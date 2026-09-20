@@ -559,7 +559,15 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
         if (!value.empty()) (*result.values)[inherited] = value;
     }
     if(pseudo.empty())SetDefault(node,result);
-    else{auto generated=std::make_shared<Node>();generated->tag=L"span";SetDefault(generated,result);}
+    else{
+        auto generated=std::make_shared<Node>();generated->tag=L"span";SetDefault(generated,result);
+        // Form-control placeholder text has a user-agent color even when the
+        // document does not declare ::placeholder. Keep it in the common
+        // pseudo-style cascade so author color/inherit/initial rules can still
+        // override it normally instead of making the painter special-case an
+        // individual input or page.
+        if(pseudo==L"placeholder")(*result.values)[L"color"]=L"#757575";
+    }
     // Preserve the user-agent/inherited starting point so a winning CSS-wide
     // `inherit` declaration can replace an earlier author declaration rather
     // than leaving that declaration behind when the parent has no value.
@@ -714,6 +722,23 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
             if(!parts.empty()){
                 setProperty(L"align-items",parts[0],candidate);
                 setProperty(L"justify-items",parts.size()>1?parts[1]:parts[0],candidate);
+            }
+        } else if (name == L"place-content") {
+            const auto parts=SplitWhitespace(value);
+            if(!parts.empty()){
+                size_t split=1;
+                if((ToLower(parts[0])==L"safe"||ToLower(parts[0])==L"unsafe")&&parts.size()>1)
+                    split=2;
+                std::wstring alignValue=parts[0];
+                for(size_t index=1;index<split;++index)alignValue+=L" "+parts[index];
+                std::wstring justifyValue=alignValue;
+                if(split<parts.size()){
+                    justifyValue=parts[split];
+                    for(size_t index=split+1;index<parts.size();++index)
+                        justifyValue+=L" "+parts[index];
+                }
+                setProperty(L"align-content",alignValue,candidate);
+                setProperty(L"justify-content",justifyValue,candidate);
             }
         } else if (name == L"inset") {
             const auto edges=ExpandEdges(value);

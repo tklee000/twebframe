@@ -2204,7 +2204,7 @@ struct RuntimeCore {
     }
     void InstallGlobals(){
         global->values[L"document"]=ObjectValue(ObjectKind::Document);
-        auto window=std::make_shared<Object>();window->kind=ObjectKind::Window;auto chrome=std::make_shared<Object>();chrome->kind=ObjectKind::Plain;chrome->props[L"webview"]=ObjectValue(ObjectKind::WebView);window->props[L"chrome"]=Value::FromObject(chrome);global->values[L"window"]=Value::FromObject(window);
+        auto window=std::make_shared<Object>();window->kind=ObjectKind::Window;auto chrome=std::make_shared<Object>();chrome->kind=ObjectKind::Plain;const auto hostBridge=ObjectValue(ObjectKind::WebView);chrome->props[L"webview"]=hostBridge;window->props[L"chrome"]=Value::FromObject(chrome);window->props[L"twebframe"]=hostBridge;global->values[L"window"]=Value::FromObject(window);
         const auto innerWidth=Value::Number(viewportWidth),innerHeight=Value::Number(viewportHeight);
         global->values[L"innerWidth"]=innerWidth;global->values[L"innerHeight"]=innerHeight;
         window->props[L"innerWidth"]=innerWidth;window->props[L"innerHeight"]=innerHeight;

@@ -811,10 +811,16 @@ void ApplyFontFallback(IDWriteFactory* factory,IDWriteTextLayout* layout,
                        const std::wstring& text,const ComputedStyle& style,
                        bool controlMetrics=false) {
     if(!factory||!layout)return;
-    if(FontFamily(style)==L"Arial"&&ContainsHangul(text)){
-        // Chromium keeps Arial for Latin characters and spaces, then uses the
-        // installed Korean face for Hangul. Set those ranges explicitly so the
-        // width used by layout is also the width used when painting.
+    const auto primaryFamily=ToLower(FontFamily(style));
+    const bool primaryProvidesKorean=primaryFamily.find(L"noto sans kr")!=std::wstring::npos||
+        primaryFamily.find(L"malgun gothic")!=std::wstring::npos||
+        primaryFamily.find(L"yu gothic")!=std::wstring::npos;
+    if(!controlMetrics&&!primaryProvidesKorean&&ContainsHangul(text)){
+        // A CSS family such as Segoe UI or Arial does not contain Hangul.
+        // Chromium resolves the Korean runs through the installed UI fallback
+        // face while DirectWrite's implicit fallback can choose a wider legacy
+        // face. Pin only those missing-glyph runs to the available Korean UI
+        // font so layout measurement and painting use the browser fallback.
         static const bool hasKoreanUiFont=[factory] {
             Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
             UINT32 index=0;BOOL exists=FALSE;
@@ -1051,7 +1057,7 @@ float ControlLineHeight(const std::wstring& source,const ComputedStyle& style) {
         if(format&&SUCCEEDED(factory->CreateGdiCompatibleTextLayout(text.c_str(),
             static_cast<UINT32>(text.size()),format.Get(),100000.0f,100000.0f,
             1.0f,&identity,FALSE,&layout))){
-            ApplyFontFallback(factory,layout.Get(),text,style);
+            ApplyFontFallback(factory,layout.Get(),text,style,true);
             DWRITE_LINE_METRICS metrics{};UINT32 count=0;
             if(SUCCEEDED(layout->GetLineMetrics(&metrics,1,&count))&&count)
                 return std::max(LineHeight(style),std::ceil(metrics.height));
@@ -1427,8 +1433,12 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
                                 childPadding.top-childPadding.bottom-childBorder.top-childBorder.bottom-
                                 childMargin.top-childMargin.bottom);
                         }
-                        lineHeight=std::max(lineHeight,childHeight+
-                            (atomic?InlineFormattingDescent(box.style):0.0f));
+                        // Every CSS inline formatting context carries a strut
+                        // with the containing block's font and line-height. A
+                        // line made only from smaller inline descendants must
+                        // therefore not collapse below the parent's line box.
+                        lineHeight=std::max(LineHeight(box.style),std::max(lineHeight,
+                            childHeight+(atomic?InlineFormattingDescent(box.style):0.0f)));
                     }else{
                         if(lineWidth>0||lineHeight>0)flushLine();
                         value+=NaturalHeight(*child,innerWidth);
@@ -1762,11 +1772,13 @@ GridTrackSizing ParseGridTrack(const std::wstring& source,float reference,float 
 std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definitions,
                                      size_t requiredCount,float available,float gap,float viewport,
                                      const std::vector<GridItemPlacement>& items,bool columns,
-                                     const std::vector<float>& oppositeSizes,bool definiteAvailable) {
+                                     const std::vector<float>& oppositeSizes,bool definiteAvailable,
+                                     bool stretchAutoTracks=true) {
     const size_t count=std::max<size_t>(1,std::max(requiredCount,definitions.size()));
     std::vector<GridTrackSizing> tracks;tracks.reserve(count);
     for(size_t i=0;i<count;++i)
         tracks.push_back(ParseGridTrack(i<definitions.size()?definitions[i]:L"auto",available,viewport));
+    std::vector<bool> shrinkableAutoTracks(count,false);
 
     auto spanSize=[&](const GridItemPlacement& item){
         const auto start=columns?item.row:item.column;
@@ -1800,17 +1812,43 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
         if(columns){
             const auto itemWidth=Trim(item.box->style.Get(L"width"));
             if(itemWidth.find(L'%')!=std::wstring::npos)contribution=0;
+            const bool automaticSize=itemWidth.empty()||itemWidth==L"auto"||
+                itemWidth.find(L'%')!=std::wstring::npos;
             const auto minimum=Trim(item.box->style.Get(L"min-width"));
             const auto overflow=item.box->style.Get(L"overflow-x",item.box->style.Get(L"overflow",L"visible"));
-            if((definiteAvailable||spansFlexibleTrack)&&
-               ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
-                (overflow!=L"visible"&&overflow!=L"clip")))contribution=0;
+            // A zero automatic minimum applies only while the item size is
+            // automatic. A definite width/height remains its track sizing
+            // contribution even when the item clips overflowing descendants.
+            // A definite grid container also does not by itself make an
+            // intrinsic track flexible: non-stretched auto tracks retain the
+            // content contribution, fr tracks use the zero minimum immediately,
+            // and stretched auto tracks shrink only if their combined natural
+            // size actually exceeds the definite grid area.
+            const bool zeroAutomaticMinimum=automaticSize&&
+                ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
+                 (overflow!=L"visible"&&overflow!=L"clip"));
+            if(zeroAutomaticMinimum){
+                if(spansFlexibleTrack)contribution=0;
+                else if(definiteAvailable&&stretchAutoTracks)
+                    for(size_t index=0;index<span&&start+index<tracks.size();++index)
+                        shrinkableAutoTracks[start+index]=tracks[start+index].stretch;
+            }
         }else{
+            const auto itemHeight=Trim(item.box->style.Get(L"height"));
+            if(itemHeight.find(L'%')!=std::wstring::npos)contribution=0;
+            const bool automaticSize=itemHeight.empty()||itemHeight==L"auto"||
+                itemHeight.find(L'%')!=std::wstring::npos;
             const auto minimum=Trim(item.box->style.Get(L"min-height"));
             const auto overflow=item.box->style.Get(L"overflow-y",item.box->style.Get(L"overflow",L"visible"));
-            if((definiteAvailable||spansFlexibleTrack)&&
-               ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
-                (overflow!=L"visible"&&overflow!=L"clip")))contribution=0;
+            const bool zeroAutomaticMinimum=automaticSize&&
+                ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
+                 (overflow!=L"visible"&&overflow!=L"clip"));
+            if(zeroAutomaticMinimum){
+                if(spansFlexibleTrack)contribution=0;
+                else if(definiteAvailable&&stretchAutoTracks)
+                    for(size_t index=0;index<span&&start+index<tracks.size();++index)
+                        shrinkableAutoTracks[start+index]=tracks[start+index].stretch;
+            }
         }
         float occupied=gap*std::max(0,static_cast<int>(span)-1);
         for(size_t index=0;index<span&&start+index<tracks.size();++index)occupied+=tracks[start+index].base;
@@ -1836,6 +1874,22 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
 
     const float gaps=gap*std::max(0,static_cast<int>(tracks.size())-1);
     auto used=[&](){float total=gaps;for(const auto& track:tracks)total+=track.base;return total;};
+    float overflow=std::max(0.0f,used()-available);
+    std::vector<size_t> shrinkable;
+    for(size_t index=0;index<tracks.size();++index)
+        if(shrinkableAutoTracks[index]&&tracks[index].base>0.01f)shrinkable.push_back(index);
+    while(overflow>0.01f&&!shrinkable.empty()){
+        const float share=overflow/static_cast<float>(shrinkable.size());
+        bool removed=false;
+        for(auto it=shrinkable.begin();it!=shrinkable.end();){
+            auto& track=tracks[*it];
+            const float reduction=std::min(share,track.base);
+            track.base-=reduction;overflow-=reduction;
+            if(track.base<=0.01f){track.base=0;it=shrinkable.erase(it);removed=true;}
+            else ++it;
+        }
+        if(!removed)break;
+    }
     float free=std::max(0.0f,available-used());
     std::vector<size_t> capped;
     for(size_t i=0;i<tracks.size();++i)if(std::isfinite(tracks[i].limit)&&tracks[i].limit>tracks[i].base+0.01f)capped.push_back(i);
@@ -1846,15 +1900,87 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
     }
     float totalFraction=0;for(const auto& track:tracks)totalFraction+=track.fraction;
     if(free>0.01f&&totalFraction>0){
-        for(auto& flexibleTrack:tracks)if(flexibleTrack.fraction>0)
-            flexibleTrack.base+=free*flexibleTrack.fraction/totalFraction;
-    }else if(free>0.01f){
+        // An fr track's base is its automatic minimum, not a head start that
+        // is added to an equal share of the remaining space.  Resolve one flex
+        // fraction from the whole flexible area and freeze only tracks whose
+        // minimum is larger than that share.  This keeps equal 1fr columns
+        // equal whenever all of their min-content sizes fit, as CSS Grid does.
+        std::vector<size_t> flexible;
+        float flexibleSpace=available-gaps;
+        for(size_t index=0;index<tracks.size();++index){
+            if(tracks[index].fraction>0)flexible.push_back(index);
+            else flexibleSpace-=tracks[index].base;
+        }
+        flexibleSpace=std::max(0.0f,flexibleSpace);
+        std::vector<bool> frozen(tracks.size(),false);
+        while(!flexible.empty()){
+            float frozenSize=0,totalActiveFraction=0;
+            for(size_t index=0;index<tracks.size();++index)
+                if(frozen[index])frozenSize+=tracks[index].base;
+            for(const auto index:flexible)totalActiveFraction+=tracks[index].fraction;
+            if(totalActiveFraction<=0)break;
+            const float fractionSize=std::max(0.0f,flexibleSpace-frozenSize)/
+                std::max(1.0f,totalActiveFraction);
+            bool frozeTrack=false;
+            for(auto it=flexible.begin();it!=flexible.end();){
+                auto& track=tracks[*it];
+                if(track.base>fractionSize*track.fraction+0.01f){
+                    frozen[*it]=true;it=flexible.erase(it);frozeTrack=true;
+                }else ++it;
+            }
+            if(frozeTrack)continue;
+            for(const auto index:flexible)
+                tracks[index].base=fractionSize*tracks[index].fraction;
+            break;
+        }
+    }else if(free>0.01f&&stretchAutoTracks){
         size_t stretchCount=0;for(const auto& candidate:tracks)if(candidate.stretch)++stretchCount;
         if(stretchCount)for(auto& stretchTrack:tracks)if(stretchTrack.stretch)stretchTrack.base+=free/stretchCount;
     }
 
     std::vector<float> result;result.reserve(tracks.size());
     for(const auto& track:tracks)result.push_back(std::max(0.0f,track.base));
+    return result;
+}
+
+struct GridContentDistribution {
+    float offset = 0;
+    float extraGap = 0;
+};
+
+std::wstring GridContentAlignment(const std::wstring& source) {
+    const auto parts=Words(ToLower(Trim(source)));
+    for(auto it=parts.rbegin();it!=parts.rend();++it)
+        if(*it!=L"safe"&&*it!=L"unsafe")return *it;
+    return L"normal";
+}
+
+bool StretchesGridAutoTracks(const std::wstring& source) {
+    const auto alignment=GridContentAlignment(source);
+    return alignment.empty()||alignment==L"normal"||alignment==L"stretch";
+}
+
+GridContentDistribution DistributeGridContent(const std::wstring& source,float available,
+                                               const std::vector<float>& tracks,float gap) {
+    GridContentDistribution result;
+    if(tracks.empty())return result;
+    float occupied=gap*std::max(0,static_cast<int>(tracks.size())-1);
+    for(const float track:tracks)occupied+=track;
+    const float free=std::max(0.0f,available-occupied);
+    if(free<=0.01f)return result;
+
+    const auto alignment=GridContentAlignment(source);
+    if(alignment==L"center")result.offset=free/2;
+    else if(alignment==L"end"||alignment==L"flex-end")result.offset=free;
+    else if(alignment==L"space-between"){
+        if(tracks.size()>1)result.extraGap=free/static_cast<float>(tracks.size()-1);
+    }else if(alignment==L"space-around"){
+        result.extraGap=free/static_cast<float>(tracks.size());
+        result.offset=result.extraGap/2;
+    }else if(alignment==L"space-evenly"){
+        result.extraGap=free/static_cast<float>(tracks.size()+1);
+        result.offset=result.extraGap;
+    }
     return result;
 }
 
@@ -2865,9 +2991,18 @@ void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
         float x=box.content.x;if(box.style.Is(L"text-align",L"center"))x+=(flowWidth-inlineWidth)/2;else if(box.style.Is(L"text-align",L"right"))x+=flowWidth-inlineWidth;
         float y=box.content.y;
         // Ordinary inline formatting starts at the block's content edge.
-        // Native button labels are the exception and remain vertically centered.
-        if(box.node&&box.node->tag==L"button")
-            y+=std::max(0.0f,(box.content.height-inlineHeight)/2);
+        // A table cell, however, distributes the row's extra block size around
+        // its inline line.  Keep a mixed line (for example icon + text) on the
+        // same vertical center as the single text-run fast path used by sibling
+        // cells.  Work in CSS DIPs so the result is stable at every monitor DPI.
+        const bool tableCell=box.style.Is(L"display",L"table-cell");
+        const auto verticalAlign=ToLower(Trim(box.style.Get(L"vertical-align")));
+        const float verticalFree=std::max(0.0f,box.content.height-inlineHeight);
+        if(box.node&&box.node->tag==L"button")y+=verticalFree/2;
+        else if(tableCell){
+            if(verticalAlign==L"bottom"||verticalAlign==L"text-bottom")y+=verticalFree;
+            else if(verticalAlign!=L"top"&&verticalAlign!=L"text-top")y+=verticalFree/2;
+        }
         size_t index=0;
         for(auto& child:box.children)if(child->visible){
             if(child->style.Is(L"position",L"absolute")||child->style.Is(L"position",L"fixed")){
@@ -2892,7 +3027,7 @@ void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
             lineX=box.content.x;lineHeight=0;continue;
         }
         const auto d=child->style.Get(L"display");const bool inlineBox=IsInlineLevel(d);
-        if(inlineBox){float w=inlineOuterWidth(*child);const bool wrapText=child->node->type==NodeType::Text&&!noWrap;const bool wrappingInlineContainer=!noWrap&&child->node->type==NodeType::Element&&!IsAtomicInlineLevel(*child)&&!child->children.empty();if((wrapText||wrappingInlineContainer)&&lineX+w>box.content.x+flowWidth+0.5f){if(lineX>box.content.x){cursorY+=lineHeight;lineX=box.content.x;lineHeight=0;}w=std::min(w,flowWidth);}float h=(wrapText||wrappingInlineContainer)?NaturalHeight(*child,w):inlineOuterHeight(*child,w);if(!wrapText&&!wrappingInlineContainer&&lineX+w>box.content.x+flowWidth+0.5f&&lineX>box.content.x){cursorY+=lineHeight;lineX=box.content.x;lineHeight=0;}LayoutBoxTree(*child,{lineX,cursorY,w,h},true,false,false);lineX+=w;lineHeight=std::max(lineHeight,h+(IsAtomicInlineLevel(*child)?InlineFormattingDescent(box.style):0.0f));}
+        if(inlineBox){float w=inlineOuterWidth(*child);const bool wrapText=child->node->type==NodeType::Text&&!noWrap;const bool atomic=IsAtomicInlineLevel(*child);const bool wrappingInlineContainer=!noWrap&&child->node->type==NodeType::Element&&!atomic&&!child->children.empty();if((wrapText||wrappingInlineContainer)&&lineX+w>box.content.x+flowWidth+0.5f){if(lineX>box.content.x){cursorY+=lineHeight;lineX=box.content.x;lineHeight=0;}w=std::min(w,flowWidth);}float h=(wrapText||wrappingInlineContainer)?NaturalHeight(*child,w):inlineOuterHeight(*child,w);if(!wrapText&&!wrappingInlineContainer&&lineX+w>box.content.x+flowWidth+0.5f&&lineX>box.content.x){cursorY+=lineHeight;lineX=box.content.x;lineHeight=0;}const float baselineOffset=atomic?0.0f:std::max(0.0f,TextBaselineOffset(box.style)-TextBaselineOffset(child->style));LayoutBoxTree(*child,{lineX,cursorY+baselineOffset,w,h},true,false,false);lineX+=w;lineHeight=std::max(LineHeight(box.style),std::max(lineHeight,h+(atomic?InlineFormattingDescent(box.style):0.0f)));}
         else{
             if(lineX>box.content.x){cursorY+=lineHeight;lineX=box.content.x;lineHeight=0;}
             float h=NaturalHeight(*child,flowWidth);const auto cssH=child->style.Get(L"height");
@@ -2930,8 +3065,17 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
     std::vector<LayoutBox*> children;for(auto& c:box.children)if(c->visible&& !c->style.Is(L"position",L"absolute")&&!c->style.Is(L"position",L"fixed"))children.push_back(c.get());
     const bool column=box.style.Is(L"flex-direction",L"column");const float mainSize=column?box.content.height:box.content.width;const float crossSize=column?box.content.width:box.content.height;const float gap=GapValue(box.style,!column,mainSize,viewportWidth_);
     std::vector<float> sizes(children.size()),minimums(children.size()),grows(children.size()),shrinks(children.size()),shrinkWeights(children.size());float fixed=gap*std::max(0,static_cast<int>(children.size())-1),growTotal=0,shrinkTotal=0;
+    std::vector<bool> mainAutoBefore(children.size()),mainAutoAfter(children.size()),
+        crossAutoBefore(children.size()),crossAutoAfter(children.size());
+    size_t mainAutoMarginCount=0;
     for(size_t i=0;i<children.size();++i){
         auto* c=children[i];const auto margin=EdgeValues(c->style,L"margin",column?crossSize:mainSize,viewportWidth_);const float mainMargin=column?margin.top+margin.bottom:margin.left+margin.right;
+        const auto isAutoMargin=[&](const wchar_t* property){return ToLower(Trim(c->style.Get(property)))==L"auto";};
+        mainAutoBefore[i]=isAutoMargin(column?L"margin-top":L"margin-left");
+        mainAutoAfter[i]=isAutoMargin(column?L"margin-bottom":L"margin-right");
+        crossAutoBefore[i]=isAutoMargin(column?L"margin-left":L"margin-top");
+        crossAutoAfter[i]=isAutoMargin(column?L"margin-right":L"margin-bottom");
+        mainAutoMarginCount+=static_cast<size_t>(mainAutoBefore[i])+static_cast<size_t>(mainAutoAfter[i]);
         grows[i]=StyleSheet::Length(c->style.Get(L"flex-grow",L"0"),0,0,0);shrinks[i]=StyleSheet::Length(c->style.Get(L"flex-shrink",L"1"),0,0,1);
         auto raw=c->style.Get(L"flex-basis");if(raw.empty()||raw==L"auto")raw=c->style.Get(column?L"height":L"width");
         bool natural=raw.empty()||raw==L"auto"||(!column&&ToLower(Trim(raw))==L"max-content");const auto minRaw=c->style.Get(column?L"min-height":L"min-width");const auto overflow=c->style.Get(column?L"overflow-y":L"overflow-x",c->style.Get(L"overflow",L"visible"));const bool automaticMinimumIsZero=(!minRaw.empty()&&StyleSheet::Length(minRaw,mainSize,column?viewportHeight_:viewportWidth_,1)==0)||(overflow!=L"visible"&&overflow!=L"clip");float base=natural&&grows[i]>0&&automaticMinimumIsZero?mainMargin:(natural?(column?NaturalHeight(*c,crossSize):NaturalWidth(*c)):StyleSheet::Length(raw,mainSize,column?viewportHeight_:viewportWidth_,0));
@@ -2951,6 +3095,9 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
         }
     }
     float occupied=gap*std::max(0,static_cast<int>(children.size())-1);for(float size:sizes)occupied+=size;float remain=std::max(0.0f,mainSize-occupied);
+    const float autoMainMargin=mainAutoMarginCount&&remain>0?
+        remain/static_cast<float>(mainAutoMarginCount):0;
+    if(autoMainMargin>0)remain=0;
     float cursor=column?box.content.y:box.content.x;const auto justify=box.style.Get(L"justify-content");float dynamicGap=gap;
     if(justify==L"center")cursor+=remain/2;else if(justify==L"flex-end"||justify==L"end")cursor+=remain;
     else if(justify==L"space-between"&&children.size()>1)dynamicGap+=remain/(children.size()-1);
@@ -2976,22 +3123,26 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
                 NaturalHeight(*child,sizes[i]));
             crossDefinite[i]=false;
         }
-        if(!column&&align==L"baseline")
+        if(!column&&align==L"baseline"&&!crossAutoBefore[i]&&!crossAutoAfter[i])
             sharedBaseline=std::max(sharedBaseline,FlexItemBaselineOffset(
                 *child,sizes[i],crossExtents[i]));
     }
     for(size_t i=0;i<children.size();++i){
         auto* child=children[i];const auto& align=alignments[i];
         const float cross=crossExtents[i];float crossPos=column?box.content.x:box.content.y;
-        if(align==L"center")crossPos+=(crossSize-cross)/2;
-        else if(align==L"flex-end"||align==L"end")crossPos+=crossSize-cross;
-        else if(!column&&align==L"baseline")crossPos+=sharedBaseline-
+        const float crossFree=std::max(0.0f,crossSize-cross);
+        if(crossAutoBefore[i]&&crossAutoAfter[i])crossPos+=crossFree/2;
+        else if(crossAutoBefore[i])crossPos+=crossFree;
+        else if(!crossAutoAfter[i]&&align==L"center")crossPos+=crossFree/2;
+        else if(!crossAutoAfter[i]&&(align==L"flex-end"||align==L"end"))crossPos+=crossFree;
+        else if(!crossAutoAfter[i]&&!column&&align==L"baseline")crossPos+=sharedBaseline-
             FlexItemBaselineOffset(*child,sizes[i],cross);
+        if(mainAutoBefore[i])cursor+=autoMainMargin;
         const LayoutRect area=column?LayoutRect{crossPos,cursor,cross,sizes[i]}:
             LayoutRect{cursor,crossPos,sizes[i],cross};
         LayoutBoxTree(*child,area,true,column?crossDefinite[i]:true,
                       column?true:crossDefinite[i]);
-        cursor+=sizes[i]+dynamicGap;
+        cursor+=sizes[i]+(mainAutoAfter[i]?autoMainMargin:0)+dynamicGap;
     }
     for(auto& c:box.children)if(c->visible&&(c->style.Is(L"position",L"absolute")||c->style.Is(L"position",L"fixed"))){
         const LayoutRect area=c->style.Is(L"position",L"fixed")?LayoutRect{0,0,viewportWidth_,viewportHeight_}:AbsoluteContainingBlock(box);
@@ -3019,15 +3170,21 @@ void LayoutEngine::LayoutGrid(LayoutBox& box,bool definiteWidth,bool definiteHei
     const float columnGap=GapValue(box.style,true,gridWidth,viewportWidth_);
     const float rowGap=GapValue(box.style,false,box.content.height,viewportHeight_);
     const std::vector<float> provisionalRows(rowCount,std::max(1.0f,(box.content.height-rowGap*std::max(0,static_cast<int>(rowCount)-1))/rowCount));
-    const auto columns=ResolveGridTracks(*columnDefinitions,columnCount,gridWidth,columnGap,viewportWidth_,items,true,provisionalRows,definiteWidth);
-    const auto rows=ResolveGridTracks(*rowDefinitions,rowCount,box.content.height,rowGap,viewportHeight_,items,false,columns,definiteHeight);
-    std::vector<float> x(columns.size()),y(rows.size());float position=box.content.x;
-    for(size_t i=0;i<columns.size();++i){x[i]=position;position+=columns[i]+columnGap;}
-    position=box.content.y;for(size_t i=0;i<rows.size();++i){y[i]=position;position+=rows[i]+rowGap;}
+    const auto justifyContent=box.style.Get(L"justify-content",L"normal");
+    const auto alignContent=box.style.Get(L"align-content",L"normal");
+    const auto columns=ResolveGridTracks(*columnDefinitions,columnCount,gridWidth,columnGap,viewportWidth_,items,true,provisionalRows,definiteWidth,StretchesGridAutoTracks(justifyContent));
+    const auto rows=ResolveGridTracks(*rowDefinitions,rowCount,box.content.height,rowGap,viewportHeight_,items,false,columns,definiteHeight,StretchesGridAutoTracks(alignContent));
+    const auto horizontalDistribution=DistributeGridContent(justifyContent,gridWidth,columns,columnGap);
+    const auto verticalDistribution=DistributeGridContent(alignContent,box.content.height,rows,rowGap);
+    const float distributedColumnGap=columnGap+horizontalDistribution.extraGap;
+    const float distributedRowGap=rowGap+verticalDistribution.extraGap;
+    std::vector<float> x(columns.size()),y(rows.size());float position=box.content.x+horizontalDistribution.offset;
+    for(size_t i=0;i<columns.size();++i){x[i]=position;position+=columns[i]+distributedColumnGap;}
+    position=box.content.y+verticalDistribution.offset;for(size_t i=0;i<rows.size();++i){y[i]=position;position+=rows[i]+distributedRowGap;}
     const auto parentAlign=box.style.Get(L"align-items",L"stretch"),parentJustify=box.style.Get(L"justify-items",L"stretch");
     for(const auto& item:items){
         if(item.row>=rows.size()||item.column>=columns.size())continue;
-        float cellWidth=columnGap*std::max(0,static_cast<int>(item.columnSpan)-1),cellHeight=rowGap*std::max(0,static_cast<int>(item.rowSpan)-1);
+        float cellWidth=distributedColumnGap*std::max(0,static_cast<int>(item.columnSpan)-1),cellHeight=distributedRowGap*std::max(0,static_cast<int>(item.rowSpan)-1);
         for(size_t index=0;index<item.columnSpan&&item.column+index<columns.size();++index)cellWidth+=columns[item.column+index];
         for(size_t index=0;index<item.rowSpan&&item.row+index<rows.size();++index)cellHeight+=rows[item.row+index];
         auto align=item.box->style.Get(L"align-self",L"auto");if(align.empty()||align==L"auto")align=parentAlign;
@@ -3179,11 +3336,15 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         EnsureTextLayout(box,factory,text);
         if(box.textLayout){
             auto textColor=StyleSheet::Color(box.style.Get(L"color",L"#000"),0xff000000);
-            if(placeholderText&&styleSheet_.HasPseudoRules(L"placeholder")){
+            float textOpacity=1.0f;
+            if(placeholderText){
                 const auto placeholderStyle=styleSheet_.Compute(box.node,&box.style,L"placeholder");
                 textColor=StyleSheet::Color(placeholderStyle.Get(L"color"),0xff757575);
+                try{textOpacity=std::stof(placeholderStyle.Get(L"opacity",L"1"));}catch(...){ }
+                textOpacity=std::max(0.0f,std::min(1.0f,textOpacity));
             }
-            target->CreateSolidColorBrush(D2DColor(textColor),&brush);
+            auto resolvedTextColor=D2DColor(textColor);resolvedTextColor.a*=textOpacity;
+            target->CreateSolidColorBrush(resolvedTextColor,&brush);
             const auto rect=D2D1::RectF(box.content.x,box.content.y,box.content.x+box.content.width,box.content.y+box.content.height);
             // A glyph's ink may extend beyond its advance, especially with
             // negative character spacing. Only CSS overflow clips text ink.

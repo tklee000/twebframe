@@ -1,8 +1,8 @@
-# Version 0.1 Supported Subset
+# Version 0.2 Supported Subset
 
 This document records the behavior currently implemented and exercised by the TWebFrame regression suite. It is not a claim of complete HTML, CSS, DOM, Web API, accessibility, or ECMAScript conformance.
 
-TWebFrame 0.1 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
+TWebFrame 0.2 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
 
 Unless a feature is listed here and covered by a test, applications should treat it as unsupported.
 
@@ -82,7 +82,7 @@ Shadow DOM, Custom Elements, browser observer APIs, the full Event constructor f
 - Shorthand expansion used by the current style and layout properties.
 - Viewport `min-width`, `max-width`, `min-height`, and `max-height` media conditions.
 
-JavaScript `matchMedia()` is only a compatibility placeholder in version 0.1 and does not mirror the stylesheet engine's complete media-query state.
+JavaScript `matchMedia()` is only a compatibility placeholder in version 0.2 and does not mirror the stylesheet engine's complete media-query state.
 
 ## CSS layout and paint
 
@@ -206,7 +206,7 @@ Image decoding, canvas, WebGL, video/audio, printing, browser plug-ins, and gene
 - `:focus-visible`, bubbling focus events, and keyboard activation for common buttons, links, and ARIA controls.
 - Tested ARIA menu navigation with arrows, Home/End, Escape, Enter, and Space.
 
-Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.1.
+Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.2.
 
 ## Accessibility
 
@@ -229,4 +229,4 @@ The provider is a practical subset for the implemented controls, not a complete 
 - UI Automation accessibility.
 - C++17 and the Visual Studio v142 toolset in the documented build.
 
-Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.1.
+Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.2.

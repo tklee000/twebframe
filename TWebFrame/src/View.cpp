@@ -113,15 +113,16 @@ bool IsKeyboardActivatable(const std::shared_ptr<Node>& node){
 
 bool FileInfoForPath(const std::wstring& path,Node::FileInfo& result){
     WIN32_FILE_ATTRIBUTE_DATA metadata{};
-    if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&metadata)||
-       (metadata.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))return false;
+    if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&metadata))return false;
+    const bool directory=(metadata.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
     const std::filesystem::path selected(path);
     const auto extension=ToLower(selected.extension().wstring());
     result.name=selected.filename().wstring();
+    if(result.name.empty())result.name=selected.root_name().wstring();
     result.path=selected.lexically_normal().wstring();
-    result.type=extension==L".csv"?L"text/csv":extension==L".json"?L"application/json":
+    result.type=directory?L"application/x-directory":extension==L".csv"?L"text/csv":extension==L".json"?L"application/json":
         extension==L".txt"||extension==L".log"?L"text/plain":L"application/octet-stream";
-    result.size=(static_cast<unsigned long long>(metadata.nFileSizeHigh)<<32)|metadata.nFileSizeLow;
+    result.size=directory?0:(static_cast<unsigned long long>(metadata.nFileSizeHigh)<<32)|metadata.nFileSizeLow;
     return true;
 }
 
