@@ -1,0 +1,2503 @@
+#include "JavaScript.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cwctype>
+#include <deque>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+
+namespace TWebFrame::Internal {
+namespace {
+
+std::string WideToUtf8(std::wstring_view value) {
+    if (value.empty()) return {};
+    const int count = WideCharToMultiByte(
+        CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (count <= 0) return {};
+    std::string result(static_cast<size_t>(count), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        result.data(), count, nullptr, nullptr);
+    return result;
+}
+
+std::wstring Utf8ToWide(std::string_view value) {
+    if(value.empty())return {};
+    const int count=MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),nullptr,0);
+    if(count<=0)return {};
+    std::wstring result(static_cast<size_t>(count),L'\0');
+    MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),result.data(),count);
+    return result;
+}
+
+int HexDigitValue(wchar_t character) {
+    if(character>=L'0'&&character<=L'9')return character-L'0';
+    if(character>=L'a'&&character<=L'f')return character-L'a'+10;
+    if(character>=L'A'&&character<=L'F')return character-L'A'+10;
+    return -1;
+}
+
+void AppendCodePoint(std::wstring& output,std::uint32_t codePoint) {
+    if(codePoint>0x10ffff||(codePoint>=0xd800&&codePoint<=0xdfff))codePoint=0xfffd;
+    if constexpr(sizeof(wchar_t)>=4)output+=static_cast<wchar_t>(codePoint);
+    else if(codePoint<=0xffff)output+=static_cast<wchar_t>(codePoint);
+    else{
+        codePoint-=0x10000;
+        output+=static_cast<wchar_t>(0xd800+(codePoint>>10));
+        output+=static_cast<wchar_t>(0xdc00+(codePoint&0x3ff));
+    }
+}
+
+bool ParseUnicodeEscape(const std::wstring& source,size_t& position,std::uint32_t& codePoint) {
+    if(position>=source.size()||source[position]!=L'u')return false;
+    size_t cursor=position+1;std::uint32_t value=0;
+    if(cursor<source.size()&&source[cursor]==L'{'){
+        ++cursor;const size_t digits=cursor;
+        while(cursor<source.size()&&source[cursor]!=L'}'){
+            const int digit=HexDigitValue(source[cursor]);
+            if(digit<0||cursor-digits>=6)return false;
+            value=value*16+static_cast<std::uint32_t>(digit);++cursor;
+        }
+        if(cursor==digits||cursor>=source.size()||source[cursor]!=L'}'||value>0x10ffff)return false;
+        ++cursor;
+    }else{
+        if(cursor+4>source.size())return false;
+        for(size_t index=0;index<4;++index){
+            const int digit=HexDigitValue(source[cursor+index]);if(digit<0)return false;
+            value=value*16+static_cast<std::uint32_t>(digit);
+        }
+        cursor+=4;
+    }
+    codePoint=value;position=cursor;return true;
+}
+
+std::wstring DecodeRegexUnicodeEscapes(const std::wstring& pattern) {
+    std::wstring output;output.reserve(pattern.size());
+    for(size_t position=0;position<pattern.size();){
+        if(pattern[position]==L'\\'&&position+1<pattern.size()&&pattern[position+1]==L'u'){
+            size_t end=position+1;std::uint32_t codePoint=0;
+            if(ParseUnicodeEscape(pattern,end,codePoint)){
+                std::wstring decoded;AppendCodePoint(decoded,codePoint);
+                for(const auto character:decoded){
+                    if(std::wstring_view(L"\\.^$|()[]{}*+?").find(character)!=std::wstring_view::npos)
+                        output+=L'\\';
+                    output+=character;
+                }
+                position=end;continue;
+            }
+        }
+        output+=pattern[position++];
+    }
+    return output;
+}
+
+// A large share of split separators are finite regular expressions made from
+// literal characters and greedy optional characters (for example /--?/ or
+// /\r?\n/).  Running the general MSVC regex engine once per match is very
+// expensive on multi-megabyte strings, so compile that whole regex class into
+// ordered literal alternatives.  Unsupported expressions still use wregex.
+struct FiniteRegexSeparator {
+    std::vector<std::wstring> alternatives;
+    bool ignoreCase=false;
+
+    bool MatchAt(const std::wstring& input,size_t position,size_t& length) const {
+        for(const auto& alternative:alternatives){
+            if(alternative.size()>input.size()-position)continue;
+            bool matches=true;
+            for(size_t index=0;index<alternative.size();++index){
+                auto left=input[position+index],right=alternative[index];
+                if(ignoreCase){left=static_cast<wchar_t>(std::towlower(left));right=static_cast<wchar_t>(std::towlower(right));}
+                if(left!=right){matches=false;break;}
+            }
+            if(matches){length=alternative.size();return true;}
+        }
+        return false;
+    }
+};
+
+bool CompileFiniteRegexSeparator(const std::wstring& pattern,const std::wstring& flags,
+                                 FiniteRegexSeparator& result){
+    result.alternatives.assign(1,L"");
+    result.ignoreCase=flags.find(L'i')!=std::wstring::npos;
+    for(size_t position=0;position<pattern.size();++position){
+        wchar_t literal=pattern[position];
+        if(literal==L'\\'){
+            if(++position>=pattern.size())return false;
+            const auto escaped=pattern[position];
+            switch(escaped){
+            case L'r':literal=L'\r';break;
+            case L'n':literal=L'\n';break;
+            case L't':literal=L'\t';break;
+            case L'f':literal=L'\f';break;
+            case L'v':literal=L'\v';break;
+            case L'0':literal=L'\0';break;
+            default:
+                if(std::iswalnum(escaped))return false;
+                literal=escaped;break;
+            }
+        }else if(std::wstring_view(L".^$|?*+()[]{}").find(literal)!=std::wstring_view::npos){
+            return false;
+        }
+        const bool optional=position+1<pattern.size()&&pattern[position+1]==L'?';
+        if(optional)++position;
+        if(optional){
+            if(result.alternatives.size()>64)return false;
+            std::vector<std::wstring> expanded;
+            expanded.reserve(result.alternatives.size()*2);
+            for(const auto& alternative:result.alternatives){
+                expanded.push_back(alternative+literal);
+                expanded.push_back(alternative);
+            }
+            result.alternatives=std::move(expanded);
+        }else{
+            for(auto& alternative:result.alternatives)alternative+=literal;
+        }
+    }
+    return true;
+}
+
+struct AnchoredRegexPrefixes {
+    std::vector<std::wstring> values;
+    bool ignoreCase=false;
+
+    bool MayMatch(const std::wstring& input) const {
+        if(values.empty())return true;
+        for(const auto& prefix:values){
+            if(prefix.size()>input.size())continue;
+            bool matches=true;
+            for(size_t index=0;index<prefix.size();++index){
+                auto left=input[index],right=prefix[index];
+                if(ignoreCase){left=static_cast<wchar_t>(std::towlower(left));right=static_cast<wchar_t>(std::towlower(right));}
+                if(left!=right){matches=false;break;}
+            }
+            if(matches)return true;
+        }
+        return false;
+    }
+};
+
+AnchoredRegexPrefixes CompileAnchoredRegexPrefixes(const std::wstring& pattern,
+                                                    const std::wstring& flags){
+    AnchoredRegexPrefixes result;result.ignoreCase=flags.find(L'i')!=std::wstring::npos;
+    if(pattern.empty()||pattern.front()!=L'^')return result;
+    auto prefix=[&](size_t begin,size_t end){
+        std::wstring value;
+        for(size_t position=begin;position<end;++position){
+            auto character=pattern[position];
+            if(character==L'\\'){
+                if(++position>=end)return std::wstring{};
+                const auto escaped=pattern[position];
+                if(std::iswalnum(escaped)){
+                    if(escaped==L'r')character=L'\r';
+                    else if(escaped==L'n')character=L'\n';
+                    else if(escaped==L't')character=L'\t';
+                    else return value;
+                }else character=escaped;
+            }else if(character==L'?'||character==L'*'){
+                if(!value.empty())value.pop_back();
+                return value;
+            }else if(character==L'{')return std::wstring{};
+            else if(std::wstring_view(L".^$|+()[]}").find(character)!=std::wstring_view::npos)return value;
+            value+=character;
+        }
+        return value;
+    };
+    size_t start=1;
+    if(start<pattern.size()&&pattern[start]==L'('){
+        ++start;if(start+1<pattern.size()&&pattern[start]==L'?'&&pattern[start+1]==L':')start+=2;
+        size_t alternative=start;int depth=0;
+        for(size_t position=start;position<pattern.size();++position){
+            if(pattern[position]==L'\\'){++position;continue;}
+            if(pattern[position]==L'(')++depth;
+            else if(pattern[position]==L')'){
+                if(depth==0){
+                    auto value=prefix(alternative,position);if(value.empty()){result.values.clear();return result;}
+                    result.values.push_back(std::move(value));return result;
+                }
+                --depth;
+            }else if(pattern[position]==L'|'&&depth==0){
+                auto value=prefix(alternative,position);if(value.empty()){result.values.clear();return result;}
+                result.values.push_back(std::move(value));alternative=position+1;
+            }
+        }
+        result.values.clear();return result;
+    }
+    auto value=prefix(start,pattern.size());if(!value.empty())result.values.push_back(std::move(value));
+    return result;
+}
+
+struct Object;
+struct Function;
+struct NativeFunction;
+struct Reference;
+struct Environment;
+struct Chunk;
+struct Prototype;
+
+struct Value {
+    enum class Type { Undefined, Null, Boolean, Number, String, Object, Function, Native, Reference };
+    Type type = Type::Undefined;
+    bool boolean = false;
+    double number = 0.0;
+    std::wstring string;
+    std::shared_ptr<Object> object;
+    std::shared_ptr<Function> function;
+    std::shared_ptr<NativeFunction> native;
+    std::shared_ptr<Reference> reference;
+
+    static Value Undefined() { return {}; }
+    static Value Null() { Value v; v.type = Type::Null; return v; }
+    static Value Bool(bool b) { Value v; v.type=Type::Boolean; v.boolean=b; return v; }
+    static Value Number(double n) { Value v; v.type=Type::Number; v.number=n; return v; }
+    static Value String(std::wstring s) { Value v; v.type=Type::String; v.string=std::move(s); return v; }
+    static Value FromObject(const std::shared_ptr<Object>& o) { Value v; v.type=Type::Object; v.object=o; return v; }
+    static Value FromFunction(const std::shared_ptr<Function>& f) { Value v; v.type=Type::Function; v.function=f; return v; }
+    static Value FromNative(const std::shared_ptr<NativeFunction>& f) { Value v; v.type=Type::Native; v.native=f; return v; }
+    static Value FromReference(const std::shared_ptr<Reference>& r) { Value v; v.type=Type::Reference; v.reference=r; return v; }
+};
+
+struct JavaScriptException {
+    Value value;
+};
+
+struct PromiseReaction {
+    Value onFulfilled;
+    Value onRejected;
+    std::shared_ptr<Object> nextPromise;
+};
+
+enum class PromiseState { Pending, Fulfilled, Rejected };
+enum class ObjectKind { Plain, Array, Map, Set, RegExp, Window, FrameWindow, Document, Node, ClassList, Style, Dataset, Event, WebView, Performance, Math, Json, ObjectConstructor, ArrayConstructor, StringConstructor, NumberConstructor, DateConstructor, Date, PromiseConstructor, ErrorConstructor, UrlSearchParams, Storage, MediaQuery, Response, Promise, Error };
+
+struct Object {
+    ObjectKind kind = ObjectKind::Plain;
+    FastMap<std::wstring, Value> props;
+    std::vector<Value> items;
+    std::vector<std::pair<Value, Value>> entries;
+    std::shared_ptr<Node> node;
+    std::shared_ptr<Object> prototype;
+    PromiseState promiseState = PromiseState::Pending;
+    Value promiseResult;
+    std::vector<PromiseReaction> promiseReactions;
+    bool promiseHandled = false;
+    bool promiseUnhandledNotified = false;
+};
+
+struct Environment {
+    FastMap<std::wstring, Value> values;
+    std::shared_ptr<Environment> parent;
+    Environment* Find(const std::wstring& name) {
+        if (values.count(name)) return this;
+        return parent ? parent->Find(name) : nullptr;
+    }
+};
+
+struct Reference {
+    enum class Kind { Variable, Property } kind = Kind::Variable;
+    std::shared_ptr<Environment> env;
+    std::wstring name;
+    Value base;
+};
+
+enum class Op {
+    Constant, Undefined, Null, TrueValue, FalseValue,
+    LoadReference, Declare, GetProperty, GetIndex, Assign,
+    NewArray, ArrayPush, ArraySpread, NewObject, ObjectSet, ObjectSpread, EnumerableKeys, MakeFunction,
+    Call, CallArray, Construct, ConstructArray, DeleteValue, ThrowValue, Await, LeaveCatch, EndFinally, Pop, Duplicate, PostIncrement, PostDecrement, PreIncrement, PreDecrement,
+    Add, Subtract, Multiply, Divide, Modulo, Power,
+    BitwiseAnd, BitwiseOr, BitwiseXor, ShiftLeft, ShiftRight, UnsignedShiftRight, InValue,
+    Equal, NotEqual, StrictEqual, StrictNotEqual, Less, LessEqual, Greater, GreaterEqual,
+    Not, BitwiseNot, Negate, Positive, VoidValue, TypeOf,
+    Jump, JumpFalse, JumpFalseKeep, JumpTrueKeep, JumpNotNullishKeep,
+    Template, Return
+};
+
+struct Instruction {
+    Op op = Op::Undefined;
+    int argument = 0;
+    std::wstring text;
+};
+
+struct Chunk {
+    struct ExceptionHandler {
+        size_t tryStart=0,tryEnd=0;
+        size_t catchStart=0,catchEnd=0;
+        size_t finallyStart=0,finallyEnd=0;
+        size_t end=0;
+        std::wstring catchName;
+        bool hasCatch=false,hasFinally=false;
+    };
+    std::vector<Instruction> code;
+    std::vector<Value> constants;
+    std::vector<ExceptionHandler> handlers;
+};
+
+struct Prototype {
+    struct Binding {
+        std::wstring parameter, property, name;
+        bool indexed=false;
+        std::shared_ptr<Chunk> defaultValue;
+    };
+    std::vector<std::wstring> parameters;
+    std::vector<std::shared_ptr<Chunk>> parameterDefaults;
+    std::vector<Binding> bindings;
+    std::wstring restParameter;
+    Chunk chunk;
+    bool lexicalThis = false;
+    bool isAsync = false;
+};
+
+struct Module {
+    std::vector<std::shared_ptr<Prototype>> prototypes;
+};
+
+struct Function {
+    std::shared_ptr<Prototype> prototype;
+    std::shared_ptr<Environment> closure;
+};
+
+struct RuntimeCore;
+using NativeCallback = std::function<Value(RuntimeCore&, const Value&, const std::vector<Value>&)>;
+struct NativeFunction { NativeCallback callback; };
+
+enum class CompletionKind { Return, Jump, Throw };
+struct PendingCompletion {
+    int handler=-1;
+    CompletionKind kind=CompletionKind::Return;
+    Value value;
+    size_t target=0;
+};
+struct ExecutionFrame {
+    struct CatchScope { int handler=-1;std::shared_ptr<Environment> outer; };
+    const Chunk* chunk=nullptr;
+    std::shared_ptr<Prototype> prototype;
+    std::shared_ptr<Environment> env;
+    std::vector<Value> stack;
+    std::vector<PendingCompletion> pending;
+    std::vector<CatchScope> catchScopes;
+    size_t ip=0;
+    std::shared_ptr<Object> asyncPromise;
+    bool resumeThrow=false;
+    Value resumeValue;
+    size_t resumeOrigin=0;
+};
+struct FrameResult {
+    bool suspended=false;
+    Value value;
+};
+
+enum class TokenKind {
+    End, Identifier, Number, String, Template, RegExp,
+    LeftParen, RightParen, LeftBrace, RightBrace, LeftBracket, RightBracket,
+    Dot, Ellipsis, Comma, Colon, Semicolon, Question, OptionalChain, Nullish, NullishAssign,
+    Plus, Minus, PlusPlus, MinusMinus, PlusAssign, MinusAssign,
+    Star, StarAssign, Exponent, ExponentAssign, Slash, SlashAssign, Percent, PercentAssign, Bang,
+    Assign, Equal, NotEqual, StrictEqual, StrictNotEqual, Less, LessEqual, Greater, GreaterEqual,
+    ShiftLeft, ShiftLeftAssign, ShiftRight, ShiftRightAssign, UnsignedShiftRight, UnsignedShiftRightAssign,
+    BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, BitNot,
+    And, AndAssign, Or, OrAssign, Arrow
+};
+
+struct Token {
+    TokenKind kind = TokenKind::End;
+    std::wstring text;
+    double number = 0;
+    int line = 1;
+    std::wstring extra;
+};
+
+class Lexer {
+public:
+    explicit Lexer(const std::wstring& source) : source_(source) {}
+    std::vector<Token> Scan() {
+        std::vector<Token> tokens;
+        for (;;) {
+            SkipTrivia();
+            if (position_ >= source_.size()) { tokens.push_back({TokenKind::End,L"",0,line_}); break; }
+            const wchar_t c = source_[position_++];
+            Token token; token.line = line_;
+            if (std::iswalpha(c) || c == L'_' || c == L'$') {
+                const size_t start = position_ - 1;
+                while (position_ < source_.size() && (std::iswalnum(source_[position_]) || source_[position_] == L'_' || source_[position_] == L'$')) ++position_;
+                token.kind=TokenKind::Identifier; token.text=source_.substr(start,position_-start); tokens.push_back(token); continue;
+            }
+            if (std::iswdigit(c) || (c == L'.' && position_ < source_.size() && std::iswdigit(source_[position_]))) {
+                const size_t start=position_-1;
+                while(position_<source_.size() && (std::iswalnum(source_[position_]) || source_[position_]==L'_' || source_[position_]==L'.' || source_[position_]==L'+' || source_[position_]==L'-')) {
+                    if ((source_[position_]==L'+' || source_[position_]==L'-') && source_[position_-1]!=L'e' && source_[position_-1]!=L'E') break;
+                    ++position_;
+                }
+                token.kind=TokenKind::Number; token.text=source_.substr(start,position_-start);
+                try {auto numeric=token.text;numeric.erase(std::remove(numeric.begin(),numeric.end(),L'_'),numeric.end());if(!numeric.empty()&&numeric.back()==L'n')numeric.pop_back();size_t used=0;if(numeric.size()>2&&numeric[0]==L'0'&&(numeric[1]==L'x'||numeric[1]==L'X'))token.number=static_cast<double>(std::stoull(numeric,&used,16));else token.number=std::stod(numeric,&used);} catch (...) { token.number=0; }
+                tokens.push_back(token); continue;
+            }
+            if (c == L'\'' || c == L'"') { token.kind=TokenKind::String; token.text=ReadString(c); tokens.push_back(token); continue; }
+            if (c == L'`') { token.kind=TokenKind::Template; token.text=ReadTemplate(); tokens.push_back(token); continue; }
+            auto push=[&](TokenKind k){token.kind=k;token.text=std::wstring(1,c);tokens.push_back(token);};
+            switch(c) {
+            case L'(':push(TokenKind::LeftParen);break; case L')':push(TokenKind::RightParen);break;
+            case L'{':push(TokenKind::LeftBrace);break; case L'}':push(TokenKind::RightBrace);break;
+            case L'[':push(TokenKind::LeftBracket);break; case L']':push(TokenKind::RightBracket);break;
+            case L'.':
+                if(position_+1<source_.size()&&source_[position_]==L'.'&&source_[position_+1]==L'.'){
+                    position_+=2;token.kind=TokenKind::Ellipsis;token.text=L"...";tokens.push_back(token);
+                }else push(TokenKind::Dot);
+                break;
+            case L',':push(TokenKind::Comma);break;
+            case L':':push(TokenKind::Colon);break; case L';':push(TokenKind::Semicolon);break;
+            case L'?':
+                if(Match(L'?')){const bool assign=Match(L'=');token.kind=assign?TokenKind::NullishAssign:TokenKind::Nullish;token.text=assign?L"??=":L"??";tokens.push_back(token);}
+                else if(Match(L'.')){token.kind=TokenKind::OptionalChain;token.text=L"?.";tokens.push_back(token);}
+                else push(TokenKind::Question);
+                break;
+            case L'+':if(Match(L'+'))push(TokenKind::PlusPlus);else if(Match(L'='))push(TokenKind::PlusAssign);else push(TokenKind::Plus);break;
+            case L'-':if(Match(L'-'))push(TokenKind::MinusMinus);else if(Match(L'='))push(TokenKind::MinusAssign);else push(TokenKind::Minus);break;
+            case L'*':
+                if(Match(L'*')){if(Match(L'='))push(TokenKind::ExponentAssign);else push(TokenKind::Exponent);}
+                else if(Match(L'='))push(TokenKind::StarAssign);else push(TokenKind::Star);break;
+            case L'/':{
+                const auto canEndExpression=[&](){
+                    if(tokens.empty())return false;const auto& previous=tokens.back();
+                    if(previous.kind==TokenKind::Identifier)return previous.text!=L"return"&&previous.text!=L"throw"&&previous.text!=L"case";
+                    return previous.kind==TokenKind::Number||previous.kind==TokenKind::String||
+                           previous.kind==TokenKind::Template||previous.kind==TokenKind::RegExp||
+                           previous.kind==TokenKind::RightParen||previous.kind==TokenKind::RightBracket;
+                };
+                if(canEndExpression()){if(Match(L'='))push(TokenKind::SlashAssign);else push(TokenKind::Slash);break;}
+                std::wstring pattern;bool escaped=false;
+                while(position_<source_.size()){
+                    const wchar_t item=source_[position_++];
+                    if(!escaped&&item==L'/')break;
+                    pattern+=item;
+                    if(escaped)escaped=false;else escaped=item==L'\\';
+                }
+                std::wstring flags;while(position_<source_.size()&&std::iswalpha(source_[position_]))flags+=source_[position_++];
+                token.kind=TokenKind::RegExp;token.text=DecodeRegexUnicodeEscapes(pattern);token.extra=std::move(flags);tokens.push_back(std::move(token));break;
+            }
+            case L'%':if(Match(L'='))push(TokenKind::PercentAssign);else push(TokenKind::Percent);break;
+            case L'!':
+                if (Match(L'=')) { const bool strict=Match(L'='); token.kind=strict?TokenKind::StrictNotEqual:TokenKind::NotEqual; token.text=strict?L"!==":L"!="; tokens.push_back(token); }
+                else push(TokenKind::Bang); break;
+            case L'=':
+                if (Match(L'>')) { token.kind=TokenKind::Arrow;token.text=L"=>";tokens.push_back(token); }
+                else if (Match(L'=')) { const bool strict=Match(L'=');token.kind=strict?TokenKind::StrictEqual:TokenKind::Equal;token.text=strict?L"===":L"==";tokens.push_back(token); }
+                else push(TokenKind::Assign); break;
+            case L'<':
+                if(Match(L'<')){if(Match(L'='))push(TokenKind::ShiftLeftAssign);else push(TokenKind::ShiftLeft);}
+                else if(Match(L'=')){token.kind=TokenKind::LessEqual;tokens.push_back(token);}else push(TokenKind::Less);break;
+            case L'>':
+                if(Match(L'>')){
+                    if(Match(L'>')){if(Match(L'='))push(TokenKind::UnsignedShiftRightAssign);else push(TokenKind::UnsignedShiftRight);}
+                    else if(Match(L'='))push(TokenKind::ShiftRightAssign);else push(TokenKind::ShiftRight);
+                }else if(Match(L'=')){token.kind=TokenKind::GreaterEqual;tokens.push_back(token);}else push(TokenKind::Greater);break;
+            case L'&':
+                if(Match(L'&')){if(Match(L'='))push(TokenKind::AndAssign);else push(TokenKind::And);}
+                else if(Match(L'='))push(TokenKind::BitAndAssign);else push(TokenKind::BitAnd);break;
+            case L'|':
+                if(Match(L'|')){if(Match(L'='))push(TokenKind::OrAssign);else push(TokenKind::Or);}
+                else if(Match(L'='))push(TokenKind::BitOrAssign);else push(TokenKind::BitOr);break;
+            case L'^':if(Match(L'='))push(TokenKind::BitXorAssign);else push(TokenKind::BitXor);break;
+            case L'~':push(TokenKind::BitNot);break;
+            default: break;
+            }
+        }
+        return tokens;
+    }
+private:
+    bool Match(wchar_t c){if(position_<source_.size()&&source_[position_]==c){++position_;return true;}return false;}
+    void SkipTrivia(){
+        for(;;){
+            while(position_<source_.size()&&std::iswspace(source_[position_])){if(source_[position_++]==L'\n')++line_;}
+            if(position_+1<source_.size()&&source_[position_]==L'/'&&source_[position_+1]==L'/'){
+                position_+=2;while(position_<source_.size()&&source_[position_]!=L'\n')++position_;continue;
+            }
+            if(position_+1<source_.size()&&source_[position_]==L'/'&&source_[position_+1]==L'*'){
+                position_+=2;while(position_+1<source_.size()&&!(source_[position_]==L'*'&&source_[position_+1]==L'/')){if(source_[position_++]==L'\n')++line_;}if(position_+1<source_.size())position_+=2;continue;
+            }
+            break;
+        }
+    }
+    void AppendEscape(std::wstring& out){
+        if(position_>=source_.size())return;
+        const wchar_t escaped=source_[position_++];
+        switch(escaped){
+        case L'n':out+=L'\n';return;case L'r':out+=L'\r';return;
+        case L't':out+=L'\t';return;case L'b':out+=L'\b';return;
+        case L'f':out+=L'\f';return;case L'v':out+=L'\v';return;
+        case L'0':out+=L'\0';return;
+        case L'\n':++line_;return;
+        case L'\r':if(position_<source_.size()&&source_[position_]==L'\n')++position_;++line_;return;
+        case L'x':{
+            if(position_+2<=source_.size()){
+                const int high=HexDigitValue(source_[position_]),low=HexDigitValue(source_[position_+1]);
+                if(high>=0&&low>=0){out+=static_cast<wchar_t>((high<<4)|low);position_+=2;return;}
+            }
+            out+=L'x';return;
+        }
+        case L'u':{
+            size_t unicodePosition=position_-1;std::uint32_t codePoint=0;
+            if(ParseUnicodeEscape(source_,unicodePosition,codePoint)){
+                AppendCodePoint(out,codePoint);position_=unicodePosition;return;
+            }
+            out+=L'u';return;
+        }
+        default:out+=escaped;return;
+        }
+    }
+    std::wstring ReadString(wchar_t quote){
+        std::wstring out;
+        while(position_<source_.size()){
+            wchar_t c=source_[position_++]; if(c==quote)break;
+            if(c==L'\\')AppendEscape(out);else{if(c==L'\n')++line_;out+=c;}
+        }return out;
+    }
+    std::wstring ReadTemplate(){
+        std::wstring out; int interpolation=0;
+        while(position_<source_.size()){
+            wchar_t c=source_[position_++];
+            if(c==L'\\'&&position_<source_.size()){
+                if(interpolation==0)AppendEscape(out);
+                else{out+=c;out+=source_[position_++];}
+                continue;
+            }
+            if(c==L'`'&&interpolation==0)break;
+            if(c==L'$'&&position_<source_.size()&&source_[position_]==L'{'){out+=c;out+=source_[position_++];++interpolation;continue;}
+            if(c==L'{'&&interpolation>0)++interpolation;
+            if(c==L'}'&&interpolation>0)--interpolation;
+            out+=c;
+        }return out;
+    }
+    const std::wstring& source_; size_t position_=0; int line_=1;
+};
+
+class Compiler {
+public:
+    Compiler(std::shared_ptr<Module> module, const std::wstring& source)
+        : module_(std::move(module)), tokens_(Lexer(source).Scan()) {}
+    Chunk CompileProgram(){ Chunk chunk; chunk_=&chunk; while(!AtEnd()) Statement(); Emit(Op::Undefined);Emit(Op::Return);return chunk; }
+    Chunk CompileExpressionOnly(){Chunk chunk;chunk_=&chunk;Expression();Emit(Op::Return);return chunk;}
+private:
+    bool AtEnd()const{return Peek().kind==TokenKind::End;}
+    const Token& Peek(int ahead=0)const{return tokens_[std::min(position_+static_cast<size_t>(ahead),tokens_.size()-1)];}
+    const Token& Previous()const{return tokens_[position_-1];}
+    bool Check(TokenKind kind)const{return Peek().kind==kind;}
+    bool CheckWord(const wchar_t* word)const{return Check(TokenKind::Identifier)&&Peek().text==word;}
+    Token Advance(){if(!AtEnd())++position_;return Previous();}
+    bool Match(TokenKind kind){if(Check(kind)){Advance();return true;}return false;}
+    bool MatchWord(const wchar_t* word){if(CheckWord(word)){Advance();return true;}return false;}
+    Token Consume(TokenKind kind,const wchar_t* message){if(Check(kind))return Advance();throw Error(message);}
+    Token ConsumeIdentifier(const wchar_t* message){return Consume(TokenKind::Identifier,message);}
+    std::runtime_error Error(const wchar_t* message)const{
+        std::wstringstream s;s<<L"JavaScript line "<<Peek().line<<L": "<<message;
+        if(Peek().kind!=TokenKind::End&&!Peek().text.empty()){
+            s<<L" near '"<<Peek().text.substr(0,48)<<L"'";
+            if(position_>0&&!Previous().text.empty())s<<L" after '"<<Previous().text.substr(0,48)<<L"'";
+            if(Peek(1).kind!=TokenKind::End&&!Peek(1).text.empty())s<<L" before '"<<Peek(1).text.substr(0,48)<<L"'";
+        }
+        return std::runtime_error(WideToUtf8(s.str()));
+    }
+    int Emit(Op op,int argument=0,std::wstring text=L""){chunk_->code.push_back({op,argument,std::move(text)});return static_cast<int>(chunk_->code.size()-1);}
+    int Jump(Op op){return Emit(op,-1);}
+    void Patch(int index){chunk_->code[index].argument=static_cast<int>(chunk_->code.size());}
+    int Constant(Value v){chunk_->constants.push_back(std::move(v));return static_cast<int>(chunk_->constants.size()-1);}
+    void OptionalSemicolon(){Match(TokenKind::Semicolon);}
+
+    void Statement(){
+        if(Match(TokenKind::Semicolon))return;
+        if(Match(TokenKind::LeftBrace)){while(!Check(TokenKind::RightBrace)&&!AtEnd())Statement();Consume(TokenKind::RightBrace,L"Expected '}'");return;}
+        if(CheckWord(L"async")&&Peek(1).kind==TokenKind::Identifier&&Peek(1).text==L"function"){Advance();Advance();FunctionDeclaration(true);return;}
+        if(MatchWord(L"class")){ClassDeclaration();return;}
+        if(MatchWord(L"function")){FunctionDeclaration();return;}
+        if(MatchWord(L"const")||MatchWord(L"let")||MatchWord(L"var")){VariableDeclaration();return;}
+        if(MatchWord(L"if")){IfStatement();return;}
+        if(MatchWord(L"try")){TryStatement();return;}
+        if(MatchWord(L"throw")){Expression();Emit(Op::ThrowValue);OptionalSemicolon();return;}
+        if(MatchWord(L"switch")){SwitchStatement();return;}
+        if(MatchWord(L"for")){ForStatement();return;}
+        if(MatchWord(L"do")){DoWhileStatement();return;}
+        if(MatchWord(L"while")){WhileStatement();return;}
+        if(MatchWord(L"break")){if(controls_.empty())throw Error(L"break outside loop or switch");controls_.back().breaks.push_back(Jump(Op::Jump));OptionalSemicolon();return;}
+        if(MatchWord(L"continue")){
+            auto context=std::find_if(controls_.rbegin(),controls_.rend(),[](const ControlContext& value){return value.continueTarget!=-1;});
+            if(context==controls_.rend())throw Error(L"continue outside loop");
+            if(context->continueTarget>=0)Emit(Op::Jump,context->continueTarget);
+            else context->continues.push_back(Jump(Op::Jump));
+            OptionalSemicolon();return;
+        }
+        if(MatchWord(L"return")){if(Check(TokenKind::Semicolon)||Check(TokenKind::RightBrace))Emit(Op::Undefined);else Expression();Emit(Op::Return);OptionalSemicolon();return;}
+        Expression();Emit(Op::Pop);OptionalSemicolon();
+    }
+    void TryStatement(){
+        const int handlerIndex=static_cast<int>(chunk_->handlers.size());
+        chunk_->handlers.emplace_back();
+        Chunk::ExceptionHandler handler;
+        handler.tryStart=chunk_->code.size();
+        Statement();
+        handler.tryEnd=chunk_->code.size();
+        const int afterTry=Jump(Op::Jump);
+        int afterCatch=-1;
+        if(MatchWord(L"catch")){
+            handler.hasCatch=true;
+            if(Match(TokenKind::LeftParen)){handler.catchName=ConsumeIdentifier(L"Expected catch variable").text;Consume(TokenKind::RightParen,L"Expected ')'");}
+            handler.catchStart=chunk_->code.size();
+            Statement();
+            handler.catchEnd=chunk_->code.size();
+            Emit(Op::LeaveCatch,handlerIndex);
+            afterCatch=Jump(Op::Jump);
+        }
+        if(MatchWord(L"finally")){
+            handler.hasFinally=true;
+            handler.finallyStart=chunk_->code.size();
+            Statement();
+            Emit(Op::EndFinally,handlerIndex);
+            handler.finallyEnd=chunk_->code.size();
+        }
+        if(!handler.hasCatch&&!handler.hasFinally)throw Error(L"Expected catch or finally");
+        handler.end=chunk_->code.size();
+        chunk_->code[afterTry].argument=static_cast<int>(handler.hasFinally?handler.finallyStart:handler.end);
+        if(afterCatch>=0)chunk_->code[afterCatch].argument=static_cast<int>(handler.hasFinally?handler.finallyStart:handler.end);
+        chunk_->handlers[handlerIndex]=std::move(handler);
+    }
+    void FunctionDeclaration(bool isAsync=false){
+        const auto name=ConsumeIdentifier(L"Expected function name").text;
+        const int index=ParseFunction(false,L"",isAsync); Emit(Op::MakeFunction,index);Emit(Op::Declare,0,name);
+    }
+    void ClassDeclaration(){
+        const auto name=ConsumeIdentifier(L"Expected class name").text;
+        Consume(TokenKind::LeftBrace,L"Expected '{' after class name");
+        Emit(Op::NewObject);
+        while(!Check(TokenKind::RightBrace)&&!AtEnd()){
+            const bool isStatic=MatchWord(L"static");
+            const bool isAsync=MatchWord(L"async");
+            const auto member=ConsumeIdentifier(L"Expected class member name").text;
+            if(Check(TokenKind::LeftParen)){
+                const int index=ParseFunction(false,L"",isAsync);
+                Emit(Op::MakeFunction,index);
+                Emit(Op::ObjectSet,0,isStatic?member:L"$method:"+member);
+            }else{
+                if(isAsync)throw Error(L"Expected '(' after async class method");
+                if(!isStatic)throw Error(L"Instance class fields are not supported");
+                if(Match(TokenKind::Assign))Assignment();else Emit(Op::Undefined);
+                Emit(Op::ObjectSet,0,member);OptionalSemicolon();
+            }
+        }
+        Consume(TokenKind::RightBrace,L"Expected '}' after class body");
+        Emit(Op::Declare,0,name);
+    }
+    void VariableDeclaration(){
+        do{
+            if(Check(TokenKind::LeftBracket)||Check(TokenKind::LeftBrace)){
+                const bool indexed=Match(TokenKind::LeftBracket);
+                if(!indexed)Consume(TokenKind::LeftBrace,L"Expected '{'");
+                const auto end=indexed?TokenKind::RightBracket:TokenKind::RightBrace;
+                std::vector<std::pair<std::wstring,std::wstring>> bindings;
+                while(!Check(end)&&!AtEnd()){
+                    auto property=indexed?std::to_wstring(bindings.size()):ConsumeIdentifier(L"Expected property name").text;
+                    auto name=indexed?ConsumeIdentifier(L"Expected element name").text:property;
+                    if(!indexed&&Match(TokenKind::Colon))name=ConsumeIdentifier(L"Expected binding name").text;
+                    bindings.emplace_back(property,name);
+                    if(!Match(TokenKind::Comma))break;
+                }
+                Consume(end,L"Expected closing destructuring bracket");
+                if(Match(TokenKind::Assign))Assignment();else Emit(Op::Undefined);
+                const auto source=L"$binding_"+std::to_wstring(hiddenVariable_++);
+                Emit(Op::Declare,0,source);
+                for(const auto& binding:bindings){
+                    Emit(Op::LoadReference,0,source);
+                    if(indexed){Emit(Op::Constant,Constant(Value::String(binding.first)));Emit(Op::GetIndex);}
+                    else Emit(Op::GetProperty,0,binding.first);
+                    Emit(Op::Declare,0,binding.second);
+                }
+                continue;
+            }
+            const auto name=ConsumeIdentifier(L"Expected variable name").text;
+            if(Match(TokenKind::Assign))Assignment();else Emit(Op::Undefined);
+            Emit(Op::Declare,0,name);
+        }while(Match(TokenKind::Comma));OptionalSemicolon();
+    }
+    void IfStatement(){
+        Consume(TokenKind::LeftParen,L"Expected '('");Expression();Consume(TokenKind::RightParen,L"Expected ')'");
+        const int falseJump=Jump(Op::JumpFalse);Statement();
+        if(MatchWord(L"else")){const int end=Jump(Op::Jump);Patch(falseJump);Statement();Patch(end);}else Patch(falseJump);
+    }
+    struct ControlContext { int continueTarget=-1;std::vector<int> breaks;std::vector<int> continues; };
+    void FinishControl(){
+        auto context=std::move(controls_.back());controls_.pop_back();
+        for(int index:context.breaks)Patch(index);
+        for(int index:context.continues)chunk_->code[index].argument=context.continueTarget;
+    }
+    void SwitchStatement(){
+        struct Clause { bool isDefault=false;size_t expressionStart=0,expressionEnd=0,bodyStart=0,bodyEnd=0;int entryJump=-1,bodyEntry=-1; };
+        Consume(TokenKind::LeftParen,L"Expected '(' after switch");Expression();Consume(TokenKind::RightParen,L"Expected ')' after switch value");
+        const auto valueName=L"$switch_value_"+std::to_wstring(hiddenVariable_++);Emit(Op::Declare,0,valueName);
+        Consume(TokenKind::LeftBrace,L"Expected '{' after switch value");
+        std::vector<Clause> clauses;
+        while(!Check(TokenKind::RightBrace)&&!AtEnd()){
+            Clause clause;
+            if(MatchWord(L"case")){
+                clause.expressionStart=position_;int parens=0,brackets=0,braces=0,questions=0;
+                while(!AtEnd()){
+                    const auto kind=Peek().kind;
+                    if(kind==TokenKind::LeftParen)++parens;else if(kind==TokenKind::RightParen)--parens;
+                    else if(kind==TokenKind::LeftBracket)++brackets;else if(kind==TokenKind::RightBracket)--brackets;
+                    else if(kind==TokenKind::LeftBrace)++braces;else if(kind==TokenKind::RightBrace)--braces;
+                    else if(parens==0&&brackets==0&&braces==0&&kind==TokenKind::Question)++questions;
+                    else if(parens==0&&brackets==0&&braces==0&&kind==TokenKind::Colon){if(questions>0)--questions;else break;}
+                    Advance();
+                }
+                clause.expressionEnd=position_;Consume(TokenKind::Colon,L"Expected ':' after switch case");
+            }else if(MatchWord(L"default")){
+                clause.isDefault=true;Consume(TokenKind::Colon,L"Expected ':' after switch default");
+            }else throw Error(L"Expected case or default in switch");
+            clause.bodyStart=position_;int braces=0;
+            while(!AtEnd()){
+                if(braces==0&&(Check(TokenKind::RightBrace)||CheckWord(L"case")||CheckWord(L"default")))break;
+                if(Check(TokenKind::LeftBrace))++braces;else if(Check(TokenKind::RightBrace))--braces;
+                Advance();
+            }
+            clause.bodyEnd=position_;clauses.push_back(clause);
+        }
+        Consume(TokenKind::RightBrace,L"Expected '}' after switch");const auto afterSwitch=position_;
+
+        int defaultIndex=-1;
+        for(size_t index=0;index<clauses.size();++index){
+            auto& clause=clauses[index];if(clause.isDefault){defaultIndex=static_cast<int>(index);continue;}
+            Emit(Op::LoadReference,0,valueName);position_=clause.expressionStart;Expression();
+            if(position_!=clause.expressionEnd)throw Error(L"Invalid switch case expression");
+            Emit(Op::StrictEqual);const int noMatch=Jump(Op::JumpFalse);clause.entryJump=Jump(Op::Jump);Patch(noMatch);
+        }
+        const int noCaseMatched=Jump(Op::Jump);
+        controls_.push_back({-1,{}});
+        for(auto& clause:clauses){
+            clause.bodyEntry=static_cast<int>(chunk_->code.size());
+            if(clause.entryJump>=0)chunk_->code[clause.entryJump].argument=clause.bodyEntry;
+            position_=clause.bodyStart;while(position_<clause.bodyEnd)Statement();
+            if(position_!=clause.bodyEnd)throw Error(L"Invalid switch case body");
+        }
+        if(defaultIndex>=0)chunk_->code[noCaseMatched].argument=clauses[static_cast<size_t>(defaultIndex)].bodyEntry;
+        else Patch(noCaseMatched);
+        FinishControl();position_=afterSwitch;
+    }
+    void WhileStatement(){
+        Consume(TokenKind::LeftParen,L"Expected '('");const int condition=static_cast<int>(chunk_->code.size());
+        Expression();Consume(TokenKind::RightParen,L"Expected ')'");const int done=Jump(Op::JumpFalse);
+        controls_.push_back({condition,{}});Statement();Emit(Op::Jump,condition);Patch(done);FinishControl();
+    }
+    void DoWhileStatement(){
+        const int body=static_cast<int>(chunk_->code.size());
+        controls_.push_back({-2,{}});Statement();
+        if(!MatchWord(L"while"))throw Error(L"Expected 'while' after do-while body");
+        const int condition=static_cast<int>(chunk_->code.size());
+        controls_.back().continueTarget=condition;
+        Consume(TokenKind::LeftParen,L"Expected '(' after while");Expression();
+        Consume(TokenKind::RightParen,L"Expected ')' after do-while condition");
+        const int done=Jump(Op::JumpFalse);Emit(Op::Jump,body);Patch(done);
+        OptionalSemicolon();FinishControl();
+    }
+    void ForStatement(){
+        Consume(TokenKind::LeftParen,L"Expected '('");
+        if((CheckWord(L"const")||CheckWord(L"let")||CheckWord(L"var"))&&
+           Peek(1).kind==TokenKind::Identifier&&Peek(2).kind==TokenKind::Identifier&&
+           (Peek(2).text==L"of"||Peek(2).text==L"in")){
+            Advance();const auto itemName=Advance().text;const bool enumerateKeys=Advance().text==L"in";
+            ForEachStatement(itemName,enumerateKeys,true);return;
+        }
+        if(Check(TokenKind::Identifier)&&Peek(1).kind==TokenKind::Identifier&&
+           (Peek(1).text==L"of"||Peek(1).text==L"in")){
+            const auto itemName=Advance().text;const bool enumerateKeys=Advance().text==L"in";
+            ForEachStatement(itemName,enumerateKeys,false);return;
+        }
+        if(!Match(TokenKind::Semicolon)){
+            if(MatchWord(L"const")||MatchWord(L"let")||MatchWord(L"var"))VariableDeclaration();
+            else{Expression();Emit(Op::Pop);Consume(TokenKind::Semicolon,L"Expected ';'");}
+        }
+        const int condition=static_cast<int>(chunk_->code.size());
+        if(Check(TokenKind::Semicolon))Emit(Op::TrueValue);else Expression();
+        Consume(TokenKind::Semicolon,L"Expected ';'");const int done=Jump(Op::JumpFalse);
+        const int enterBody=Jump(Op::Jump);
+        const int increment=static_cast<int>(chunk_->code.size());
+        if(!Check(TokenKind::RightParen)){Expression();Emit(Op::Pop);}
+        Consume(TokenKind::RightParen,L"Expected ')'");Emit(Op::Jump,condition);
+        Patch(enterBody);controls_.push_back({increment,{}});Statement();Emit(Op::Jump,increment);Patch(done);FinishControl();
+    }
+    void ForEachStatement(const std::wstring& itemName,bool enumerateKeys,bool declareItem){
+        Assignment();Consume(TokenKind::RightParen,enumerateKeys?L"Expected ')' after for-in object":L"Expected ')' after for-of iterable");
+        if(enumerateKeys)Emit(Op::EnumerableKeys);
+        const auto suffix=std::to_wstring(hiddenVariable_++);
+        const auto valuesName=L"$for_values_"+suffix,indexName=L"$for_index_"+suffix;
+        Emit(Op::Declare,0,valuesName);
+        Emit(Op::Constant,Constant(Value::Number(0)));Emit(Op::Declare,0,indexName);
+
+        const int condition=static_cast<int>(chunk_->code.size());
+        Emit(Op::LoadReference,0,indexName);Emit(Op::LoadReference,0,valuesName);Emit(Op::GetProperty,0,L"length");Emit(Op::Less);
+        const int done=Jump(Op::JumpFalse);const int enterBody=Jump(Op::Jump);
+        const int increment=static_cast<int>(chunk_->code.size());
+        Emit(Op::LoadReference,0,indexName);Emit(Op::PostIncrement);Emit(Op::Pop);Emit(Op::Jump,condition);
+
+        Patch(enterBody);
+        if(!declareItem)Emit(Op::LoadReference,0,itemName);
+        Emit(Op::LoadReference,0,valuesName);Emit(Op::LoadReference,0,indexName);Emit(Op::GetIndex);
+        if(declareItem)Emit(Op::Declare,0,itemName);else{Emit(Op::Assign);Emit(Op::Pop);}
+        controls_.push_back({increment,{}});Statement();Emit(Op::Jump,increment);Patch(done);FinishControl();
+    }
+    void ParseParameters(const std::shared_ptr<Prototype>& prototype){
+        if(!Check(TokenKind::RightParen))do{
+            if(Match(TokenKind::Ellipsis)){
+                prototype->restParameter=ConsumeIdentifier(L"Expected rest parameter name").text;
+                if(Check(TokenKind::Comma))throw Error(L"Rest parameter must be last");
+                break;
+            }
+            if(Match(TokenKind::LeftBracket)||Check(TokenKind::LeftBrace)){
+                const bool indexed=Previous().kind==TokenKind::LeftBracket;
+                if(!indexed)Consume(TokenKind::LeftBrace,L"Expected '{'");
+                const auto end=indexed?TokenKind::RightBracket:TokenKind::RightBrace;
+                const auto parameter=L"$parameter_"+std::to_wstring(prototype->parameters.size());
+                prototype->parameters.push_back(parameter);prototype->parameterDefaults.push_back({});
+                size_t index=0;
+                while(!Check(end)&&!AtEnd()){
+                    auto property=indexed?std::to_wstring(index++):ConsumeIdentifier(L"Expected property name").text;
+                    auto name=indexed?ConsumeIdentifier(L"Expected element name").text:property;
+                    if(!indexed&&Match(TokenKind::Colon))name=ConsumeIdentifier(L"Expected binding name").text;
+                    std::shared_ptr<Chunk> bindingDefault;
+                    if(Match(TokenKind::Assign)){
+                        bindingDefault=std::make_shared<Chunk>();Chunk* outer=chunk_;chunk_=bindingDefault.get();
+                        Assignment();Emit(Op::Return);chunk_=outer;
+                    }
+                    prototype->bindings.push_back({parameter,property,name,indexed,std::move(bindingDefault)});
+                    if(!Match(TokenKind::Comma))break;
+                }
+                Consume(end,L"Expected closing parameter bracket");
+                if(Match(TokenKind::Assign)){
+                    auto parameterDefault=std::make_shared<Chunk>();Chunk* outer=chunk_;chunk_=parameterDefault.get();
+                    Assignment();Emit(Op::Return);chunk_=outer;
+                    prototype->parameterDefaults.back()=std::move(parameterDefault);
+                }
+                continue;
+            }
+            prototype->parameters.push_back(ConsumeIdentifier(L"Expected parameter").text);
+            std::shared_ptr<Chunk> defaultValue;
+            if(Match(TokenKind::Assign)){
+                defaultValue=std::make_shared<Chunk>();Chunk* outer=chunk_;chunk_=defaultValue.get();
+                Assignment();Emit(Op::Return);chunk_=outer;
+            }
+            prototype->parameterDefaults.push_back(std::move(defaultValue));
+        }while(Match(TokenKind::Comma)&&!Check(TokenKind::RightParen));
+        Consume(TokenKind::RightParen,L"Expected ')'");
+    }
+    int ParseFunction(bool arrow,const std::wstring& singleParameter,bool isAsync=false){
+        auto prototype=std::make_shared<Prototype>();
+        prototype->lexicalThis=arrow;
+        prototype->isAsync=isAsync;
+        if(!singleParameter.empty()){prototype->parameters.push_back(singleParameter);prototype->parameterDefaults.push_back({});}
+        else{
+            if(!arrow)Consume(TokenKind::LeftParen,L"Expected '('");
+            ParseParameters(prototype);
+        }
+        Chunk* outer=chunk_;const bool outerAsync=compilingAsync_;chunk_=&prototype->chunk;compilingAsync_=isAsync;
+        if(arrow&& !Check(TokenKind::LeftBrace)){Assignment();Emit(Op::Return);}
+        else{Consume(TokenKind::LeftBrace,L"Expected function body");while(!Check(TokenKind::RightBrace)&&!AtEnd())Statement();Consume(TokenKind::RightBrace,L"Expected '}'");Emit(Op::Undefined);Emit(Op::Return);}
+        chunk_=outer;compilingAsync_=outerAsync;module_->prototypes.push_back(prototype);return static_cast<int>(module_->prototypes.size()-1);
+    }
+    bool IsParenArrow()const{
+        size_t i=position_;if(i>=tokens_.size()||tokens_[i].kind!=TokenKind::LeftParen)return false;
+        int depth=0;for(;i<tokens_.size();++i){
+            if(tokens_[i].kind==TokenKind::LeftParen)++depth;
+            else if(tokens_[i].kind==TokenKind::RightParen&&--depth==0)
+                return i+1<tokens_.size()&&tokens_[i+1].kind==TokenKind::Arrow;
+        }
+        return false;
+    }
+    void Expression(){Assignment();while(Match(TokenKind::Comma)){Emit(Op::Pop);Assignment();}}
+    void Assignment(){
+        Conditional();
+        if(Match(TokenKind::Assign)){Assignment();Emit(Op::Assign);}
+        else if(Match(TokenKind::NullishAssign)){
+            Emit(Op::Duplicate);const int existing=Jump(Op::JumpNotNullishKeep);
+            Assignment();Emit(Op::Assign);const int end=Jump(Op::Jump);
+            Patch(existing);Emit(Op::Pop);Patch(end);
+        }
+        else if(Match(TokenKind::PlusAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Add);Emit(Op::Assign);}
+        else if(Match(TokenKind::MinusAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Subtract);Emit(Op::Assign);}
+        else if(Match(TokenKind::StarAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Multiply);Emit(Op::Assign);}
+        else if(Match(TokenKind::SlashAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Divide);Emit(Op::Assign);}
+        else if(Match(TokenKind::PercentAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Modulo);Emit(Op::Assign);}
+        else if(Match(TokenKind::ExponentAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::Power);Emit(Op::Assign);}
+        else if(Match(TokenKind::BitAndAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::BitwiseAnd);Emit(Op::Assign);}
+        else if(Match(TokenKind::BitOrAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::BitwiseOr);Emit(Op::Assign);}
+        else if(Match(TokenKind::BitXorAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::BitwiseXor);Emit(Op::Assign);}
+        else if(Match(TokenKind::ShiftLeftAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::ShiftLeft);Emit(Op::Assign);}
+        else if(Match(TokenKind::ShiftRightAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::ShiftRight);Emit(Op::Assign);}
+        else if(Match(TokenKind::UnsignedShiftRightAssign)){Emit(Op::Duplicate);Assignment();Emit(Op::UnsignedShiftRight);Emit(Op::Assign);}
+        else if(Match(TokenKind::AndAssign)){
+            Emit(Op::Duplicate);const int existing=Jump(Op::JumpFalseKeep);
+            Assignment();Emit(Op::Assign);const int end=Jump(Op::Jump);
+            Patch(existing);Emit(Op::Pop);Patch(end);
+        }
+        else if(Match(TokenKind::OrAssign)){
+            Emit(Op::Duplicate);const int existing=Jump(Op::JumpTrueKeep);
+            Assignment();Emit(Op::Assign);const int end=Jump(Op::Jump);
+            Patch(existing);Emit(Op::Pop);Patch(end);
+        }
+    }
+    void Conditional(){
+        Nullish();
+        if(Match(TokenKind::Question)){const int no=Jump(Op::JumpFalse);Assignment();Consume(TokenKind::Colon,L"Expected ':'");const int end=Jump(Op::Jump);Patch(no);Conditional();Patch(end);}
+    }
+    void Nullish(){LogicalOr();while(Match(TokenKind::Nullish)){const int jump=Jump(Op::JumpNotNullishKeep);LogicalOr();Patch(jump);}}
+    void LogicalOr(){LogicalAnd();while(Match(TokenKind::Or)){const int jump=Jump(Op::JumpTrueKeep);LogicalAnd();Patch(jump);}}
+    void LogicalAnd(){BitwiseOr();while(Match(TokenKind::And)){const int jump=Jump(Op::JumpFalseKeep);BitwiseOr();Patch(jump);}}
+    void BitwiseOr(){BitwiseXor();while(Match(TokenKind::BitOr)){BitwiseXor();Emit(Op::BitwiseOr);}}
+    void BitwiseXor(){BitwiseAnd();while(Match(TokenKind::BitXor)){BitwiseAnd();Emit(Op::BitwiseXor);}}
+    void BitwiseAnd(){Equality();while(Match(TokenKind::BitAnd)){Equality();Emit(Op::BitwiseAnd);}}
+    void Equality(){Comparison();while(Check(TokenKind::Equal)||Check(TokenKind::NotEqual)||Check(TokenKind::StrictEqual)||Check(TokenKind::StrictNotEqual)){const auto op=Advance().kind;Comparison();Emit(op==TokenKind::Equal?Op::Equal:op==TokenKind::NotEqual?Op::NotEqual:op==TokenKind::StrictEqual?Op::StrictEqual:Op::StrictNotEqual);}}
+    void Comparison(){
+        Shift();
+        while(Check(TokenKind::Less)||Check(TokenKind::LessEqual)||Check(TokenKind::Greater)||Check(TokenKind::GreaterEqual)||CheckWord(L"in")){
+            if(MatchWord(L"in")){Shift();Emit(Op::InValue);continue;}
+            const auto op=Advance().kind;Shift();Emit(op==TokenKind::Less?Op::Less:op==TokenKind::LessEqual?Op::LessEqual:op==TokenKind::Greater?Op::Greater:Op::GreaterEqual);
+        }
+    }
+    void Shift(){Term();while(Check(TokenKind::ShiftLeft)||Check(TokenKind::ShiftRight)||Check(TokenKind::UnsignedShiftRight)){const auto op=Advance().kind;Term();Emit(op==TokenKind::ShiftLeft?Op::ShiftLeft:op==TokenKind::ShiftRight?Op::ShiftRight:Op::UnsignedShiftRight);}}
+    void Term(){Factor();while(Check(TokenKind::Plus)||Check(TokenKind::Minus)){const auto op=Advance().kind;Factor();Emit(op==TokenKind::Plus?Op::Add:Op::Subtract);}}
+    void Factor(){PowerExpression();while(Check(TokenKind::Star)||Check(TokenKind::Slash)||Check(TokenKind::Percent)){const auto op=Advance().kind;PowerExpression();Emit(op==TokenKind::Star?Op::Multiply:op==TokenKind::Slash?Op::Divide:Op::Modulo);}}
+    void PowerExpression(){Unary();if(Match(TokenKind::Exponent)){PowerExpression();Emit(Op::Power);}}
+    void Unary(){
+        if(Match(TokenKind::Bang)){Unary();Emit(Op::Not);return;}if(Match(TokenKind::Minus)){Unary();Emit(Op::Negate);return;}
+        if(Match(TokenKind::Plus)){Unary();Emit(Op::Positive);return;}
+        if(Match(TokenKind::BitNot)){Unary();Emit(Op::BitwiseNot);return;}
+        if(Match(TokenKind::PlusPlus)){Unary();Emit(Op::PreIncrement);return;}
+        if(Match(TokenKind::MinusMinus)){Unary();Emit(Op::PreDecrement);return;}
+        if(MatchWord(L"await")){if(!compilingAsync_)throw Error(L"await outside async function");Unary();Emit(Op::Await);return;}
+        if(MatchWord(L"delete")){Unary();Emit(Op::DeleteValue);return;}
+        if(MatchWord(L"void")){Unary();Emit(Op::VoidValue);return;}
+        if(MatchWord(L"new")){NewExpression();return;}
+        if(MatchWord(L"typeof")){Unary();Emit(Op::TypeOf);return;}Postfix();
+    }
+    void Arguments(){
+        Emit(Op::NewArray);
+        if(!Check(TokenKind::RightParen))do{
+            const bool spread=Match(TokenKind::Ellipsis);Assignment();Emit(spread?Op::ArraySpread:Op::ArrayPush);
+        }while(Match(TokenKind::Comma)&&!Check(TokenKind::RightParen));
+        Consume(TokenKind::RightParen,L"Expected ')'");
+    }
+    void Postfix(){
+        Primary();
+        for(;;){
+            if(Match(TokenKind::Dot)){Emit(Op::GetProperty,0,ConsumeIdentifier(L"Expected property name").text);}
+            else if(Match(TokenKind::OptionalChain)){
+                const int value=Jump(Op::JumpNotNullishKeep);
+                Emit(Op::Undefined);const int end=Jump(Op::Jump);Patch(value);
+                if(Match(TokenKind::LeftBracket)){Expression();Consume(TokenKind::RightBracket,L"Expected ']'");Emit(Op::GetIndex);}
+                else if(Match(TokenKind::LeftParen)){Arguments();Emit(Op::CallArray);}
+                else Emit(Op::GetProperty,0,ConsumeIdentifier(L"Expected property name").text);
+                Patch(end);
+            }
+            else if(Match(TokenKind::LeftBracket)){Expression();Consume(TokenKind::RightBracket,L"Expected ']'");Emit(Op::GetIndex);}
+            else if(Match(TokenKind::LeftParen)){Arguments();Emit(Op::CallArray);}
+            else if(Match(TokenKind::PlusPlus))Emit(Op::PostIncrement);
+            else if(Match(TokenKind::MinusMinus))Emit(Op::PostDecrement);
+            else break;
+        }
+    }
+    void NewExpression(){
+        Primary();
+        while(true){
+            if(Match(TokenKind::Dot))Emit(Op::GetProperty,0,ConsumeIdentifier(L"Expected property name").text);
+            else if(Match(TokenKind::LeftBracket)){Expression();Consume(TokenKind::RightBracket,L"Expected ']'");Emit(Op::GetIndex);}
+            else break;
+        }
+        if(Match(TokenKind::LeftParen)){Arguments();Emit(Op::ConstructArray);}else Emit(Op::Construct,0);
+        for(;;){
+            if(Match(TokenKind::Dot))Emit(Op::GetProperty,0,ConsumeIdentifier(L"Expected property name").text);
+            else if(Match(TokenKind::LeftBracket)){Expression();Consume(TokenKind::RightBracket,L"Expected ']'");Emit(Op::GetIndex);}
+            else if(Match(TokenKind::LeftParen)){Arguments();Emit(Op::CallArray);}
+            else break;
+        }
+    }
+    void Primary(){
+        if(Match(TokenKind::Number)){Emit(Op::Constant,Constant(Value::Number(Previous().number)));return;}
+        if(Match(TokenKind::String)){Emit(Op::Constant,Constant(Value::String(Previous().text)));return;}
+        if(Match(TokenKind::Template)){Emit(Op::Template,Constant(Value::String(Previous().text)));return;}
+        if(Match(TokenKind::RegExp)){auto expression=std::make_shared<Object>();expression->kind=ObjectKind::RegExp;expression->props[L"$pattern"]=Value::String(Previous().text);expression->props[L"$flags"]=Value::String(Previous().extra);Emit(Op::Constant,Constant(Value::FromObject(expression)));return;}
+        if(MatchWord(L"true")){Emit(Op::TrueValue);return;}if(MatchWord(L"false")){Emit(Op::FalseValue);return;}
+        if(MatchWord(L"null")){Emit(Op::Null);return;}if(MatchWord(L"undefined")){Emit(Op::Undefined);return;}
+        if(MatchWord(L"async")){
+            if(MatchWord(L"function")){Emit(Op::MakeFunction,ParseFunction(false,L"",true));return;}
+            if(Check(TokenKind::Identifier)&&Peek(1).kind==TokenKind::Arrow){const auto name=Advance().text;Advance();Emit(Op::MakeFunction,ParseArrowSingle(name,true));return;}
+            if(IsParenArrow()){Emit(Op::MakeFunction,ParseParenArrow(true));return;}
+            Primary();return;
+        }
+        if(MatchWord(L"function")){Emit(Op::MakeFunction,ParseFunction(false,L""));return;}
+        if(IsParenArrow()){Emit(Op::MakeFunction,ParseParenArrow(false));return;}
+        if(Match(TokenKind::LeftParen)){Expression();Consume(TokenKind::RightParen,L"Expected ')'");return;}
+        if(Match(TokenKind::LeftBracket)){
+            Emit(Op::NewArray);
+            while(!Check(TokenKind::RightBracket)&&!AtEnd()){
+                if(Match(TokenKind::Comma)){Emit(Op::Undefined);Emit(Op::ArrayPush);continue;}
+                const bool spread=Match(TokenKind::Ellipsis);Assignment();Emit(spread?Op::ArraySpread:Op::ArrayPush);
+                if(!Match(TokenKind::Comma))break;
+            }
+            Consume(TokenKind::RightBracket,L"Expected ']'");return;
+        }
+        if(Match(TokenKind::LeftBrace)){
+            Emit(Op::NewObject);
+            if(!Check(TokenKind::RightBrace))do{
+                if(Match(TokenKind::Ellipsis)){Assignment();Emit(Op::ObjectSpread);continue;}
+                if(CheckWord(L"get")&&Peek(1).kind==TokenKind::Identifier&&Peek(2).kind==TokenKind::LeftParen){
+                    Advance();const auto name=Advance().text;Emit(Op::MakeFunction,ParseFunction(false,L""));Emit(Op::ObjectSet,0,L"$get:"+name);continue;
+                }
+                if(CheckWord(L"async")&&Peek(1).kind==TokenKind::Identifier&&Peek(2).kind==TokenKind::LeftParen){
+                    Advance();const auto name=Advance().text;Emit(Op::MakeFunction,ParseFunction(false,L"",true));Emit(Op::ObjectSet,0,name);continue;
+                }
+                if(Check(TokenKind::Identifier)&&Peek(1).kind==TokenKind::LeftParen){
+                    const auto name=Advance().text;Emit(Op::MakeFunction,ParseFunction(false,L""));Emit(Op::ObjectSet,0,name);continue;
+                }
+                Token key;if(Check(TokenKind::Identifier)||Check(TokenKind::String)||Check(TokenKind::Number))key=Advance();else throw Error(L"Expected object key");
+                if(Match(TokenKind::Colon))Assignment();
+                else if(key.kind==TokenKind::Identifier)Emit(Op::LoadReference,0,key.text);
+                else throw Error(L"Expected ':'");
+                Emit(Op::ObjectSet,0,key.text);
+            }while(Match(TokenKind::Comma)&&!Check(TokenKind::RightBrace));
+            Consume(TokenKind::RightBrace,L"Expected '}'");return;
+        }
+        if(Check(TokenKind::Identifier)){
+            auto name=Advance().text;
+            if(Match(TokenKind::Arrow)){Emit(Op::MakeFunction,ParseArrowSingle(name,false));return;}
+            Emit(Op::LoadReference,0,name);return;
+        }
+        throw Error(L"Expected expression");
+    }
+    int ParseArrowSingle(const std::wstring& name,bool isAsync){
+        auto prototype=std::make_shared<Prototype>();prototype->parameters.push_back(name);prototype->parameterDefaults.push_back({});prototype->lexicalThis=true;prototype->isAsync=isAsync;Chunk* outer=chunk_;const bool outerAsync=compilingAsync_;chunk_=&prototype->chunk;compilingAsync_=isAsync;
+        if(Match(TokenKind::LeftBrace)){while(!Check(TokenKind::RightBrace)&&!AtEnd())Statement();Consume(TokenKind::RightBrace,L"Expected '}'");Emit(Op::Undefined);Emit(Op::Return);}else{Assignment();Emit(Op::Return);}
+        chunk_=outer;compilingAsync_=outerAsync;module_->prototypes.push_back(prototype);return static_cast<int>(module_->prototypes.size()-1);
+    }
+    int ParseParenArrow(bool isAsync){
+        Consume(TokenKind::LeftParen,L"");auto prototype=std::make_shared<Prototype>();ParseParameters(prototype);Consume(TokenKind::Arrow,L"Expected =>");
+        prototype->lexicalThis=true;prototype->isAsync=isAsync;Chunk* outer=chunk_;const bool outerAsync=compilingAsync_;chunk_=&prototype->chunk;compilingAsync_=isAsync;
+        if(Match(TokenKind::LeftBrace)){while(!Check(TokenKind::RightBrace)&&!AtEnd())Statement();Consume(TokenKind::RightBrace,L"Expected '}'");Emit(Op::Undefined);Emit(Op::Return);}else{Assignment();Emit(Op::Return);}
+        chunk_=outer;compilingAsync_=outerAsync;module_->prototypes.push_back(prototype);return static_cast<int>(module_->prototypes.size()-1);
+    }
+    std::shared_ptr<Module> module_;std::vector<Token> tokens_;size_t position_=0;Chunk* chunk_=nullptr;std::vector<ControlContext> controls_;size_t hiddenVariable_=0;bool compilingAsync_=false;
+};
+
+std::wstring NumberString(double number) {
+    if(std::isnan(number))return L"NaN";if(std::isinf(number))return number<0?L"-Infinity":L"Infinity";
+    std::wostringstream out;out<<std::setprecision(15)<<number;auto value=out.str();
+    if(value.find(L'.')!=std::wstring::npos){while(!value.empty()&&value.back()==L'0')value.pop_back();if(!value.empty()&&value.back()==L'.')value.pop_back();}
+    return value;
+}
+
+std::wstring CamelToKebab(const std::wstring& value){std::wstring out;for(wchar_t c:value){if(std::iswupper(c)){out+=L'-';out+=std::towlower(c);}else out+=c;}return out;}
+std::wstring DatasetAttributeName(const std::wstring& value){return L"data-"+CamelToKebab(value);}
+
+struct RuntimeCore {
+    struct MutationBatch {
+        RuntimeCore& runtime;
+        explicit MutationBatch(RuntimeCore& value):runtime(value){runtime.BeginMutationBatch();}
+        ~MutationBatch(){runtime.EndMutationBatch();}
+    };
+    Document& document;
+    JavaScriptRuntime::MessageSink messageSink;
+    JavaScriptRuntime::MutationSink mutationSink;
+    JavaScriptRuntime::GeometryProvider geometryProvider;
+    JavaScriptRuntime::StylePropertyProvider stylePropertyProvider;
+    JavaScriptRuntime::FrameScheduler frameScheduler;
+    JavaScriptRuntime::TimerScheduler timerScheduler;
+    JavaScriptRuntime::ResourceLoader resourceLoader;
+    JavaScriptRuntime::FrameMessageSink frameMessageSink;
+    JavaScriptRuntime::ParentMessageSink parentMessageSink;
+    JavaScriptRuntime::FocusSink focusSink;
+    JavaScriptRuntime::SelectionProvider selectionProvider;
+    JavaScriptRuntime::SelectionSetter selectionSetter;
+    std::wstring location;
+    std::shared_ptr<Environment> global=std::make_shared<Environment>();
+    std::shared_ptr<Module> module=std::make_shared<Module>();
+    FastMap<Node*,FastMap<std::wstring,std::vector<Value>>> listeners;
+    FastMap<std::wstring,std::vector<Value>> documentListeners;
+    FastMap<std::wstring,std::vector<Value>> windowListeners;
+    FastMap<std::wstring,std::vector<Value>> webViewListeners;
+    FastMap<Node*,std::weak_ptr<Object>> nodeObjects;
+    FastMap<Node*,std::weak_ptr<Object>> frameWindows;
+    FastMap<std::wstring,std::shared_ptr<const std::wregex>> regularExpressions;
+    FastMap<std::wstring,std::shared_ptr<const FiniteRegexSeparator>> finiteRegularExpressions;
+    FastMap<std::wstring,AnchoredRegexPrefixes> anchoredRegexPrefixes;
+    struct TemplateProgram {
+        std::vector<std::wstring> literals;
+        std::vector<Chunk> expressions;
+    };
+    FastMap<std::wstring,std::shared_ptr<TemplateProgram>> templatePrograms;
+    std::vector<std::pair<unsigned,Value>> frameCallbacks;
+    struct TimerEntry { unsigned id=0;Value callback;std::chrono::steady_clock::time_point due;unsigned interval=0; };
+    std::vector<TimerEntry> timers;
+    std::deque<std::function<void()>> microtasks;
+    std::vector<std::weak_ptr<Object>> possiblyUnhandledRejections;
+    unsigned nextFrameId=1;
+    unsigned nextTimerId=1;
+    bool frameScheduled=false;
+    bool timerScheduled=false;
+    bool drainingMicrotasks=false;
+    std::chrono::steady_clock::time_point timerWake{};
+    std::wstring lastError;
+    int mutationBatchDepth=0;
+    bool mutationPending=false;
+    bool indexDirty=false;
+    double viewportWidth=0;
+    double viewportHeight=0;
+
+    explicit RuntimeCore(Document& d):document(d){InstallGlobals();}
+
+    std::shared_ptr<const std::wregex> RegularExpression(const std::wstring& pattern,
+                                                        const std::wstring& flags){
+        const auto key=flags+L'\x1f'+pattern;
+        const auto cached=regularExpressions.find(key);
+        if(cached!=regularExpressions.end())return cached->second;
+        std::wregex::flag_type options=std::regex_constants::ECMAScript;
+        if(flags.find(L'i')!=std::wstring::npos)options|=std::regex_constants::icase;
+        try{
+            auto expression=std::make_shared<const std::wregex>(pattern,options);
+            if(regularExpressions.size()>=256)regularExpressions.clear();
+            regularExpressions.emplace(key,expression);
+            return expression;
+        }catch(...){return {};}
+    }
+
+    std::shared_ptr<const FiniteRegexSeparator> FiniteRegularExpression(
+        const std::wstring& pattern,const std::wstring& flags){
+        const auto key=flags+L'\x1f'+pattern;
+        const auto cached=finiteRegularExpressions.find(key);
+        if(cached!=finiteRegularExpressions.end())return cached->second;
+        auto expression=std::make_shared<FiniteRegexSeparator>();
+        if(!CompileFiniteRegexSeparator(pattern,flags,*expression))expression.reset();
+        if(finiteRegularExpressions.size()>=256)finiteRegularExpressions.clear();
+        finiteRegularExpressions.emplace(key,expression);
+        return expression;
+    }
+
+    bool RegularExpressionMayMatch(const std::wstring& pattern,const std::wstring& flags,
+                                   const std::wstring& input){
+        const auto key=flags+L'\x1f'+pattern;
+        auto cached=anchoredRegexPrefixes.find(key);
+        if(cached==anchoredRegexPrefixes.end()){
+            if(anchoredRegexPrefixes.size()>=256)anchoredRegexPrefixes.clear();
+            cached=anchoredRegexPrefixes.emplace(key,CompileAnchoredRegexPrefixes(pattern,flags)).first;
+        }
+        return cached->second.MayMatch(input);
+    }
+
+    Value Deref(const Value& input){
+        if(input.type!=Value::Type::Reference)return input;
+        const auto& ref=*input.reference;
+        if(ref.kind==Reference::Kind::Variable){
+            auto* env=ref.env?ref.env->Find(ref.name):nullptr;return env?env->values[ref.name]:Value::Undefined();
+        }
+        return GetProperty(Deref(ref.base),ref.name);
+    }
+    Value Deref(Value&& input){
+        if(input.type!=Value::Type::Reference)return std::move(input);
+        return Deref(static_cast<const Value&>(input));
+    }
+    bool Truth(const Value& value){
+        const auto v=Deref(value);switch(v.type){case Value::Type::Undefined:case Value::Type::Null:return false;case Value::Type::Boolean:return v.boolean;case Value::Type::Number:return v.number!=0&&!std::isnan(v.number);case Value::Type::String:return !v.string.empty();default:return true;}
+    }
+    double Number(const Value& value){
+        const auto v=Deref(value);if(v.type==Value::Type::Number)return v.number;if(v.type==Value::Type::Boolean)return v.boolean?1:0;if(v.type==Value::Type::Null)return 0;if(v.type==Value::Type::String)try{return std::stod(v.string);}catch(...){return std::numeric_limits<double>::quiet_NaN();}if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Date&&v.object->props.count(L"$time"))return Number(v.object->props[L"$time"]);return std::numeric_limits<double>::quiet_NaN();
+    }
+    std::uint32_t Uint32(const Value& value){
+        const double number=Number(value);if(!std::isfinite(number)||number==0)return 0;
+        double reduced=std::fmod(std::trunc(number),4294967296.0);if(reduced<0)reduced+=4294967296.0;
+        return static_cast<std::uint32_t>(reduced);
+    }
+    std::int32_t Int32(const Value& value){return static_cast<std::int32_t>(Uint32(value));}
+    bool HasProperty(const Value& input,const std::wstring& key){
+        const auto value=Deref(input);
+        if(value.type==Value::Type::String){
+            if(key==L"length")return true;
+            try{size_t used=0;const auto index=std::stoull(key,&used);return used==key.size()&&index<value.string.size();}catch(...){return false;}
+        }
+        if(value.type!=Value::Type::Object||!value.object)return false;
+        const auto object=value.object;
+        if(object->props.count(key)||object->props.count(L"$get:"+key))return true;
+        if(object->kind==ObjectKind::Array){
+            if(key==L"length")return true;
+            try{size_t used=0;const auto index=std::stoull(key,&used);if(used==key.size()&&index<object->items.size())return true;}catch(...){}
+        }
+        for(auto prototype=object->prototype;prototype;prototype=prototype->prototype)
+            if(prototype->props.count(key)||prototype->props.count(L"$get:"+key)||prototype->props.count(L"$method:"+key))return true;
+        return false;
+    }
+    std::wstring String(const Value& value){
+        const auto v=Deref(value);switch(v.type){case Value::Type::Undefined:return L"undefined";case Value::Type::Null:return L"null";case Value::Type::Boolean:return v.boolean?L"true":L"false";case Value::Type::Number:return NumberString(v.number);case Value::Type::String:return v.string;case Value::Type::Function:case Value::Type::Native:return L"function";case Value::Type::Object:if(v.object&&v.object->kind==ObjectKind::Array)return L"[object Array]";if(v.object&&v.object->kind==ObjectKind::Promise)return L"[object Promise]";if(v.object&&v.object->kind==ObjectKind::Error){const auto name=v.object->props.find(L"name"),message=v.object->props.find(L"message");const auto n=name==v.object->props.end()?L"Error":String(name->second);const auto m=message==v.object->props.end()?L"":String(message->second);return m.empty()?n:n+L": "+m;}return L"[object Object]";default:return L"undefined";}
+    }
+    Value NodeValue(const std::shared_ptr<Node>& node){
+        if(!node)return Value::Null();auto found=nodeObjects.find(node.get());if(found!=nodeObjects.end())if(auto cached=found->second.lock())return Value::FromObject(cached);
+        auto object=std::make_shared<Object>();object->kind=ObjectKind::Node;object->node=node;nodeObjects[node.get()]=object;return Value::FromObject(object);
+    }
+    Value FrameWindowValue(const std::shared_ptr<Node>& node){
+        if(!node)return Value::Null();
+        auto found=frameWindows.find(node.get());
+        if(found!=frameWindows.end())if(auto cached=found->second.lock())return Value::FromObject(cached);
+        auto object=std::make_shared<Object>();object->kind=ObjectKind::FrameWindow;object->node=node;
+        frameWindows[node.get()]=object;return Value::FromObject(object);
+    }
+    Value ArrayValue(const std::vector<Value>& items){auto o=std::make_shared<Object>();o->kind=ObjectKind::Array;o->items=items;return Value::FromObject(o);}
+    Value CloneValue(const Value& input){
+        const auto value=Deref(input);if(value.type!=Value::Type::Object||!value.object)return value;
+        if(value.object->kind==ObjectKind::Array){std::vector<Value> items;items.reserve(value.object->items.size());for(const auto& item:value.object->items)items.push_back(CloneValue(item));return ArrayValue(items);}
+        if(value.object->kind==ObjectKind::Date)return DateValue({value.object->props[L"$time"]});
+        if(value.object->kind!=ObjectKind::Plain)return value;
+        auto clone=ObjectValue(ObjectKind::Plain);for(const auto& property:value.object->props)clone.object->props[property.first]=CloneValue(property.second);return clone;
+    }
+    static double CurrentTimeMilliseconds(){
+        using namespace std::chrono;return duration<double,std::milli>(system_clock::now().time_since_epoch()).count();
+    }
+    static double ParseDateMilliseconds(const std::wstring& value){
+        SYSTEMTIME time{};wchar_t separator=0;int consumed=0;
+        const int matched=swscanf_s(value.c_str(),L"%hu-%hu-%hu%c%hu:%hu:%hu%n",
+            &time.wYear,&time.wMonth,&time.wDay,&separator,1,&time.wHour,&time.wMinute,&time.wSecond,&consumed);
+        if(matched<7||(separator!=L'T'&&separator!=L't'&&separator!=L' '))
+            return std::numeric_limits<double>::quiet_NaN();
+        size_t index=consumed>0?static_cast<size_t>(consumed):value.size();
+        time.wMilliseconds=0;
+        if(index<value.size()&&value[index]==L'.'){
+            ++index;unsigned milliseconds=0,digits=0;
+            while(index<value.size()&&std::iswdigit(value[index])){
+                if(digits<3)milliseconds=milliseconds*10+static_cast<unsigned>(value[index]-L'0');
+                ++digits;++index;
+            }
+            while(digits<3){milliseconds*=10;++digits;}
+            time.wMilliseconds=static_cast<WORD>(milliseconds);
+        }
+        bool explicitZone=false;int offsetMinutes=0;
+        if(index<value.size()&&(value[index]==L'Z'||value[index]==L'z')){
+            explicitZone=true;++index;
+        }else if(index<value.size()&&(value[index]==L'+'||value[index]==L'-')){
+            explicitZone=true;const int direction=value[index++]==L'+'?1:-1;
+            auto twoDigits=[&](int& result){
+                if(index+1>=value.size()||!std::iswdigit(value[index])||!std::iswdigit(value[index+1]))return false;
+                result=(value[index]-L'0')*10+(value[index+1]-L'0');index+=2;return true;
+            };
+            int hours=0,minutes=0;if(!twoDigits(hours))return std::numeric_limits<double>::quiet_NaN();
+            if(index<value.size()&&value[index]==L':')++index;
+            if(!twoDigits(minutes)||hours>23||minutes>59)return std::numeric_limits<double>::quiet_NaN();
+            offsetMinutes=direction*(hours*60+minutes);
+        }
+        while(index<value.size()&&std::iswspace(value[index]))++index;
+        if(index!=value.size())return std::numeric_limits<double>::quiet_NaN();
+        SYSTEMTIME utc=time;
+        if(!explicitZone&&!TzSpecificLocalTimeToSystemTime(nullptr,&time,&utc))
+            return std::numeric_limits<double>::quiet_NaN();
+        FILETIME file{};if(!SystemTimeToFileTime(&utc,&file))return std::numeric_limits<double>::quiet_NaN();
+        ULARGE_INTEGER ticks{};ticks.LowPart=file.dwLowDateTime;ticks.HighPart=file.dwHighDateTime;
+        long long adjusted=static_cast<long long>(ticks.QuadPart)-
+            static_cast<long long>(offsetMinutes)*60ll*10000000ll;
+        constexpr unsigned long long epoch=116444736000000000ull;
+        return adjusted<static_cast<long long>(epoch)?std::numeric_limits<double>::quiet_NaN():
+            static_cast<double>(adjusted-static_cast<long long>(epoch))/10000.0;
+    }
+    static bool DateSystemTime(double milliseconds,SYSTEMTIME& time,bool local){
+        if(!std::isfinite(milliseconds))return false;constexpr unsigned long long epoch=116444736000000000ull;
+        const auto ticks=static_cast<long long>(std::trunc(milliseconds*10000.0))+static_cast<long long>(epoch);if(ticks<0)return false;
+        ULARGE_INTEGER value{};value.QuadPart=static_cast<unsigned long long>(ticks);FILETIME utc{value.LowPart,value.HighPart},converted=utc;
+        if(local&&!FileTimeToLocalFileTime(&utc,&converted))return false;return FileTimeToSystemTime(&converted,&time)!=FALSE;
+    }
+    Value DateValue(const std::vector<Value>& args){
+        double milliseconds=CurrentTimeMilliseconds();if(!args.empty()){const auto value=Deref(args[0]);milliseconds=value.type==Value::Type::String?ParseDateMilliseconds(value.string):Number(value);}
+        auto date=ObjectValue(ObjectKind::Date);date.object->props[L"$time"]=Value::Number(milliseconds);return date;
+    }
+    Value FileListValue(const std::vector<Node::FileInfo>& infos){
+        std::vector<Value> files;files.reserve(infos.size());
+        for(const auto& info:infos){auto file=ObjectValue(ObjectKind::Plain);
+            file.object->props[L"name"]=Value::String(info.name);
+            file.object->props[L"type"]=Value::String(info.type);
+            file.object->props[L"path"]=Value::String(info.path);
+            file.object->props[L"size"]=Value::Number(static_cast<double>(info.size));
+            files.push_back(file);
+        }
+        return ArrayValue(files);
+    }
+    Value Native(NativeCallback callback){auto n=std::make_shared<NativeFunction>();n->callback=std::move(callback);return Value::FromNative(n);}
+    Value ObjectValue(ObjectKind kind){auto o=std::make_shared<Object>();o->kind=kind;return Value::FromObject(o);}
+    bool IsCallable(const Value& input){const auto value=Deref(input);return value.type==Value::Type::Function||value.type==Value::Type::Native;}
+    Value ErrorValue(const std::wstring& name,const std::wstring& message){
+        auto error=ObjectValue(ObjectKind::Error);error.object->props[L"name"]=Value::String(name);error.object->props[L"message"]=Value::String(message);error.object->props[L"stack"]=Value::String(message.empty()?name:name+L": "+message);return error;
+    }
+    Value PromiseValue(){return ObjectValue(ObjectKind::Promise);}
+    void EnqueueMicrotask(std::function<void()> job){microtasks.push_back(std::move(job));}
+    void SchedulePromiseReaction(const std::shared_ptr<Object>& promise,PromiseReaction reaction){
+        EnqueueMicrotask([this,promise,reaction=std::move(reaction)]() mutable {
+            const bool fulfilled=promise->promiseState==PromiseState::Fulfilled;
+            const auto handler=fulfilled?reaction.onFulfilled:reaction.onRejected;
+            if(!IsCallable(handler)){
+                if(fulfilled)ResolvePromise(reaction.nextPromise,promise->promiseResult);
+                else RejectPromise(reaction.nextPromise,promise->promiseResult);
+                return;
+            }
+            try{ResolvePromise(reaction.nextPromise,Call(handler,Value::Undefined(),{promise->promiseResult}));}
+            catch(const JavaScriptException& exception){RejectPromise(reaction.nextPromise,exception.value);}
+            catch(const std::exception& exception){RejectPromise(reaction.nextPromise,ErrorValue(L"Error",Utf8ToWide(exception.what())));}
+        });
+    }
+    Value PerformThen(const std::shared_ptr<Object>& promise,const Value& onFulfilled,const Value& onRejected){
+        auto next=PromiseValue().object;
+        if(promise->promiseUnhandledNotified){promise->promiseUnhandledNotified=false;auto* runtime=this;EnqueueMicrotask([runtime,promise](){runtime->DispatchPromiseRejectionEvent(L"rejectionhandled",promise);});}
+        promise->promiseHandled=true;
+        PromiseReaction reaction{Deref(onFulfilled),Deref(onRejected),next};
+        if(promise->promiseState==PromiseState::Pending)promise->promiseReactions.push_back(std::move(reaction));
+        else SchedulePromiseReaction(promise,std::move(reaction));
+        return Value::FromObject(next);
+    }
+    void SettlePromise(const std::shared_ptr<Object>& promise,PromiseState state,const Value& result){
+        if(!promise||promise->kind!=ObjectKind::Promise||promise->promiseState!=PromiseState::Pending)return;
+        promise->promiseState=state;promise->promiseResult=Deref(result);
+        auto reactions=std::move(promise->promiseReactions);promise->promiseReactions.clear();
+        if(state==PromiseState::Rejected&&!promise->promiseHandled&&reactions.empty())possiblyUnhandledRejections.push_back(promise);
+        for(auto& reaction:reactions)SchedulePromiseReaction(promise,std::move(reaction));
+    }
+    void RejectPromise(const std::shared_ptr<Object>& promise,const Value& reason){SettlePromise(promise,PromiseState::Rejected,reason);}
+    void ResolvePromise(const std::shared_ptr<Object>& promise,const Value& input){
+        if(!promise||promise->promiseState!=PromiseState::Pending)return;
+        const auto resolution=Deref(input);
+        if(resolution.type==Value::Type::Object&&resolution.object==promise){RejectPromise(promise,ErrorValue(L"TypeError",L"Chaining cycle detected for promise"));return;}
+        if(resolution.type==Value::Type::Object&&resolution.object&&resolution.object->kind==ObjectKind::Promise){
+            const auto source=resolution.object;source->promiseHandled=true;
+            PromiseReaction adoption{Value::Undefined(),Value::Undefined(),promise};
+            if(source->promiseState==PromiseState::Pending)source->promiseReactions.push_back(std::move(adoption));
+            else SchedulePromiseReaction(source,std::move(adoption));
+            return;
+        }
+        if(resolution.type==Value::Type::Object&&resolution.object){
+            Value then;
+            try{then=GetProperty(resolution,L"then");}catch(const JavaScriptException& exception){RejectPromise(promise,exception.value);return;}
+            if(IsCallable(then)){
+                auto called=std::make_shared<bool>(false);
+                auto resolve=Native([promise,called](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){if(!*called){*called=true;runtime.ResolvePromise(promise,args.empty()?Value::Undefined():args[0]);}return Value::Undefined();});
+                auto reject=Native([promise,called](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){if(!*called){*called=true;runtime.RejectPromise(promise,args.empty()?Value::Undefined():args[0]);}return Value::Undefined();});
+                try{Call(then,resolution,{resolve,reject});}
+                catch(const JavaScriptException& exception){if(!*called){*called=true;RejectPromise(promise,exception.value);}}
+                catch(const std::exception& exception){if(!*called){*called=true;RejectPromise(promise,ErrorValue(L"Error",Utf8ToWide(exception.what())));}}
+                return;
+            }
+        }
+        SettlePromise(promise,PromiseState::Fulfilled,resolution);
+    }
+    Value PromiseResolveValue(const Value& value){const auto resolved=Deref(value);if(resolved.type==Value::Type::Object&&resolved.object&&resolved.object->kind==ObjectKind::Promise)return resolved;auto promise=PromiseValue();ResolvePromise(promise.object,resolved);return promise;}
+    Value ConstructPromise(const Value& executor){
+        if(!IsCallable(executor))throw JavaScriptException{ErrorValue(L"TypeError",L"Promise resolver is not a function")};
+        auto promise=PromiseValue();auto called=std::make_shared<bool>(false);
+        auto resolve=Native([promise=promise.object,called](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){if(!*called){*called=true;runtime.ResolvePromise(promise,args.empty()?Value::Undefined():args[0]);}return Value::Undefined();});
+        auto reject=Native([promise=promise.object,called](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){if(!*called){*called=true;runtime.RejectPromise(promise,args.empty()?Value::Undefined():args[0]);}return Value::Undefined();});
+        try{Call(executor,Value::Undefined(),{resolve,reject});}
+        catch(const JavaScriptException& exception){if(!*called){*called=true;RejectPromise(promise.object,exception.value);}}
+        catch(const std::exception& exception){if(!*called){*called=true;RejectPromise(promise.object,ErrorValue(L"Error",Utf8ToWide(exception.what())));}}
+        return promise;
+    }
+    void DispatchPromiseRejectionEvent(const std::wstring& type,const std::shared_ptr<Object>& promise){
+        auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;event->props[L"type"]=Value::String(type);event->props[L"promise"]=Value::FromObject(promise);event->props[L"reason"]=promise->promiseResult;
+        const auto found=windowListeners.find(type);if(found==windowListeners.end())return;
+        for(const auto& callback:found->second)try{Call(callback,global->values[L"window"],{Value::FromObject(event)});}catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}
+    }
+    void DrainMicrotasks(){
+        if(drainingMicrotasks)return;drainingMicrotasks=true;
+        for(;;){
+            while(!microtasks.empty()){
+                auto job=std::move(microtasks.front());microtasks.pop_front();
+                try{MutationBatch batch(*this);job();}
+                catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}
+                catch(const std::exception& exception){lastError=Utf8ToWide(exception.what());}
+            }
+            auto pending=std::move(possiblyUnhandledRejections);possiblyUnhandledRejections.clear();
+            for(const auto& weak:pending)if(auto promise=weak.lock())if(promise->promiseState==PromiseState::Rejected&&!promise->promiseHandled&&!promise->promiseUnhandledNotified){promise->promiseUnhandledNotified=true;DispatchPromiseRejectionEvent(L"unhandledrejection",promise);}
+            if(microtasks.empty())break;
+        }
+        drainingMicrotasks=false;
+    }
+    void BeginMutationBatch(){++mutationBatchDepth;}
+    void FlushMutations(){
+        if(indexDirty){document.Reindex();indexDirty=false;}
+        if(mutationPending&&mutationSink)mutationSink();
+        mutationPending=false;
+    }
+    void EndMutationBatch(){if(mutationBatchDepth>0&&--mutationBatchDepth==0)FlushMutations();}
+    void EnsureIndex(){if(indexDirty){document.Reindex();indexDirty=false;}}
+    void Mutated(bool requiresIndex=false){
+        mutationPending=true;indexDirty=indexDirty||requiresIndex;
+        if(mutationBatchDepth==0)FlushMutations();
+    }
+    unsigned ScheduleAnimationFrame(const Value& callback){
+        const unsigned id=nextFrameId++;
+        frameCallbacks.emplace_back(id,Deref(callback));
+        if(frameScheduler&&!frameScheduled){frameScheduled=true;frameScheduler();}
+        return id;
+    }
+    void RunAnimationFrame(){
+        frameScheduled=false;
+        std::vector<std::pair<unsigned,Value>> callbacks;
+        callbacks.swap(frameCallbacks);
+        if(callbacks.empty())return;
+        MutationBatch batch(*this);
+        using namespace std::chrono;
+        const auto timestamp=Value::Number(duration<double,std::milli>(steady_clock::now().time_since_epoch()).count());
+        for(const auto& callback:callbacks){try{Call(callback.second,Value::Undefined(),{timestamp});}catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}DrainMicrotasks();}
+    }
+    void ScheduleNextTimer(){
+        if(timers.empty()){timerScheduled=false;if(timerScheduler)timerScheduler(0);return;}
+        const auto earliest=std::min_element(timers.begin(),timers.end(),[](const auto& a,const auto& b){return a.due<b.due;})->due;
+        if(timerScheduled&&earliest>=timerWake)return;
+        timerScheduled=true;timerWake=earliest;
+        const auto now=std::chrono::steady_clock::now();
+        const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(earliest-now).count();
+        if(timerScheduler)timerScheduler(static_cast<unsigned>(std::max<long long>(1,remaining)));
+    }
+    unsigned ScheduleTimer(const Value& callback,double delay,bool repeat=false){
+        const unsigned id=nextTimerId++;
+        const auto milliseconds=static_cast<long long>(std::max(0.0,std::min(delay,2147483647.0)));
+        timers.push_back({id,Deref(callback),std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds),repeat?static_cast<unsigned>(std::max<long long>(1,milliseconds)):0});
+        ScheduleNextTimer();return id;
+    }
+    void ClearTimer(unsigned id){
+        timers.erase(std::remove_if(timers.begin(),timers.end(),[&](const auto& timer){return timer.id==id;}),timers.end());
+        timerScheduled=false;ScheduleNextTimer();
+    }
+    void RunTimers(){
+        timerScheduled=false;const auto now=std::chrono::steady_clock::now();std::vector<Value> callbacks;
+        for(auto it=timers.begin();it!=timers.end();)if(it->due<=now+std::chrono::milliseconds(1)){callbacks.push_back(it->callback);if(it->interval){it->due=now+std::chrono::milliseconds(it->interval);++it;}else it=timers.erase(it);}else ++it;
+        if(!callbacks.empty()){MutationBatch batch(*this);for(const auto& callback:callbacks){try{Call(callback,Value::Undefined(),{});}catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}DrainMicrotasks();}}
+        ScheduleNextTimer();
+    }
+    Value GetProperty(const Value& input,const std::wstring& key){
+        const auto base=Deref(input);
+        if(base.type==Value::Type::Number&&key==L"toFixed")return Native([value=base.number](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const int digits=a.empty()?0:std::max(0,std::min(100,static_cast<int>(r.Number(a[0]))));
+            if(!std::isfinite(value))return Value::String(NumberString(value));
+            std::wostringstream out;out<<std::fixed<<std::setprecision(digits)<<value;
+            return Value::String(out.str());
+        });
+        if((base.type==Value::Type::Function||base.type==Value::Type::Native)&&(key==L"bind"||key==L"call")){
+            return Native([callable=base,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto boundThis=a.empty()?Value::Undefined():r.Deref(a[0]);
+                if(key==L"call"){std::vector<Value> forwarded;if(a.size()>1)forwarded.assign(a.begin()+1,a.end());return r.Call(callable,boundThis,forwarded);}
+                return r.Native([callable,boundThis](RuntimeCore& inner,const Value&,const std::vector<Value>& args){
+                    return inner.Call(callable,boundThis,args);
+                });
+            });
+        }
+        if(base.type==Value::Type::String){
+            if(key==L"length")return Value::Number(static_cast<double>(base.string.size()));
+            try{size_t used=0;const auto index=std::stoul(key,&used);if(used==key.size()&&index<base.string.size())return Value::String(std::wstring(1,base.string[index]));}catch(...){}
+            if(key==L"indexOf")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto found=s.find(a.empty()?L"":r.String(a[0]));return Value::Number(found==std::wstring::npos?-1.0:static_cast<double>(found));});
+            if(key==L"toLowerCase"||key==L"toLocaleLowerCase"||key==L"toUpperCase")return Native([s=base.string,key](RuntimeCore&,const Value&,const std::vector<Value>&){auto out=s;std::transform(out.begin(),out.end(),out.begin(),[&](wchar_t c){return key==L"toUpperCase"?std::towupper(c):std::towlower(c);});return Value::String(out);});
+            if(key==L"trim")return Native([s=base.string](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::String(Trim(s));});
+            if(key==L"startsWith")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto prefix=a.empty()?L"":r.String(a[0]);return Value::Bool(s.rfind(prefix,0)==0);});
+            if(key==L"slice")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto size=static_cast<long long>(s.size());auto offset=[&](size_t i,long long fallback){if(i>=a.size())return fallback;auto n=static_cast<long long>(r.Number(a[i]));return n<0?std::max(0ll,size+n):std::min(size,n);};const auto begin=offset(0,0),end=offset(1,size);return Value::String(s.substr(static_cast<size_t>(begin),static_cast<size_t>(std::max(0ll,end-begin))));});
+            if(key==L"split")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                std::vector<Value> out;
+                const size_t limit=a.size()>1?static_cast<size_t>(r.Uint32(a[1])):
+                    static_cast<size_t>((std::numeric_limits<std::uint32_t>::max)());
+                if(limit==0)return r.ArrayValue(out);
+                const auto separatorValue=a.empty()?Value::Undefined():r.Deref(a[0]);
+                if(separatorValue.type==Value::Type::Undefined){out.push_back(Value::String(s));return r.ArrayValue(out);}
+                auto append=[&](const std::wstring& value){if(out.size()<limit)out.push_back(Value::String(value));};
+                if(separatorValue.type==Value::Type::Object&&separatorValue.object&&
+                   separatorValue.object->kind==ObjectKind::RegExp){
+                    const auto pattern=r.String(separatorValue.object->props[L"$pattern"]);
+                    const auto flags=r.String(separatorValue.object->props[L"$flags"]);
+                    if(const auto finiteSeparator=r.FiniteRegularExpression(pattern,flags)){
+                        size_t lastEnd=0,searchStart=0;
+                        bool matchedEmptyInput=false;
+                        while(searchStart<=s.size()&&out.size()<limit){
+                            size_t matchStart=searchStart,matchLength=0;
+                            for(;matchStart<=s.size();++matchStart)
+                                if(finiteSeparator->MatchAt(s,matchStart,matchLength))break;
+                            if(matchStart>s.size())break;
+                            if(matchLength==0&&matchStart==lastEnd){
+                                matchedEmptyInput=matchedEmptyInput||s.empty();
+                                if(matchStart>=s.size())break;
+                                searchStart=matchStart+1;
+                                continue;
+                            }
+                            if(matchLength==0&&matchStart==s.size())break;
+                            append(s.substr(lastEnd,matchStart-lastEnd));
+                            lastEnd=matchStart+matchLength;
+                            searchStart=matchLength==0?matchStart+1:lastEnd;
+                        }
+                        if(out.size()<limit&&!(s.empty()&&matchedEmptyInput))append(s.substr(lastEnd));
+                        return r.ArrayValue(out);
+                    }
+                    if(const auto expression=r.RegularExpression(pattern,flags)){
+                        size_t lastEnd=0;
+                        bool matchedEmptyInput=false;
+                        for(std::wsregex_iterator iterator(s.begin(),s.end(),*expression),end;
+                            iterator!=end&&out.size()<limit;++iterator){
+                            const auto& match=*iterator;
+                            const size_t matchStart=static_cast<size_t>(match.position());
+                            const size_t matchEnd=matchStart+static_cast<size_t>(match.length());
+                            if(match.length()==0&&matchStart==lastEnd){
+                                matchedEmptyInput=matchedEmptyInput||s.empty();
+                                continue;
+                            }
+                            if(match.length()==0&&matchStart==s.size())break;
+                            append(s.substr(lastEnd,matchStart-lastEnd));
+                            for(size_t capture=1;capture<match.size()&&out.size()<limit;++capture)
+                                append(match[capture].matched?match[capture].str():L"");
+                            lastEnd=matchEnd;
+                        }
+                        if(out.size()<limit&&!(s.empty()&&matchedEmptyInput))append(s.substr(lastEnd));
+                        return r.ArrayValue(out);
+                    }else{out.push_back(Value::String(s));return r.ArrayValue(out);}
+                }
+                const auto separator=r.String(separatorValue);
+                if(separator.empty()){
+                    for(wchar_t character:s){append(std::wstring(1,character));if(out.size()>=limit)break;}
+                }else{
+                    size_t start=0;
+                    for(;;){
+                        const auto end=s.find(separator,start);
+                        append(s.substr(start,end==std::wstring::npos?std::wstring::npos:end-start));
+                        if(end==std::wstring::npos||out.size()>=limit)break;
+                        start=end+separator.size();
+                    }
+                }
+                return r.ArrayValue(out);
+            });
+            if(key==L"match")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                auto patternValue=a.empty()?Value::Undefined():r.Deref(a[0]);
+                std::wstring pattern,flags;
+                if(patternValue.type==Value::Type::Object&&patternValue.object&&
+                   patternValue.object->kind==ObjectKind::RegExp){
+                    pattern=r.String(patternValue.object->props[L"$pattern"]);
+                    flags=r.String(patternValue.object->props[L"$flags"]);
+                }else pattern=patternValue.type==Value::Type::Undefined?L"":r.String(patternValue);
+                if(!r.RegularExpressionMayMatch(pattern,flags,s))return Value::Null();
+                if(const auto expression=r.RegularExpression(pattern,flags)){
+                    std::vector<Value> matches;
+                    if(flags.find(L'g')!=std::wstring::npos){
+                        for(std::wsregex_iterator it(s.begin(),s.end(),*expression),end;it!=end;++it)
+                            matches.push_back(Value::String((*it)[0].str()));
+                        return matches.empty()?Value::Null():r.ArrayValue(matches);
+                    }
+                    std::wsmatch match;
+                    if(!std::regex_search(s,match,*expression))return Value::Null();
+                    for(const auto& capture:match)
+                        matches.push_back(capture.matched?Value::String(capture.str()):Value::Undefined());
+                    auto result=r.ArrayValue(matches);
+                    result.object->props[L"index"]=Value::Number(static_cast<double>(match.position()));
+                    result.object->props[L"input"]=Value::String(s);
+                    return result;
+                }else return Value::Null();
+            });
+            if(key==L"padStart")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){size_t n=a.empty()?0:static_cast<size_t>(r.Number(a[0]));std::wstring fill=a.size()>1?r.String(a[1]):L" ";if(fill.empty())fill=L" ";std::wstring out=s;while(out.size()<n)out=fill+out;if(out.size()>n)out=out.substr(out.size()-n);return Value::String(out);});
+            if(key==L"replaceAll")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto search=a.empty()?L"":r.String(a[0]);const auto replacement=a.size()>1?r.String(a[1]):L"undefined";
+                if(search.empty()){std::wstring out=replacement;for(wchar_t c:s){out+=c;out+=replacement;}return Value::String(out);}
+                auto match=s.find(search);if(match==std::wstring::npos)return Value::String(s);
+                std::wstring out;out.reserve(s.size()+replacement.size());size_t position=0;
+                do{
+                    out.append(s,position,match-position);out+=replacement;
+                    position=match+search.size();match=s.find(search,position);
+                }while(match!=std::wstring::npos);
+                out.append(s,position,std::wstring::npos);return Value::String(std::move(out));
+            });
+            if(key==L"replace")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::String(s);const auto pattern=r.Deref(a[0]);const auto replacement=a.size()>1?r.Deref(a[1]):Value::Undefined();
+                if(pattern.type==Value::Type::Object&&pattern.object&&pattern.object->kind==ObjectKind::RegExp){
+                    const auto patternText=r.String(pattern.object->props[L"$pattern"]),flags=r.String(pattern.object->props[L"$flags"]);
+                    if(!r.RegularExpressionMayMatch(patternText,flags,s))return Value::String(s);
+                    if(const auto expression=r.RegularExpression(patternText,flags)){std::wstring out;size_t cursor=0;for(std::wsregex_iterator it(s.begin(),s.end(),*expression),end;it!=end;++it){const auto& match=*it;const auto matchPosition=static_cast<size_t>(match.position()),matchLength=static_cast<size_t>(match.length());out+=s.substr(cursor,matchPosition-cursor);if(replacement.type==Value::Type::Function||replacement.type==Value::Type::Native){std::vector<Value> arguments;for(size_t i=0;i<match.size();++i)arguments.push_back(Value::String(match[i].str()));arguments.push_back(Value::Number(static_cast<double>(matchPosition)));arguments.push_back(Value::String(s));out+=r.String(r.Call(replacement,Value::Undefined(),arguments));}else{const auto replacementText=r.String(replacement);for(size_t index=0;index<replacementText.size();++index){const wchar_t character=replacementText[index];if(character!=L'$'||index+1>=replacementText.size()){out+=character;continue;}const wchar_t token=replacementText[index+1];if(token==L'$'){out+=L'$';++index;}else if(token==L'&'){out+=match[0].str();++index;}else if(token==L'`'){out+=s.substr(0,matchPosition);++index;}else if(token==L'\''){out+=s.substr(matchPosition+matchLength);++index;}else if(token>=L'1'&&token<=L'9'){size_t capture=static_cast<size_t>(token-L'0'),used=1;if(index+2<replacementText.size()&&replacementText[index+2]>=L'0'&&replacementText[index+2]<=L'9'){const size_t two=capture*10+static_cast<size_t>(replacementText[index+2]-L'0');if(two<match.size()){capture=two;used=2;}}if(capture<match.size()){if(match[capture].matched)out+=match[capture].str();index+=used;}else out+=L'$';}else out+=L'$';} }cursor=matchPosition+matchLength;if(flags.find(L'g')==std::wstring::npos)break;}out+=s.substr(cursor);return Value::String(out);}return Value::String(s);
+                }
+                const auto needle=r.String(pattern);const auto position=s.find(needle);if(position==std::wstring::npos)return Value::String(s);auto out=s;out.replace(position,needle.size(),r.String(replacement));return Value::String(out);
+            });
+            if(key==L"at")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto size=static_cast<long long>(s.size());auto index=a.empty()?0ll:static_cast<long long>(r.Number(a[0]));if(index<0)index+=size;return index>=0&&index<size?Value::String(std::wstring(1,s[static_cast<size_t>(index)])):Value::Undefined();});
+            if(key==L"localeCompare")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto other=a.empty()?L"undefined":r.String(a[0]);const int result=CompareStringEx(LOCALE_NAME_USER_DEFAULT,NORM_LINGUISTIC_CASING,s.c_str(),static_cast<int>(s.size()),other.c_str(),static_cast<int>(other.size()),nullptr,nullptr,0);return Value::Number(result==CSTR_LESS_THAN?-1:result==CSTR_GREATER_THAN?1:0);});
+        }
+        if(base.type==Value::Type::Number){
+            if(key==L"toFixed")return Native([n=base.number](RuntimeCore& r,const Value&,const std::vector<Value>& a){int d=a.empty()?0:static_cast<int>(r.Number(a[0]));std::wostringstream out;out<<std::fixed<<std::setprecision(std::max(0,std::min(20,d)))<<n;return Value::String(out.str());});
+            if(key==L"toLocaleString")return Native([n=base.number](RuntimeCore&,const Value&,const std::vector<Value>&){
+                auto value=NumberString(n);const auto exponent=value.find_first_of(L"eE");if(exponent!=std::wstring::npos)return Value::String(value);
+                const auto decimal=value.find(L'.');const size_t end=decimal==std::wstring::npos?value.size():decimal;const size_t begin=!value.empty()&&(value[0]==L'-'||value[0]==L'+')?1:0;
+                for(size_t position=end;position>begin+3;position-=3)value.insert(position-3,1,L',');return Value::String(value);
+            });
+        }
+        if(base.type!=Value::Type::Object||!base.object)return Value::Undefined();
+        auto object=base.object;const auto own=object->props.find(key);if(own!=object->props.end())return own->second;
+        const auto getter=object->props.find(L"$get:"+key);if(getter!=object->props.end())return Call(getter->second,base,{});
+        for(auto prototype=object->prototype;prototype;prototype=prototype->prototype){
+            const auto method=prototype->props.find(L"$method:"+key);
+            if(method!=prototype->props.end())return method->second;
+        }
+        if(object->kind==ObjectKind::DateConstructor&&key==L"now")return Native([](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::Number(CurrentTimeMilliseconds());});
+        if(object->kind==ObjectKind::Date){
+            const auto milliseconds=Number(object->props[L"$time"]);
+            if(key==L"getTime"||key==L"valueOf")return Native([milliseconds](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::Number(milliseconds);});
+            if(key==L"toISOString"||key==L"toJSON")return Native([milliseconds](RuntimeCore&,const Value&,const std::vector<Value>&){SYSTEMTIME time{};if(!DateSystemTime(milliseconds,time,false))return Value::String(L"Invalid Date");wchar_t buffer[40]{};swprintf_s(buffer,L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,time.wMilliseconds);return Value::String(buffer);});
+            if(key==L"toLocaleTimeString")return Native([milliseconds](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                SYSTEMTIME time{};
+                if(!DateSystemTime(milliseconds,time,true))return Value::String(L"Invalid Date");
+                bool force24Hour=false;
+                if(a.size()>1){
+                    const auto options=r.Deref(a[1]);
+                    if(options.type==Value::Type::Object&&options.object){
+                        const auto hour12=options.object->props.find(L"hour12");
+                        force24Hour=hour12!=options.object->props.end()&&
+                            r.Deref(hour12->second).type==Value::Type::Boolean&&
+                            !r.Deref(hour12->second).boolean;
+                    }
+                }
+                wchar_t buffer[128]{};
+                if(force24Hour){
+                    swprintf_s(buffer,L"%02u:%02u:%02u",time.wHour,time.wMinute,time.wSecond);
+                    return Value::String(buffer);
+                }
+                const auto locale=a.empty()?L"":r.String(a[0]);
+                if(GetTimeFormatEx(locale.empty()?LOCALE_NAME_USER_DEFAULT:locale.c_str(),0,&time,nullptr,
+                                   buffer,static_cast<int>(std::size(buffer)))>0)
+                    return Value::String(buffer);
+                swprintf_s(buffer,L"%02u:%02u:%02u",time.wHour,time.wMinute,time.wSecond);
+                return Value::String(buffer);
+            });
+        }
+        if(object->kind==ObjectKind::Promise){
+            if(key==L"then")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.PerformThen(object,a.empty()?Value::Undefined():a[0],a.size()>1?a[1]:Value::Undefined());});
+            if(key==L"catch")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.PerformThen(object,Value::Undefined(),a.empty()?Value::Undefined():a[0]);});
+            if(key==L"finally")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto callback=a.empty()?Value::Undefined():r.Deref(a[0]);
+                if(!r.IsCallable(callback))return r.PerformThen(object,Value::Undefined(),Value::Undefined());
+                auto fulfilled=r.Native([callback](RuntimeCore& runtime,const Value&,const std::vector<Value>& values){
+                    const auto original=values.empty()?Value::Undefined():values[0];
+                    const auto waited=runtime.PromiseResolveValue(runtime.Call(callback,Value::Undefined(),{}));
+                    auto restore=runtime.Native([original](RuntimeCore&,const Value&,const std::vector<Value>&){return original;});
+                    return runtime.PerformThen(waited.object,restore,Value::Undefined());
+                });
+                auto rejected=r.Native([callback](RuntimeCore& runtime,const Value&,const std::vector<Value>& values){
+                    const auto reason=values.empty()?Value::Undefined():values[0];
+                    const auto waited=runtime.PromiseResolveValue(runtime.Call(callback,Value::Undefined(),{}));
+                    auto rethrow=runtime.Native([reason](RuntimeCore&,const Value&,const std::vector<Value>&)->Value{throw JavaScriptException{reason};});
+                    return runtime.PerformThen(waited.object,rethrow,Value::Undefined());
+                });
+                return r.PerformThen(object,fulfilled,rejected);
+            });
+        }
+        if(object->kind==ObjectKind::Error&&key==L"toString")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){const auto name=object->props.count(L"name")?r.String(object->props[L"name"]):L"Error";const auto message=object->props.count(L"message")?r.String(object->props[L"message"]):L"";return Value::String(message.empty()?name:name+L": "+message);});
+        if(object->kind==ObjectKind::Array){
+            if(key==L"length")return Value::Number(static_cast<double>(object->items.size()));
+            if(key==L"push")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>& args){for(auto& v:args)object->items.push_back(v);return Value::Number(static_cast<double>(object->items.size()));});
+            if(key==L"unshift")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>& args){object->items.insert(object->items.begin(),args.begin(),args.end());return Value::Number(static_cast<double>(object->items.size()));});
+            if(key==L"pop")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){if(object->items.empty())return Value::Undefined();auto last=object->items.back();object->items.pop_back();return last;});
+            if(key==L"shift")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){if(object->items.empty())return Value::Undefined();auto first=object->items.front();object->items.erase(object->items.begin());return first;});
+            if(key==L"indexOf")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){if(args.empty())return Value::Number(-1);for(size_t i=0;i<object->items.size();++i)if(r.EqualValues(object->items[i],args[0]))return Value::Number(static_cast<double>(i));return Value::Number(-1);});
+            if(key==L"includes")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){if(args.empty())return Value::Bool(false);for(const auto& item:object->items)if(r.EqualValues(item,args[0]))return Value::Bool(true);return Value::Bool(false);});
+            if(key==L"find")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){if(args.empty())return Value::Undefined();for(size_t i=0;i<object->items.size();++i)if(r.Truth(r.Call(args[0],Value::Undefined(),{object->items[i],Value::Number(static_cast<double>(i)),Value::FromObject(object)})))return object->items[i];return Value::Undefined();});
+            if(key==L"findIndex")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){if(args.empty())return Value::Number(-1);for(size_t i=0;i<object->items.size();++i)if(r.Truth(r.Call(args[0],Value::Undefined(),{object->items[i],Value::Number(static_cast<double>(i)),Value::FromObject(object)})))return Value::Number(static_cast<double>(i));return Value::Number(-1);});
+            if(key==L"some")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){if(args.empty())return Value::Bool(false);for(size_t i=0;i<object->items.size();++i)if(r.Truth(r.Call(args[0],Value::Undefined(),{object->items[i],Value::Number(static_cast<double>(i)),Value::FromObject(object)})))return Value::Bool(true);return Value::Bool(false);});
+            if(key==L"at")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){const auto size=static_cast<long long>(object->items.size());auto index=args.empty()?0ll:static_cast<long long>(r.Number(args[0]));if(index<0)index+=size;return index>=0&&index<size?object->items[static_cast<size_t>(index)]:Value::Undefined();});
+            if(key==L"sort")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){const auto compare=args.empty()?Value::Undefined():r.Deref(args[0]);std::stable_sort(object->items.begin(),object->items.end(),[&](const Value& left,const Value& right){if(r.IsCallable(compare)){const auto result=r.Number(r.Call(compare,Value::Undefined(),{left,right}));return std::isnan(result)?false:result<0;}return r.String(left)<r.String(right);});return Value::FromObject(object);});
+            if(key==L"slice")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){
+                const auto size=static_cast<long long>(object->items.size());
+                auto offset=[&](size_t index,long long fallback){
+                    if(index>=args.size())return fallback;
+                    const double number=r.Number(args[index]);
+                    if(std::isnan(number))return 0ll;
+                    const auto integer=static_cast<long long>(number);
+                    return integer<0?std::max(0ll,size+integer):std::min(size,integer);
+                };
+                const auto begin=offset(0,0),end=offset(1,size);
+                if(end<=begin)return r.ArrayValue({});
+                return r.ArrayValue(std::vector<Value>(
+                    object->items.begin()+static_cast<std::ptrdiff_t>(begin),
+                    object->items.begin()+static_cast<std::ptrdiff_t>(end)));
+            });
+            if(key==L"splice")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){
+                const auto size=static_cast<std::ptrdiff_t>(object->items.size());
+                auto boundedIndex=[&](const Value& value){const double number=r.Number(value);
+                    if(std::isnan(number))return std::ptrdiff_t{0};
+                    return static_cast<std::ptrdiff_t>(std::max(-static_cast<double>(size),std::min(static_cast<double>(size),number)));
+                };
+                std::ptrdiff_t start=args.empty()?0:boundedIndex(args[0]);
+                if(start<0)start=std::max(std::ptrdiff_t{0},size+start);else start=std::min(start,size);
+                std::ptrdiff_t count=args.size()>1?boundedIndex(args[1]):size-start;
+                count=std::max(std::ptrdiff_t{0},std::min(count,size-start));auto first=object->items.begin()+start;
+                std::vector<Value> removed(first,first+count);object->items.erase(first,first+count);
+                if(args.size()>2)object->items.insert(object->items.begin()+start,args.begin()+2,args.end());
+                return r.ArrayValue(removed);
+            });
+            if(key==L"forEach"||key==L"filter"||key==L"every"||key==L"map")return Native([object,key](RuntimeCore& r,const Value&,const std::vector<Value>& args){
+                if(args.empty())return key==L"every"?Value::Bool(true):(key==L"filter"||key==L"map"?r.ArrayValue({}):Value::Undefined());std::vector<Value> output;if(key==L"filter"||key==L"map")output.reserve(object->items.size());
+                std::vector<Value> callbackArgs(3);callbackArgs[2]=Value::FromObject(object);
+                for(size_t i=0;i<object->items.size();++i){callbackArgs[0]=object->items[i];callbackArgs[1]=Value::Number(static_cast<double>(i));auto result=r.Call(args[0],Value::Undefined(),callbackArgs);if(key==L"filter"&&r.Truth(result))output.push_back(object->items[i]);if(key==L"map")output.push_back(r.Deref(std::move(result)));if(key==L"every"&&!r.Truth(result))return Value::Bool(false);}
+                if(key==L"filter"||key==L"map")return r.ArrayValue(output);if(key==L"every")return Value::Bool(true);return Value::Undefined();});
+            if(key==L"join")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& args){
+                const auto separator=args.empty()?L",":r.String(args[0]);
+                size_t capacity=separator.size()*(object->items.empty()?0:object->items.size()-1);
+                bool stringsOnly=true;
+                for(const auto& item:object->items){
+                    const auto value=r.Deref(item);
+                    if(value.type==Value::Type::String)capacity+=value.string.size();
+                    else if(value.type!=Value::Type::Undefined&&value.type!=Value::Type::Null){stringsOnly=false;break;}
+                }
+                std::wstring out;
+                if(stringsOnly)out.reserve(capacity);
+                for(size_t i=0;i<object->items.size();++i){
+                    if(i)out+=separator;
+                    const auto value=r.Deref(object->items[i]);
+                    if(value.type==Value::Type::String)out+=value.string;
+                    else if(value.type!=Value::Type::Undefined&&value.type!=Value::Type::Null)out+=r.String(value);
+                }
+                return Value::String(std::move(out));
+            });
+            try{size_t used=0;size_t index=std::stoul(key,&used);if(used==key.size()&&index<object->items.size())return object->items[index];}catch(...){}
+        }
+        if(object->kind==ObjectKind::RegExp&&(key==L"test"||key==L"exec"))return Native([object,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const auto input=a.empty()?L"":r.String(a[0]),pattern=r.String(object->props[L"$pattern"]),flags=r.String(object->props[L"$flags"]);
+            if(!r.RegularExpressionMayMatch(pattern,flags,input))return key==L"test"?Value::Bool(false):Value::Null();
+            if(const auto expression=r.RegularExpression(pattern,flags)){std::wsmatch match;const bool found=std::regex_search(input,match,*expression);if(key==L"test")return Value::Bool(found);if(!found)return Value::Null();std::vector<Value> captures;for(const auto& capture:match)captures.push_back(Value::String(capture.str()));return r.ArrayValue(captures);}return key==L"test"?Value::Bool(false):Value::Null();
+        });
+        if(object->kind==ObjectKind::ObjectConstructor){
+            if(key==L"create")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){return r.ObjectValue(ObjectKind::Plain);});
+            if(key==L"freeze")return Native([](RuntimeCore&,const Value&,const std::vector<Value>& a){return a.empty()?Value::Undefined():a[0];});
+            if(key==L"fromEntries")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                auto result=r.ObjectValue(ObjectKind::Plain);
+                if(!a.empty()){auto entries=r.Deref(a[0]);
+                    if(entries.type==Value::Type::Object&&entries.object&&entries.object->kind==ObjectKind::Array)
+                        for(const auto& item:entries.object->items){auto pair=r.Deref(item);
+                            if(pair.type==Value::Type::Object&&pair.object&&pair.object->kind==ObjectKind::Array&&pair.object->items.size()>1)
+                                result.object->props[r.String(pair.object->items[0])]=r.Deref(pair.object->items[1]);
+                        }
+                }
+                return result;
+            });
+            if(key==L"entries"||key==L"values"||key==L"keys")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                std::vector<Value> result;if(a.empty())return r.ArrayValue(result);
+                auto source=r.Deref(a[0]);if(source.type!=Value::Type::Object||!source.object)return r.ArrayValue(result);
+                for(const auto& property:source.object->props){
+                    auto name=Value::String(property.first),value=r.Deref(property.second);
+                    result.push_back(key==L"keys"?name:key==L"values"?value:r.ArrayValue({name,value}));
+                }
+                return r.ArrayValue(result);
+            });
+        }
+        if(object->kind==ObjectKind::Map||object->kind==ObjectKind::Set){
+            const bool map=object->kind==ObjectKind::Map;
+            if(key==L"size")return Value::Number(static_cast<double>(object->entries.size()));
+            if(key==L"clear")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->entries.clear();return Value::Undefined();});
+            if(key==L"values")return Native([object,map](RuntimeCore& r,const Value&,const std::vector<Value>&){std::vector<Value> values;values.reserve(object->entries.size());for(const auto& entry:object->entries)values.push_back(map?entry.second:entry.first);return r.ArrayValue(values);});
+            if(key==L"has"||key==L"get"||key==L"set"||key==L"add"||key==L"delete")return Native([object,key,map](RuntimeCore& r,const Value&,const std::vector<Value>& args){
+                const auto needle=args.empty()?Value::Undefined():r.Deref(args[0]);
+                auto found=std::find_if(object->entries.begin(),object->entries.end(),[&](const auto& entry){return r.EqualValues(entry.first,needle);});
+                if(key==L"has")return Value::Bool(found!=object->entries.end());
+                if(key==L"get")return found==object->entries.end()?Value::Undefined():found->second;
+                if(key==L"delete"){if(found==object->entries.end())return Value::Bool(false);object->entries.erase(found);return Value::Bool(true);}
+                const auto value=map?(args.size()>1?r.Deref(args[1]):Value::Undefined()):needle;
+                if(found==object->entries.end())object->entries.push_back({needle,value});else found->second=value;
+                return Value::FromObject(object);
+            });
+        }
+        if(object->kind==ObjectKind::Document){
+            if(key==L"documentElement")return NodeValue(document.QuerySelector(L"html"));
+            if(key==L"body")return NodeValue(document.Body());
+            if(key==L"activeElement"){
+                std::shared_ptr<Node> active;
+                std::function<void(const std::shared_ptr<Node>&)> find=[&](const std::shared_ptr<Node>& node){
+                    if(!node||active)return;if(node->focused){active=node;return;}
+                    for(const auto& child:node->children)find(child);
+                };
+                find(document.Root());return NodeValue(active);
+            }
+            if(key==L"getElementById")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();return r.NodeValue(r.document.GetElementById(a.empty()?L"":r.String(a[0])));});
+            if(key==L"getElementsByName")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){std::vector<Value> out;for(auto& n:r.document.GetElementsByName(a.empty()?L"":r.String(a[0])))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
+            if(key==L"querySelector"||key==L"querySelectorAll")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
+            if(key==L"createElement")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(r.document.CreateElement(a.empty()?L"div":r.String(a[0])));});
+            if(key==L"createTextNode")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";node->text=a.empty()?L"":r.String(a[0]);return r.NodeValue(node);});
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.documentListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+        }
+        if(object->kind==ObjectKind::Node){
+            auto node=object->node;if(!node)return Value::Undefined();
+            if(key==L"contentWindow"&&node->tag==L"iframe")return FrameWindowValue(node);
+            if(key==L"id")return Value::String(node->Attribute(L"id"));
+            if(key==L"className")return Value::String(node->Attribute(L"class"));
+            if(key==L"value")return Value::String(node->Attribute(L"value"));
+            if(key==L"selectionStart"||key==L"selectionEnd"){
+                size_t start=node->selectionStart,end=node->selectionEnd;
+                if(selectionProvider)selectionProvider(node,start,end);
+                return Value::Number(static_cast<double>(key==L"selectionStart"?start:end));
+            }
+            if(key==L"selectionDirection")return Value::String(L"none");
+            if(key==L"files"&&node->tag==L"input"&&ToLower(node->Attribute(L"type"))==L"file"){
+                return FileListValue(node->files);
+            }
+            if(key==L"checked")return Value::Bool(node->checked);
+            if(key==L"disabled")return Value::Bool(node->disabled);
+            if(key==L"hidden")return Value::Bool(node->attributes.count(L"hidden")!=0);
+            if(key==L"open")return Value::Bool(node->attributes.count(L"open")!=0);
+            if(key==L"title"||key==L"type"||key==L"draggable"||key==L"colSpan"||key==L"returnValue")return key==L"draggable"?Value::Bool(node->Attribute(L"draggable")==L"true"):Value::String(node->Attribute(key==L"colSpan"?L"colspan":ToLower(key)));
+            if(key==L"scrollTop")return Value::Number(node->scrollTop);
+            if(key==L"clientHeight"||key==L"clientWidth"||key==L"scrollHeight"){
+                const auto g=geometryProvider?geometryProvider(node):JavaScriptRuntime::NodeGeometry{};
+                return Value::Number(key==L"clientHeight"?g.clientHeight:key==L"clientWidth"?g.clientWidth:g.scrollHeight);
+            }
+            if(key==L"getBoundingClientRect")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){
+                const auto g=r.geometryProvider?r.geometryProvider(node):JavaScriptRuntime::NodeGeometry{};
+                auto rect=r.ObjectValue(ObjectKind::Plain);
+                rect.object->props[L"x"]=rect.object->props[L"left"]=Value::Number(g.x);
+                rect.object->props[L"y"]=rect.object->props[L"top"]=Value::Number(g.y);
+                rect.object->props[L"width"]=Value::Number(g.width);
+                rect.object->props[L"height"]=Value::Number(g.height);
+                rect.object->props[L"right"]=Value::Number(g.x+g.width);
+                rect.object->props[L"bottom"]=Value::Number(g.y+g.height);
+                return rect;
+            });
+            if(key==L"innerText"||key==L"textContent")return Value::String(node->InnerText());
+            if(key==L"innerHTML")return Value::String(node->InnerText());
+            if(key==L"content"&&node->tag==L"template")return NodeValue(node);
+            if(key==L"children"){
+                std::vector<Value> out;for(const auto& child:node->children)if(child->type==NodeType::Element)out.push_back(NodeValue(child));return ArrayValue(out);
+            }
+            if(key==L"childElementCount"){
+                size_t count=0;for(const auto& child:node->children)if(child->type==NodeType::Element)++count;return Value::Number(static_cast<double>(count));
+            }
+            if(key==L"firstElementChild"||key==L"lastElementChild"){
+                if(key==L"firstElementChild"){for(const auto& child:node->children)if(child->type==NodeType::Element)return NodeValue(child);}
+                else{for(auto child=node->children.rbegin();child!=node->children.rend();++child)if((*child)->type==NodeType::Element)return NodeValue(*child);}
+                return Value::Null();
+            }
+            if(key==L"classList"){auto o=std::make_shared<Object>();o->kind=ObjectKind::ClassList;o->node=node;return Value::FromObject(o);}
+            if(key==L"style"){auto o=std::make_shared<Object>();o->kind=ObjectKind::Style;o->node=node;return Value::FromObject(o);}
+            if(key==L"dataset"){auto o=std::make_shared<Object>();o->kind=ObjectKind::Dataset;o->node=node;return Value::FromObject(o);}
+            if(key==L"cells"){std::vector<Value> out;for(auto& c:node->children)if(c->tag==L"td"||c->tag==L"th")out.push_back(NodeValue(c));return ArrayValue(out);}
+            if(key==L"parentNode"||key==L"parentElement")return NodeValue(node->parent.lock());
+            if(key==L"nextElementSibling"){
+                auto parent=node->parent.lock();if(!parent)return Value::Null();bool found=false;for(const auto& sibling:parent->children){if(sibling==node){found=true;continue;}if(found&&sibling->type==NodeType::Element)return NodeValue(sibling);}return Value::Null();
+            }
+            if(key==L"appendChild")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty()){auto v=r.Deref(a[0]);if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Node&&v.object->node){v.object->node->parent=node;node->children.push_back(v.object->node);r.Mutated(true);return v;}}return Value::Null();});
+            if(key==L"insertBefore")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Null();auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node||!value.object->node)return Value::Null();
+                auto child=value.object->node;if(auto old=child->parent.lock())old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());
+                auto position=node->children.end();if(a.size()>1){auto before=r.Deref(a[1]);if(before.type==Value::Type::Object&&before.object&&before.object->kind==ObjectKind::Node)position=std::find(node->children.begin(),node->children.end(),before.object->node);}
+                child->parent=node;node->children.insert(position,child);r.Mutated(true);return value;
+            });
+            if(key==L"append"||key==L"replaceChildren")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"replaceChildren")node->children.clear();for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> child;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)child=value.object->node;else{child=std::make_shared<Node>();child->type=NodeType::Text;child->tag=L"#text";child->text=r.String(value);}if(child){if(auto old=child->parent.lock()){old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());}child->parent=node;node->children.push_back(child);}}r.Mutated(true);return Value::Undefined();});
+            if(key==L"setAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1){const auto name=r.String(a[0]);node->SetAttribute(name,r.String(a[1]));r.Mutated(name==L"id");}return Value::Undefined();});
+            if(key==L"getAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::String(a.empty()?L"":node->Attribute(r.String(a[0])));});
+            if(key==L"hasAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&node->attributes.count(ToLower(r.String(a[0])))!=0);});
+            if(key==L"removeAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty()){const auto name=r.String(a[0]);node->RemoveAttribute(name);r.Mutated(name==L"id");}return Value::Undefined();});
+            if(key==L"remove")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(auto parent=node->parent.lock()){parent->children.erase(std::remove(parent->children.begin(),parent->children.end(),node),parent->children.end());node->parent.reset();r.Mutated(true);}return Value::Undefined();});
+            if(key==L"replaceWith")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                auto parent=node->parent.lock();if(!parent)return Value::Undefined();auto position=std::find(parent->children.begin(),parent->children.end(),node);if(position==parent->children.end())return Value::Undefined();
+                const auto offset=static_cast<size_t>(position-parent->children.begin());parent->children.erase(position);node->parent.reset();size_t insert=offset;
+                for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> replacement;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)replacement=value.object->node;else{replacement=std::make_shared<Node>();replacement->type=NodeType::Text;replacement->tag=L"#text";replacement->text=r.String(value);}if(auto old=replacement->parent.lock())old->children.erase(std::remove(old->children.begin(),old->children.end(),replacement),old->children.end());replacement->parent=parent;parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(insert++),replacement);}
+                r.Mutated(true);return Value::Undefined();
+            });
+            if(key==L"focus")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink(node);else node->focused=true;r.Mutated();return Value::Undefined();});
+            if(key==L"setSelectionRange")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto length=node->Attribute(L"value").size();
+                const auto start=std::min(length,static_cast<size_t>(std::max(0.0,a.empty()?0:r.Number(a[0]))));
+                const auto end=std::min(length,static_cast<size_t>(std::max(0.0,a.size()>1?r.Number(a[1]):static_cast<double>(start))));
+                node->selectionStart=start;node->selectionEnd=end;if(r.selectionSetter)r.selectionSetter(node,start,end);
+                return Value::Undefined();
+            });
+            if((key==L"showModal"||key==L"show")&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){node->SetAttribute(L"open",L"");r.Mutated();return Value::Undefined();});
+            if(key==L"close"&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){node->RemoveAttribute(L"open");node->SetAttribute(L"returnvalue",a.empty()?L"":r.String(a[0]));r.Mutated();r.Dispatch(node,L"close");return Value::Undefined();});
+            if(key==L"requestSubmit"&&node->tag==L"form")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){r.Dispatch(node,L"submit");return Value::Undefined();});
+            if(key==L"scrollTo")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                double top=0;if(!a.empty()){auto value=r.Deref(a[0]);if(value.type==Value::Type::Object&&value.object&&value.object->props.count(L"top"))top=r.Number(value.object->props[L"top"]);else top=r.Number(value);}node->scrollTop=std::max(0.0f,static_cast<float>(top));r.Mutated();return Value::Undefined();
+            });
+            if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node)return Value::Bool(false);for(auto current=value.object->node;current;current=current->parent.lock())if(current==node)return Value::Bool(true);return Value::Bool(false);});
+            if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.listeners[node.get()][r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+            if(key==L"querySelector"||key==L"querySelectorAll")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector,node));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector,node))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
+            if(key==L"closest")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(node->Closest(a.empty()?L"":r.String(a[0])));});
+            if(key==L"matches")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&Document::MatchesSelector(node,r.String(a[0])));});
+        }
+        if(object->kind==ObjectKind::ClassList){
+            auto node=object->node;
+            if(key==L"add"||key==L"remove")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){for(auto& v:a)if(key==L"add")node->AddClass(r.String(v));else node->RemoveClass(r.String(v));r.Mutated();return Value::Undefined();});
+            if(key==L"toggle")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);bool has=a.size()>1;bool force=has?r.Truth(a[1]):false;node->ToggleClass(r.String(a[0]),force,has);r.Mutated();return Value::Bool(node->HasClass(r.String(a[0])));});
+            if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&node->HasClass(r.String(a[0])));});
+        }
+        if(object->kind==ObjectKind::Style){
+            if(key==L"setProperty")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(object->node&&a.size()>1){object->node->inlineStyle[ToLower(r.String(a[0]))]=r.String(a[1]);r.Mutated();}
+                return Value::Undefined();
+            });
+            if(key==L"getPropertyValue")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(!object->node||a.empty())return Value::String(L"");
+                const auto name=ToLower(r.String(a[0]));if(object->props.count(L"$computed")&&r.stylePropertyProvider)return Value::String(r.stylePropertyProvider(object->node,name));
+                const auto found=object->node->inlineStyle.find(name);return Value::String(found==object->node->inlineStyle.end()?L"":found->second);
+            });
+            if(!object->node)return Value::String(L"");const auto name=CamelToKebab(key);if(object->props.count(L"$computed")&&stylePropertyProvider)return Value::String(stylePropertyProvider(object->node,name));const auto found=object->node->inlineStyle.find(name);return Value::String(found==object->node->inlineStyle.end()?L"":found->second);
+        }
+        if(object->kind==ObjectKind::Dataset)
+            return Value::String(object->node?object->node->Attribute(DatasetAttributeName(key)):L"");
+        if(object->kind==ObjectKind::Window){
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.windowListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+        }
+        if(object->kind==ObjectKind::FrameWindow&&key==L"postMessage")return Native([node=object->node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            if(!a.empty()){
+                const auto data=r.Json(a[0]);
+                if(node){if(r.frameMessageSink)r.frameMessageSink(node,data);}
+                else if(r.parentMessageSink)r.parentMessageSink(data);
+            }
+            return Value::Undefined();
+        });
+        if(object->kind==ObjectKind::Event){
+            if(key==L"stopPropagation")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"$propagationStopped"]=Value::Bool(true);return Value::Undefined();});
+            if(key==L"stopImmediatePropagation")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"$propagationStopped"]=Value::Bool(true);object->props[L"$immediateStopped"]=Value::Bool(true);return Value::Undefined();});
+            if(key==L"preventDefault")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"defaultPrevented"]=Value::Bool(true);return Value::Undefined();});
+            if(key==L"composedPath")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){std::vector<Value> path;auto target=object->props.find(L"target");if(target!=object->props.end()){auto value=r.Deref(target->second);if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)for(auto node=value.object->node;node;node=node->parent.lock())path.push_back(r.NodeValue(node));}return r.ArrayValue(path);});
+        }
+        if(object->kind==ObjectKind::WebView){
+            if(key==L"postMessage")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(r.messageSink&&!a.empty())r.messageSink(r.String(a[0]));return Value::Undefined();});
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.webViewListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+        }
+        if(object->kind==ObjectKind::Storage){
+            if(key==L"getItem")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Null();const auto found=object->props.find(r.String(a[0]));return found==object->props.end()?Value::Null():found->second;});
+            if(key==L"setItem")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)object->props[r.String(a[0])]=Value::String(r.String(a[1]));return Value::Undefined();});
+            if(key==L"removeItem")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty())object->props.erase(r.String(a[0]));return Value::Undefined();});
+        }
+        if(object->kind==ObjectKind::UrlSearchParams&&key==L"get")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Null();const auto found=object->props.find(r.String(a[0]));return found==object->props.end()?Value::Null():found->second;});
+        if(object->kind==ObjectKind::Response&&key==L"json")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){const auto found=object->props.find(L"$body");if(found==object->props.end())return r.PromiseResolveValue(r.ObjectValue(ObjectKind::Plain));try{Compiler parser(r.module,r.String(found->second));return r.PromiseResolveValue(r.Run(parser.CompileExpressionOnly(),r.global));}catch(const JavaScriptException& exception){auto promise=r.PromiseValue();r.RejectPromise(promise.object,exception.value);return promise;}catch(const std::exception& exception){auto promise=r.PromiseValue();r.RejectPromise(promise.object,r.ErrorValue(L"SyntaxError",Utf8ToWide(exception.what())));return promise;}});
+        if(object->kind==ObjectKind::Performance&&key==L"now")return Native([](RuntimeCore&,const Value&,const std::vector<Value>&){using namespace std::chrono;return Value::Number(duration<double,std::milli>(steady_clock::now().time_since_epoch()).count());});
+        if(object->kind==ObjectKind::Math&&(key==L"floor"||key==L"ceil"||key==L"round"||key==L"log"||key==L"pow"||key==L"min"||key==L"max"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"floor")return Value::Number(std::floor(a.empty()?0:r.Number(a[0])));if(key==L"ceil")return Value::Number(std::ceil(a.empty()?0:r.Number(a[0])));if(key==L"round")return Value::Number(std::round(a.empty()?0:r.Number(a[0])));if(key==L"log")return Value::Number(std::log(a.empty()?0:r.Number(a[0])));if(key==L"pow")return Value::Number(std::pow(a.empty()?0:r.Number(a[0]),a.size()>1?r.Number(a[1]):0));double n=a.empty()?0:r.Number(a[0]);for(size_t i=1;i<a.size();++i)n=key==L"min"?std::min(n,r.Number(a[i])):std::max(n,r.Number(a[i]));return Value::Number(n);});
+        if(object->kind==ObjectKind::Json&&(key==L"stringify"||key==L"parse"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"stringify")return Value::String(a.empty()?L"undefined":r.Json(a[0]));if(a.empty())return Value::Undefined();try{Compiler parser(r.module,r.String(a[0]));return r.Run(parser.CompileExpressionOnly(),r.global);}catch(...){return Value::Undefined();}});
+        if(object->kind==ObjectKind::ArrayConstructor&&(key==L"from"||key==L"isArray"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"isArray")return Value::Bool(!a.empty()&&r.Deref(a[0]).type==Value::Type::Object&&r.Deref(a[0]).object->kind==ObjectKind::Array);if(a.empty())return r.ArrayValue({});auto v=r.Deref(a[0]);std::vector<Value> values;if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Array)values=v.object->items;else if(v.type==Value::Type::Object&&v.object){const auto length=v.object->props.find(L"length");const auto count=length==v.object->props.end()?0:static_cast<size_t>(std::max(0.0,r.Number(length->second)));values.resize(count,Value::Undefined());}if(a.size()>1)for(size_t i=0;i<values.size();++i)values[i]=r.Deref(r.Call(a[1],Value::Undefined(),{values[i],Value::Number(static_cast<double>(i))}));return r.ArrayValue(values);});
+        if(object->kind==ObjectKind::NumberConstructor&&(key==L"isFinite"||key==L"isNaN"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto value=a.empty()?Value::Undefined():r.Deref(a[0]);return Value::Bool(key==L"isFinite"?value.type==Value::Type::Number&&std::isfinite(value.number):value.type==Value::Type::Number&&std::isnan(value.number));});
+        return Value::Undefined();
+    }
+    void SetProperty(const Value& input,const std::wstring& key,const Value& value){
+        auto base=Deref(input);if(base.type!=Value::Type::Object||!base.object)return;auto object=base.object;auto v=Deref(value);
+        if(object->kind==ObjectKind::Array){try{size_t used=0;size_t i=std::stoul(key,&used);if(used==key.size()){if(i>=object->items.size())object->items.resize(i+1);object->items[i]=v;return;}}catch(...){} }
+        if(object->kind==ObjectKind::Node&&object->node){auto n=object->node;
+            if(key==L"id")n->SetAttribute(L"id",String(v));else if(key==L"className")n->SetAttribute(L"class",String(v));else if(key==L"value"){
+                const auto text=String(v);if(n->tag==L"input"&&ToLower(n->Attribute(L"type"))==L"file"&&text.empty())n->files.clear();
+                n->SetAttribute(L"value",text);n->selectionStart=std::min(n->selectionStart,text.size());n->selectionEnd=std::min(n->selectionEnd,text.size());
+            }
+            else if(key==L"selectionStart"||key==L"selectionEnd"){
+                const auto length=n->Attribute(L"value").size();const auto position=std::min(length,static_cast<size_t>(std::max(0.0,Number(v))));
+                if(key==L"selectionStart")n->selectionStart=position;else n->selectionEnd=position;
+                if(selectionSetter)selectionSetter(n,n->selectionStart,n->selectionEnd);return;
+            }
+            else if(key==L"title"||key==L"type"||key==L"lang"||key==L"colSpan"||key==L"returnValue")n->SetAttribute(key==L"colSpan"?L"colspan":ToLower(key),String(v));
+            else if(key==L"draggable")n->SetAttribute(L"draggable",Truth(v)?L"true":L"false");
+            else if(key==L"hidden"||key==L"open"){if(Truth(v))n->SetAttribute(key,L"");else n->RemoveAttribute(key);Mutated();return;}
+            else if(key==L"scrollTop"){n->scrollTop=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}
+            else if(key==L"checked")n->checked=Truth(v);else if(key==L"disabled")n->disabled=Truth(v);
+            else if(key==L"innerText"||key==L"textContent"){n->SetInnerText(String(v));Mutated(true);return;}else if(key==L"innerHTML"){document.SetInnerHtml(n,String(v),false);Mutated(true);return;}else object->props[key]=v;Mutated(key==L"id");return;}
+        if(object->kind==ObjectKind::Style&&object->node){object->node->inlineStyle[CamelToKebab(key)]=String(v);Mutated();return;}
+        if(object->kind==ObjectKind::Dataset&&object->node){object->node->SetAttribute(DatasetAttributeName(key),String(v));Mutated();return;}
+        object->props[key]=v;
+    }
+    void Assign(const Value& reference,const Value& value){
+        if(reference.type!=Value::Type::Reference)return;auto ref=reference.reference;
+        if(ref->kind==Reference::Kind::Variable){auto* env=ref->env->Find(ref->name);if(!env)env=ref->env.get();env->values[ref->name]=Deref(value);}else SetProperty(ref->base,ref->name,value);
+    }
+    bool Delete(const Value& reference){
+        if(reference.type!=Value::Type::Reference)return true;const auto ref=reference.reference;
+        if(ref->kind==Reference::Kind::Variable){if(ref->env){auto* env=ref->env->Find(ref->name);if(env)env->values.erase(ref->name);}return true;}
+        auto base=Deref(ref->base);if(base.type!=Value::Type::Object||!base.object)return true;
+        if(base.object->kind==ObjectKind::Dataset&&base.object->node){base.object->node->RemoveAttribute(DatasetAttributeName(ref->name));Mutated();return true;}
+        base.object->props.erase(ref->name);return true;
+    }
+    Value Call(const Value& callable,const Value& explicitThis,const std::vector<Value>& args){
+        Value callee=Deref(callable),thisValue=explicitThis;
+        if(callable.type==Value::Type::Reference&&callable.reference->kind==Reference::Kind::Property)thisValue=Deref(callable.reference->base);
+        if(callee.type==Value::Type::Native)return callee.native->callback(*this,thisValue,args);
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::NumberConstructor)
+            return Value::Number(args.empty()?0:Number(args[0]));
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::DateConstructor)return DateValue(args);
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::ErrorConstructor){const auto name=callee.object->props.count(L"$name")?String(callee.object->props[L"$name"]):L"Error";return ErrorValue(name,args.empty()?L"":String(args[0]));}
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::PromiseConstructor)throw JavaScriptException{ErrorValue(L"TypeError",L"Promise constructor must be called with new")};
+        if(callee.type==Value::Type::Function){
+            const auto prototype=callee.function->prototype;auto env=std::make_shared<Environment>();env->parent=callee.function->closure;
+            env->values.reserve(prototype->parameters.size()+3);
+            try{
+                if(!prototype->lexicalThis)env->values[L"this"]=thisValue;
+                for(size_t i=0;i<prototype->parameters.size();++i){auto value=i<args.size()?Deref(args[i]):Value::Undefined();env->values[prototype->parameters[i]]=value;if(value.type==Value::Type::Undefined&&i<prototype->parameterDefaults.size()&&prototype->parameterDefaults[i])env->values[prototype->parameters[i]]=Run(*prototype->parameterDefaults[i],env);}
+                if(!prototype->lexicalThis)env->values[L"arguments"]=ArrayValue(args);
+                if(!prototype->restParameter.empty()){
+                    std::vector<Value> rest;
+                    if(args.size()>prototype->parameters.size())rest.assign(args.begin()+prototype->parameters.size(),args.end());
+                    env->values[prototype->restParameter]=ArrayValue(rest);
+                }
+                for(const auto& binding:prototype->bindings){
+                    auto value=GetProperty(env->values[binding.parameter],binding.property);
+                    if(Deref(value).type==Value::Type::Undefined&&binding.defaultValue)
+                        value=Run(*binding.defaultValue,env);
+                    env->values[binding.name]=Deref(value);
+                }
+                if(prototype->isAsync)return StartAsyncFunction(prototype,env);return Run(prototype->chunk,env);
+            }catch(const JavaScriptException& exception){if(!prototype->isAsync)throw;auto promise=PromiseValue();RejectPromise(promise.object,exception.value);return promise;}
+            catch(const std::exception& exception){if(!prototype->isAsync)throw;auto promise=PromiseValue();RejectPromise(promise.object,ErrorValue(L"Error",Utf8ToWide(exception.what())));return promise;}
+        }
+        return Value::Undefined();
+    }
+    Value Construct(const Value& constructor,const std::vector<Value>& args){
+        const auto callee=Deref(constructor);
+        if(callee.type==Value::Type::Native){const auto result=Call(callee,Value::Undefined(),args);return Deref(result);}
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::DateConstructor)return DateValue(args);
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::PromiseConstructor)return ConstructPromise(args.empty()?Value::Undefined():args[0]);
+        if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::ErrorConstructor){const auto name=callee.object->props.count(L"$name")?String(callee.object->props[L"$name"]):L"Error";return ErrorValue(name,args.empty()?L"":String(args[0]));}
+        auto instance=ObjectValue(ObjectKind::Plain);
+        if(callee.type==Value::Type::Object&&callee.object){
+            instance.object->prototype=callee.object;
+            const auto found=callee.object->props.find(L"$method:constructor");
+            if(found!=callee.object->props.end())Call(found->second,instance,args);
+            return instance;
+        }
+        if(callee.type==Value::Type::Function){
+            const auto result=Deref(Call(callee,instance,args));
+            return result.type==Value::Type::Object?result:instance;
+        }
+        return instance;
+    }
+    bool EqualValues(const Value& a,const Value& b){auto x=Deref(a),y=Deref(b);if(x.type!=y.type)return false;switch(x.type){case Value::Type::Undefined:case Value::Type::Null:return true;case Value::Type::Boolean:return x.boolean==y.boolean;case Value::Type::Number:return x.number==y.number;case Value::Type::String:return x.string==y.string;case Value::Type::Object:return x.object==y.object;case Value::Type::Function:return x.function==y.function;case Value::Type::Native:return x.native==y.native;default:return false;}}
+    bool LooseEqualValues(const Value& a,const Value& b){auto x=Deref(a),y=Deref(b);if((x.type==Value::Type::Undefined||x.type==Value::Type::Null)&&(y.type==Value::Type::Undefined||y.type==Value::Type::Null))return true;if(x.type==y.type)return EqualValues(x,y);if(x.type==Value::Type::Boolean||x.type==Value::Type::Number||x.type==Value::Type::String||y.type==Value::Type::Boolean||y.type==Value::Type::Number||y.type==Value::Type::String)return Number(x)==Number(y);return false;}
+    std::wstring Json(const Value& input){
+        auto v=Deref(input);if(v.type==Value::Type::Undefined)return L"undefined";if(v.type==Value::Type::Null)return L"null";if(v.type==Value::Type::Boolean)return v.boolean?L"true":L"false";if(v.type==Value::Type::Number)return NumberString(v.number);
+        if(v.type==Value::Type::String){std::wstring o=L"\"";for(wchar_t c:v.string){if(c==L'\\'||c==L'"')o+=L'\\';if(c==L'\n')o+=L"\\n";else o+=c;}return o+L"\"";}
+        if(v.type==Value::Type::Object&&v.object){if(v.object->kind==ObjectKind::Array){std::wstring o=L"[";for(size_t i=0;i<v.object->items.size();++i){if(i)o+=L",";o+=Json(v.object->items[i]);}return o+L"]";}std::wstring o=L"{";bool first=true;for(auto& p:v.object->props){if(!first)o+=L",";first=false;o+=Json(Value::String(p.first))+L":"+Json(p.second);}return o+L"}";}return L"undefined";
+    }
+    std::wstring TypeName(const Value& input){auto v=Deref(input);switch(v.type){case Value::Type::Undefined:return L"undefined";case Value::Type::Boolean:return L"boolean";case Value::Type::Number:return L"number";case Value::Type::String:return L"string";case Value::Type::Function:case Value::Type::Native:return L"function";case Value::Type::Object:if(v.object&&(v.object->kind==ObjectKind::PromiseConstructor||v.object->kind==ObjectKind::ErrorConstructor||v.object->kind==ObjectKind::NumberConstructor||v.object->kind==ObjectKind::DateConstructor))return L"function";return L"object";default:return L"object";}}
+    Value EvaluateTemplate(const std::wstring& raw,const std::shared_ptr<Environment>& env){
+        auto found=templatePrograms.find(raw);
+        if(found==templatePrograms.end()){
+            auto program=std::make_shared<TemplateProgram>();size_t position=0;
+            while(position<raw.size()){
+                const auto begin=raw.find(L"${",position);
+                if(begin==std::wstring::npos){program->literals.push_back(raw.substr(position));position=raw.size();break;}
+                program->literals.push_back(raw.substr(position,begin-position));
+                int depth=1;size_t end=begin+2;wchar_t quote=0;
+                for(;end<raw.size()&&depth;++end){const auto c=raw[end];if(quote){if(c==quote&&raw[end-1]!=L'\\')quote=0;}else if(c==L'\''||c==L'"'||c==L'`')quote=c;else if(c==L'{')++depth;else if(c==L'}')--depth;}
+                if(depth){program->literals.back()+=raw.substr(begin);position=raw.size();break;}
+                Compiler compiler(module,raw.substr(begin+2,end-begin-3));
+                program->expressions.push_back(compiler.CompileExpressionOnly());position=end;
+            }
+            if(program->literals.size()==program->expressions.size())program->literals.emplace_back();
+            if(templatePrograms.size()>=256)templatePrograms.clear();
+            found=templatePrograms.emplace(raw,program).first;
+        }
+        const auto& program=*found->second;std::wstring out;size_t reserve=0;
+        for(const auto& literal:program.literals)reserve+=literal.size();out.reserve(reserve+32*program.expressions.size());
+        for(size_t index=0;index<program.expressions.size();++index){
+            out+=program.literals[index];out+=String(Run(program.expressions[index],env));
+        }
+        if(!program.literals.empty())out+=program.literals.back();
+        return Value::String(out);
+    }
+    static bool InRange(size_t position,size_t begin,size_t end){return position>=begin&&position<end;}
+    void CancelPendingFinally(const std::shared_ptr<ExecutionFrame>& frame,size_t origin){
+        frame->pending.erase(std::remove_if(frame->pending.begin(),frame->pending.end(),[&](const PendingCompletion& completion){const auto& handler=frame->chunk->handlers[completion.handler];return handler.hasFinally&&InRange(origin,handler.finallyStart,handler.finallyEnd);}),frame->pending.end());
+    }
+    void LeaveCatchScope(const std::shared_ptr<ExecutionFrame>& frame,int handlerIndex){
+        const auto found=std::find_if(frame->catchScopes.rbegin(),frame->catchScopes.rend(),[&](const ExecutionFrame::CatchScope& scope){return scope.handler==handlerIndex;});
+        if(found==frame->catchScopes.rend())return;frame->env=found->outer;frame->catchScopes.erase(std::next(found).base());
+    }
+    bool DispatchException(const std::shared_ptr<ExecutionFrame>& frame,const Value& thrown,size_t origin){
+        CancelPendingFinally(frame,origin);
+        for(int index=static_cast<int>(frame->chunk->handlers.size())-1;index>=0;--index){const auto& handler=frame->chunk->handlers[static_cast<size_t>(index)];
+            if(InRange(origin,handler.tryStart,handler.tryEnd)){
+                frame->stack.clear();
+                if(handler.hasCatch){auto catchEnvironment=std::make_shared<Environment>();catchEnvironment->parent=frame->env;if(!handler.catchName.empty())catchEnvironment->values[handler.catchName]=Deref(thrown);frame->catchScopes.push_back({index,frame->env});frame->env=catchEnvironment;frame->ip=handler.catchStart;return true;}
+                if(handler.hasFinally){frame->pending.push_back({index,CompletionKind::Throw,Deref(thrown),0});frame->ip=handler.finallyStart;return true;}
+            }
+            if(handler.hasCatch&&InRange(origin,handler.catchStart,handler.catchEnd)){frame->stack.clear();LeaveCatchScope(frame,index);if(handler.hasFinally){frame->pending.push_back({index,CompletionKind::Throw,Deref(thrown),0});frame->ip=handler.finallyStart;return true;}}
+        }
+        return false;
+    }
+    bool BeginAbrupt(const std::shared_ptr<ExecutionFrame>& frame,CompletionKind kind,const Value& value,size_t target,size_t origin){
+        CancelPendingFinally(frame,origin);
+        for(int index=static_cast<int>(frame->chunk->handlers.size())-1;index>=0;--index){const auto& handler=frame->chunk->handlers[static_cast<size_t>(index)];
+            const bool inTry=InRange(origin,handler.tryStart,handler.tryEnd),inCatch=handler.hasCatch&&InRange(origin,handler.catchStart,handler.catchEnd);if(!inTry&&!inCatch)continue;
+            if(kind==CompletionKind::Jump){const bool stays=inTry?InRange(target,handler.tryStart,handler.tryEnd):InRange(target,handler.catchStart,handler.catchEnd);if(stays)continue;if(target==handler.finallyStart)return false;}
+            if(inCatch)LeaveCatchScope(frame,index);if(!handler.hasFinally)continue;
+            frame->pending.push_back({index,kind,Deref(value),target});frame->ip=handler.finallyStart;return true;
+        }
+        return false;
+    }
+    void ResumeAsync(const std::shared_ptr<ExecutionFrame>& frame,bool rejected,const Value& value){
+        if(!frame||!frame->asyncPromise||frame->asyncPromise->promiseState!=PromiseState::Pending)return;
+        if(rejected){frame->resumeThrow=true;frame->resumeValue=Deref(value);}else frame->stack.push_back(Deref(value));
+        try{const auto result=RunFrame(frame);if(!result.suspended)ResolvePromise(frame->asyncPromise,result.value);}
+        catch(const JavaScriptException& exception){RejectPromise(frame->asyncPromise,exception.value);}
+        catch(const std::exception& exception){RejectPromise(frame->asyncPromise,ErrorValue(L"Error",Utf8ToWide(exception.what())));}
+    }
+    FrameResult RunFrame(const std::shared_ptr<ExecutionFrame>& frame){
+        auto& stack=frame->stack;auto pop=[&](){if(stack.empty())return Value::Undefined();auto value=std::move(stack.back());stack.pop_back();return value;};
+        if(frame->resumeThrow){frame->resumeThrow=false;const auto thrown=frame->resumeValue;if(!DispatchException(frame,thrown,frame->resumeOrigin))throw JavaScriptException{thrown};}
+        while(frame->ip<frame->chunk->code.size()){
+            const size_t current=frame->ip++;const auto& ins=frame->chunk->code[current];
+            try{switch(ins.op){
+            case Op::Constant:stack.push_back(frame->chunk->constants[ins.argument]);break;case Op::Undefined:stack.push_back(Value::Undefined());break;case Op::Null:stack.push_back(Value::Null());break;case Op::TrueValue:stack.push_back(Value::Bool(true));break;case Op::FalseValue:stack.push_back(Value::Bool(false));break;
+            case Op::LoadReference:{auto reference=std::make_shared<Reference>();reference->env=frame->env;reference->name=ins.text;stack.push_back(Value::FromReference(reference));break;}
+            case Op::Declare:{auto value=Deref(pop());frame->env->values[ins.text]=value;break;}
+            case Op::GetProperty:{auto base=pop();auto reference=std::make_shared<Reference>();reference->kind=Reference::Kind::Property;reference->base=base;reference->name=ins.text;stack.push_back(Value::FromReference(reference));break;}
+            case Op::GetIndex:{auto key=String(pop());auto base=pop();auto reference=std::make_shared<Reference>();reference->kind=Reference::Kind::Property;reference->base=base;reference->name=key;stack.push_back(Value::FromReference(reference));break;}
+            case Op::Assign:{auto value=Deref(pop());auto reference=pop();Assign(reference,value);stack.push_back(value);break;}
+            case Op::PostIncrement:case Op::PostDecrement:case Op::PreIncrement:case Op::PreDecrement:{auto reference=pop();const auto old=Deref(reference);const double delta=(ins.op==Op::PostIncrement||ins.op==Op::PreIncrement)?1.0:-1.0;const auto next=Value::Number(Number(old)+delta);Assign(reference,next);stack.push_back(ins.op==Op::PostIncrement||ins.op==Op::PostDecrement?old:next);break;}
+            case Op::NewArray:stack.push_back(ArrayValue({}));break;case Op::ArrayPush:{auto value=Deref(pop());auto array=Deref(stack.back());array.object->items.push_back(value);break;}
+            case Op::ArraySpread:{auto source=Deref(pop());auto array=Deref(stack.back());if(source.type==Value::Type::Object&&source.object&&array.type==Value::Type::Object&&array.object){if(source.object->kind==ObjectKind::Array)array.object->items.insert(array.object->items.end(),source.object->items.begin(),source.object->items.end());else if(source.object->kind==ObjectKind::Map||source.object->kind==ObjectKind::Set)for(const auto& entry:source.object->entries)array.object->items.push_back(source.object->kind==ObjectKind::Map?entry.second:entry.first);}break;}
+            case Op::NewObject:stack.push_back(ObjectValue(ObjectKind::Plain));break;case Op::ObjectSet:{auto value=Deref(pop());auto object=Deref(stack.back());object.object->props[ins.text]=value;break;}
+            case Op::ObjectSpread:{auto source=Deref(pop());auto target=Deref(stack.back());if(source.type==Value::Type::Object&&source.object&&target.type==Value::Type::Object&&target.object)for(const auto& property:source.object->props)target.object->props[property.first]=Deref(property.second);break;}
+            case Op::EnumerableKeys:{
+                const auto source=Deref(pop());std::vector<Value> keys;
+                if(source.type==Value::Type::String){for(size_t index=0;index<source.string.size();++index)keys.push_back(Value::String(std::to_wstring(index)));}
+                else if(source.type==Value::Type::Object&&source.object){
+                    if(source.object->kind==ObjectKind::Array)for(size_t index=0;index<source.object->items.size();++index)keys.push_back(Value::String(std::to_wstring(index)));
+                    for(const auto& property:source.object->props)if(property.first.empty()||property.first.front()!=L'$')keys.push_back(Value::String(property.first));
+                }
+                stack.push_back(ArrayValue(keys));break;
+            }
+            case Op::MakeFunction:{auto function=std::make_shared<Function>();function->prototype=module->prototypes[ins.argument];function->closure=frame->env;stack.push_back(Value::FromFunction(function));break;}
+            case Op::Call:{std::vector<Value> args(ins.argument);for(int i=ins.argument-1;i>=0;--i)args[i]=Deref(pop());auto callee=pop();stack.push_back(Call(callee,Value::Undefined(),args));break;}
+            case Op::CallArray:{auto arguments=Deref(pop());auto callee=pop();stack.push_back(Call(callee,Value::Undefined(),arguments.type==Value::Type::Object&&arguments.object?arguments.object->items:std::vector<Value>{}));break;}
+            case Op::Construct:{std::vector<Value> args(ins.argument);for(int i=ins.argument-1;i>=0;--i)args[i]=Deref(pop());auto constructor=pop();stack.push_back(Construct(constructor,args));break;}
+            case Op::ConstructArray:{auto arguments=Deref(pop());auto constructor=pop();stack.push_back(Construct(constructor,arguments.type==Value::Type::Object&&arguments.object?arguments.object->items:std::vector<Value>{}));break;}
+            case Op::DeleteValue:stack.push_back(Value::Bool(Delete(pop())));break;
+            case Op::ThrowValue:throw JavaScriptException{Deref(pop())};
+            case Op::Await:{const auto awaited=PromiseResolveValue(pop());const auto origin=current;frame->resumeOrigin=origin;auto fulfilled=Native([frame](RuntimeCore& runtime,const Value&,const std::vector<Value>& values){runtime.ResumeAsync(frame,false,values.empty()?Value::Undefined():values[0]);return Value::Undefined();});auto rejected=Native([frame](RuntimeCore& runtime,const Value&,const std::vector<Value>& values){runtime.ResumeAsync(frame,true,values.empty()?Value::Undefined():values[0]);return Value::Undefined();});PerformThen(awaited.object,fulfilled,rejected);return {true,Value::Undefined()};}
+            case Op::LeaveCatch:LeaveCatchScope(frame,ins.argument);break;
+            case Op::EndFinally:{auto found=std::find_if(frame->pending.rbegin(),frame->pending.rend(),[&](const PendingCompletion& pending){return pending.handler==ins.argument;});if(found==frame->pending.rend())break;auto completion=*found;frame->pending.erase(std::next(found).base());if(completion.kind==CompletionKind::Throw){if(!DispatchException(frame,completion.value,current))throw JavaScriptException{completion.value};break;}if(BeginAbrupt(frame,completion.kind,completion.value,completion.target,current))break;if(completion.kind==CompletionKind::Return)return {false,completion.value};frame->ip=completion.target;break;}
+            case Op::Pop:pop();break;case Op::Duplicate:if(!stack.empty())stack.push_back(stack.back());break;
+            case Op::Add:{auto b=Deref(pop()),a=Deref(pop());if(a.type==Value::Type::String||b.type==Value::Type::String){std::wstring text;if(a.type==Value::Type::String)text=std::move(a.string);else text=String(a);if(b.type==Value::Type::String)text+=b.string;else text+=String(b);stack.push_back(Value::String(std::move(text)));}else stack.push_back(Value::Number(Number(a)+Number(b)));break;}
+            case Op::Subtract:{auto b=pop(),a=pop();stack.push_back(Value::Number(Number(a)-Number(b)));break;}case Op::Multiply:{auto b=pop(),a=pop();stack.push_back(Value::Number(Number(a)*Number(b)));break;}case Op::Divide:{auto b=pop(),a=pop();stack.push_back(Value::Number(Number(a)/Number(b)));break;}case Op::Modulo:{auto b=pop(),a=pop();stack.push_back(Value::Number(std::fmod(Number(a),Number(b))));break;}case Op::Power:{auto b=pop(),a=pop();stack.push_back(Value::Number(std::pow(Number(a),Number(b))));break;}
+            case Op::BitwiseAnd:{auto b=pop(),a=pop();stack.push_back(Value::Number(static_cast<std::int32_t>(Uint32(a)&Uint32(b))));break;}
+            case Op::BitwiseOr:{auto b=pop(),a=pop();stack.push_back(Value::Number(static_cast<std::int32_t>(Uint32(a)|Uint32(b))));break;}
+            case Op::BitwiseXor:{auto b=pop(),a=pop();stack.push_back(Value::Number(static_cast<std::int32_t>(Uint32(a)^Uint32(b))));break;}
+            case Op::ShiftLeft:{auto b=pop(),a=pop();stack.push_back(Value::Number(static_cast<std::int32_t>(Uint32(a)<<(Uint32(b)&31u))));break;}
+            case Op::ShiftRight:{auto b=pop(),a=pop();stack.push_back(Value::Number(Int32(a)>>(Uint32(b)&31u)));break;}
+            case Op::UnsignedShiftRight:{auto b=pop(),a=pop();stack.push_back(Value::Number(Uint32(a)>>(Uint32(b)&31u)));break;}
+            case Op::InValue:{auto object=pop(),key=pop();stack.push_back(Value::Bool(HasProperty(object,String(key))));break;}
+            case Op::Equal:{auto b=pop(),a=pop();stack.push_back(Value::Bool(LooseEqualValues(a,b)));break;}case Op::NotEqual:{auto b=pop(),a=pop();stack.push_back(Value::Bool(!LooseEqualValues(a,b)));break;}case Op::StrictEqual:{auto b=pop(),a=pop();stack.push_back(Value::Bool(EqualValues(a,b)));break;}case Op::StrictNotEqual:{auto b=pop(),a=pop();stack.push_back(Value::Bool(!EqualValues(a,b)));break;}
+            case Op::Less:{auto b=pop(),a=pop();stack.push_back(Value::Bool(Number(a)<Number(b)));break;}case Op::LessEqual:{auto b=pop(),a=pop();stack.push_back(Value::Bool(Number(a)<=Number(b)));break;}case Op::Greater:{auto b=pop(),a=pop();stack.push_back(Value::Bool(Number(a)>Number(b)));break;}case Op::GreaterEqual:{auto b=pop(),a=pop();stack.push_back(Value::Bool(Number(a)>=Number(b)));break;}
+            case Op::Not:stack.push_back(Value::Bool(!Truth(pop())));break;case Op::BitwiseNot:stack.push_back(Value::Number(static_cast<std::int32_t>(~Uint32(pop()))));break;case Op::Negate:stack.push_back(Value::Number(-Number(pop())));break;case Op::Positive:stack.push_back(Value::Number(Number(pop())));break;case Op::VoidValue:pop();stack.push_back(Value::Undefined());break;case Op::TypeOf:stack.push_back(Value::String(TypeName(pop())));break;
+            case Op::Jump:{const auto target=static_cast<size_t>(ins.argument);if(!BeginAbrupt(frame,CompletionKind::Jump,Value::Undefined(),target,current))frame->ip=target;break;}
+            case Op::JumpFalse:if(!Truth(pop()))frame->ip=static_cast<size_t>(ins.argument);break;
+            case Op::JumpFalseKeep:if(!Truth(stack.back()))frame->ip=static_cast<size_t>(ins.argument);else pop();break;case Op::JumpTrueKeep:if(Truth(stack.back()))frame->ip=static_cast<size_t>(ins.argument);else pop();break;
+            case Op::JumpNotNullishKeep:{const auto value=Deref(stack.back());if(value.type!=Value::Type::Undefined&&value.type!=Value::Type::Null)frame->ip=static_cast<size_t>(ins.argument);else pop();break;}
+            case Op::Template:stack.push_back(EvaluateTemplate(frame->chunk->constants[ins.argument].string,frame->env));break;
+            case Op::Return:{const auto value=stack.empty()?Value::Undefined():Deref(pop());if(BeginAbrupt(frame,CompletionKind::Return,value,0,current))break;return {false,value};}
+            }}catch(const JavaScriptException& exception){if(!DispatchException(frame,exception.value,current))throw;}
+            catch(const std::exception& exception){const auto error=ErrorValue(L"Error",Utf8ToWide(exception.what()));if(!DispatchException(frame,error,current))throw JavaScriptException{error};}
+        }
+        return {false,Value::Undefined()};
+    }
+    Value StartAsyncFunction(const std::shared_ptr<Prototype>& prototype,const std::shared_ptr<Environment>& env){
+        auto promise=PromiseValue();auto frame=std::make_shared<ExecutionFrame>();frame->chunk=&prototype->chunk;frame->prototype=prototype;frame->env=env;frame->asyncPromise=promise.object;
+        try{const auto result=RunFrame(frame);if(!result.suspended)ResolvePromise(promise.object,result.value);}
+        catch(const JavaScriptException& exception){RejectPromise(promise.object,exception.value);}
+        catch(const std::exception& exception){RejectPromise(promise.object,ErrorValue(L"Error",Utf8ToWide(exception.what())));}
+        return promise;
+    }
+    Value Run(const Chunk& chunk,const std::shared_ptr<Environment>& env){
+        auto frame=std::make_shared<ExecutionFrame>();frame->chunk=&chunk;frame->env=env;
+        frame->stack.reserve(std::min<size_t>(chunk.code.size(),64));
+        const auto result=RunFrame(frame);if(result.suspended)throw std::runtime_error("await outside async execution frame");return result.value;
+    }
+    void InstallGlobals(){
+        global->values[L"document"]=ObjectValue(ObjectKind::Document);
+        auto window=std::make_shared<Object>();window->kind=ObjectKind::Window;auto chrome=std::make_shared<Object>();chrome->kind=ObjectKind::Plain;chrome->props[L"webview"]=ObjectValue(ObjectKind::WebView);window->props[L"chrome"]=Value::FromObject(chrome);global->values[L"window"]=Value::FromObject(window);
+        const auto innerWidth=Value::Number(viewportWidth),innerHeight=Value::Number(viewportHeight);
+        global->values[L"innerWidth"]=innerWidth;global->values[L"innerHeight"]=innerHeight;
+        window->props[L"innerWidth"]=innerWidth;window->props[L"innerHeight"]=innerHeight;
+        auto parent=parentMessageSink?ObjectValue(ObjectKind::FrameWindow):Value::FromObject(window);
+        global->values[L"parent"]=parent;window->props[L"parent"]=parent;
+        global->values[L"performance"]=ObjectValue(ObjectKind::Performance);global->values[L"Math"]=ObjectValue(ObjectKind::Math);global->values[L"JSON"]=ObjectValue(ObjectKind::Json);global->values[L"Array"]=ObjectValue(ObjectKind::ArrayConstructor);
+        auto objectConstructor=std::make_shared<Object>();objectConstructor->kind=ObjectKind::ObjectConstructor;auto objectPrototype=std::make_shared<Object>();objectPrototype->kind=ObjectKind::Plain;objectPrototype->props[L"hasOwnProperty"]=Native([](RuntimeCore& r,const Value& thisValue,const std::vector<Value>& a){const auto object=r.Deref(thisValue);return Value::Bool(!a.empty()&&object.type==Value::Type::Object&&object.object&&object.object->props.count(r.String(a[0]))!=0);});objectConstructor->props[L"prototype"]=Value::FromObject(objectPrototype);global->values[L"Object"]=Value::FromObject(objectConstructor);
+        global->values[L"Number"]=ObjectValue(ObjectKind::NumberConstructor);
+        global->values[L"String"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::String(a.empty()?L"":r.String(a[0]));});
+        global->values[L"RegExp"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            auto expression=r.ObjectValue(ObjectKind::RegExp);
+            const auto pattern=a.empty()?Value::Undefined():r.Deref(a[0]);
+            if(pattern.type==Value::Type::Object&&pattern.object&&pattern.object->kind==ObjectKind::RegExp){
+                expression.object->props[L"$pattern"]=pattern.object->props[L"$pattern"];
+                expression.object->props[L"$flags"]=a.size()>1?Value::String(r.String(a[1])):pattern.object->props[L"$flags"];
+            }else{
+                expression.object->props[L"$pattern"]=Value::String(a.empty()?L"":r.String(a[0]));
+                expression.object->props[L"$flags"]=Value::String(a.size()>1?r.String(a[1]):L"");
+            }
+            return expression;
+        });
+        global->values[L"encodeURIComponent"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const auto bytes=WideToUtf8(a.empty()?L"undefined":r.String(a[0]));
+            constexpr wchar_t hex[]=L"0123456789ABCDEF";
+            std::wstring encoded;
+            for(unsigned char byte:bytes){
+                if((byte>=L'A'&&byte<=L'Z')||(byte>=L'a'&&byte<=L'z')||
+                   (byte>=L'0'&&byte<=L'9')||byte=='-'||byte=='_'||byte=='.'||
+                   byte=='!'||byte=='~'||byte=='*'||byte=='\''||byte=='('||byte==')')
+                    encoded+=static_cast<wchar_t>(byte);
+                else{encoded+=L'%';encoded+=hex[byte>>4];encoded+=hex[byte&15];}
+            }
+            return Value::String(encoded);
+        });
+        global->values[L"Boolean"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&r.Truth(a[0]));});
+        global->values[L"BigInt"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Number(a.empty()?0:r.Number(a[0]));});
+        for(const auto* name:{L"Error",L"TypeError",L"RangeError",L"ReferenceError",L"SyntaxError",L"AggregateError"}){auto constructor=ObjectValue(ObjectKind::ErrorConstructor);constructor.object->props[L"$name"]=Value::String(name);global->values[name]=constructor;}
+        global->values[L"parseFloat"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Number(a.empty()?std::numeric_limits<double>::quiet_NaN():r.Number(a[0]));});
+        global->values[L"Map"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){return r.ObjectValue(ObjectKind::Map);});
+        global->values[L"Set"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){return r.ObjectValue(ObjectKind::Set);});
+        global->values[L"Date"]=ObjectValue(ObjectKind::DateConstructor);
+        auto intl=ObjectValue(ObjectKind::Plain);
+        intl.object->props[L"RelativeTimeFormat"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const auto locale=a.empty()?L"":ToLower(r.String(a[0]));auto formatter=r.ObjectValue(ObjectKind::Plain);
+            formatter.object->props[L"format"]=r.Native([locale](RuntimeCore& inner,const Value&,const std::vector<Value>& values){
+                const double raw=values.empty()?0:inner.Number(values[0]);const auto unit=values.size()>1?ToLower(inner.String(values[1])):L"second";const auto amount=NumberString(std::abs(raw));
+                if(locale.rfind(L"ko",0)==0){std::wstring translated=unit;if(unit==L"second")translated=L"\uCD08";else if(unit==L"minute")translated=L"\uBD84";else if(unit==L"hour")translated=L"\uC2DC\uAC04";else if(unit==L"day")translated=L"\uC77C";else if(unit==L"week")translated=L"\uC8FC";else if(unit==L"month")translated=L"\uAC1C\uC6D4";else if(unit==L"year")translated=L"\uB144";return Value::String(amount+translated+(raw<0?L" \uC804":L" \uD6C4"));}
+                auto label=unit;if(std::abs(raw)!=1)label+=L"s";return Value::String(raw<0?amount+L" "+label+L" ago":L"in "+amount+L" "+label);
+            });return formatter;
+        });
+        intl.object->props[L"DateTimeFormat"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const auto locale=a.empty()?L"":r.String(a[0]);
+            std::wstring year,month,day,hour,minute,second;int hour12=-1;
+            if(a.size()>1){
+                const auto options=r.Deref(a[1]);
+                if(options.type==Value::Type::Object&&options.object){
+                    auto stringOption=[&](const wchar_t* name){
+                        const auto found=options.object->props.find(name);
+                        return found==options.object->props.end()?std::wstring{}:r.String(found->second);
+                    };
+                    year=stringOption(L"year");month=stringOption(L"month");day=stringOption(L"day");
+                    hour=stringOption(L"hour");minute=stringOption(L"minute");second=stringOption(L"second");
+                    if(const auto found=options.object->props.find(L"hour12");found!=options.object->props.end()){
+                        const auto value=r.Deref(found->second);
+                        if(value.type==Value::Type::Boolean)hour12=value.boolean?1:0;
+                    }
+                }
+            }
+            auto formatter=r.ObjectValue(ObjectKind::Plain);
+            formatter.object->props[L"format"]=r.Native([locale,year,month,day,hour,minute,second,hour12](RuntimeCore& inner,const Value&,const std::vector<Value>& values){
+                const auto value=values.empty()?inner.DateValue({}):inner.Deref(values[0]);const double milliseconds=value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Date?inner.Number(value.object->props[L"$time"]):inner.Number(value);SYSTEMTIME time{};if(!DateSystemTime(milliseconds,time,true))return Value::String(L"Invalid Date");
+                wchar_t date[128]{},clock[128]{};const auto name=locale.empty()?LOCALE_NAME_USER_DEFAULT:locale.c_str();
+                const bool wantsDate=!year.empty()||!month.empty()||!day.empty();
+                const bool wantsTime=!hour.empty()||!minute.empty()||!second.empty();
+                if(wantsDate){
+                    if(year.empty()&&!month.empty()&&!day.empty()){
+                        wchar_t pattern[128]{};
+                        if(GetLocaleInfoEx(name,LOCALE_SMONTHDAY,pattern,
+                                           static_cast<int>(std::size(pattern)))>0)
+                            GetDateFormatEx(name,0,&time,pattern,date,
+                                            static_cast<int>(std::size(date)),nullptr);
+                    }else GetDateFormatEx(name,DATE_SHORTDATE,&time,nullptr,date,
+                                          static_cast<int>(std::size(date)),nullptr);
+                }
+                if(wantsTime){
+                    DWORD flags=second.empty()?TIME_NOSECONDS:0;
+                    if(hour12==0)flags|=TIME_FORCE24HOURFORMAT|TIME_NOTIMEMARKER;
+                    GetTimeFormatEx(name,flags,&time,nullptr,clock,static_cast<int>(std::size(clock)));
+                }
+                if(date[0]&&clock[0])return Value::String(std::wstring(date)+L" "+clock);
+                if(date[0])return Value::String(date);if(clock[0])return Value::String(clock);
+                wchar_t fallback[40]{};swprintf_s(fallback,L"%04u-%02u-%02u %02u:%02u",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute);return Value::String(fallback);
+            });return formatter;
+        });global->values[L"Intl"]=intl;
+        auto css=ObjectValue(ObjectKind::Plain);css.object->props[L"escape"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            const auto value=a.empty()?L"undefined":r.String(a[0]);std::wstring escaped;
+            for(size_t index=0;index<value.size();++index){const wchar_t c=value[index];
+                const bool control=(c>=1&&c<=31)||c==127;
+                const bool leadingDigit=index==0&&std::iswdigit(c);
+                const bool secondDigit=index==1&&value[0]==L'-'&&std::iswdigit(c);
+                if(c==0){escaped+=static_cast<wchar_t>(0xfffd);continue;}
+                if(control||leadingDigit||secondDigit){wchar_t buffer[16]{};swprintf_s(buffer,L"\\%x ",static_cast<unsigned>(c));escaped+=buffer;continue;}
+                if(index==0&&c==L'-'&&value.size()==1){escaped+=L"\\-";continue;}
+                if(c>=128||c==L'-'||c==L'_'||std::iswalnum(c)){escaped+=c;continue;}
+                escaped+=L'\\';escaped+=c;
+            }
+            return Value::String(escaped);
+        });global->values[L"CSS"]=css;
+        global->values[L"requestAnimationFrame"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Number(a.empty()?0:r.ScheduleAnimationFrame(a[0]));});
+        global->values[L"cancelAnimationFrame"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            if(!a.empty()){const unsigned id=static_cast<unsigned>(r.Number(a[0]));
+                r.frameCallbacks.erase(std::remove_if(r.frameCallbacks.begin(),r.frameCallbacks.end(),
+                    [id](const auto& frame){return frame.first==id;}),r.frameCallbacks.end());}
+            return Value::Undefined();
+        });
+        auto timeout=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Number(0);return Value::Number(r.ScheduleTimer(a[0],a.size()>1?r.Number(a[1]):0));});
+        auto interval=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Number(0);return Value::Number(r.ScheduleTimer(a[0],a.size()>1?r.Number(a[1]):0,true));});
+        auto clearTimeout=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty())r.ClearTimer(static_cast<unsigned>(r.Number(a[0])));return Value::Undefined();});
+        global->values[L"setTimeout"]=timeout;global->values[L"clearTimeout"]=clearTimeout;global->values[L"setInterval"]=interval;global->values[L"clearInterval"]=clearTimeout;window->props[L"setTimeout"]=timeout;window->props[L"clearTimeout"]=clearTimeout;window->props[L"setInterval"]=interval;window->props[L"clearInterval"]=clearTimeout;
+        global->values[L"structuredClone"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return a.empty()?Value::Undefined():r.CloneValue(a[0]);});
+        global->values[L"getComputedStyle"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return r.ObjectValue(ObjectKind::Style);const auto value=r.Deref(a[0]);if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node){auto style=r.ObjectValue(ObjectKind::Style);style.object->node=value.object->node;style.object->props[L"$computed"]=Value::Bool(true);return style;}return r.ObjectValue(ObjectKind::Style);});
+        auto promise=ObjectValue(ObjectKind::PromiseConstructor);
+        promise.object->props[L"resolve"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.PromiseResolveValue(a.empty()?Value::Undefined():a[0]);});
+        promise.object->props[L"reject"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto result=r.PromiseValue();r.RejectPromise(result.object,a.empty()?Value::Undefined():a[0]);return result;});
+        promise.object->props[L"all"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            auto result=r.PromiseValue();const auto input=a.empty()?Value::Undefined():r.Deref(a[0]);
+            if(input.type!=Value::Type::Object||!input.object||input.object->kind!=ObjectKind::Array){r.RejectPromise(result.object,r.ErrorValue(L"TypeError",L"Promise.all requires an array"));return result;}
+            auto values=std::make_shared<std::vector<Value>>(input.object->items.size(),Value::Undefined());auto remaining=std::make_shared<size_t>(values->size());
+            if(values->empty()){r.ResolvePromise(result.object,r.ArrayValue({}));return result;}
+            for(size_t index=0;index<input.object->items.size();++index){const auto item=r.PromiseResolveValue(input.object->items[index]);auto fulfilled=r.Native([result=result.object,values,remaining,index](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){(*values)[index]=args.empty()?Value::Undefined():args[0];if(--*remaining==0)runtime.ResolvePromise(result,runtime.ArrayValue(*values));return Value::Undefined();});auto rejected=r.Native([result=result.object](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){runtime.RejectPromise(result,args.empty()?Value::Undefined():args[0]);return Value::Undefined();});r.PerformThen(item.object,fulfilled,rejected);}
+            return result;
+        });
+        promise.object->props[L"race"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            auto result=r.PromiseValue();const auto input=a.empty()?Value::Undefined():r.Deref(a[0]);
+            if(input.type!=Value::Type::Object||!input.object||input.object->kind!=ObjectKind::Array){r.RejectPromise(result.object,r.ErrorValue(L"TypeError",L"Promise.race requires an array"));return result;}
+            for(const auto& value:input.object->items){const auto item=r.PromiseResolveValue(value);auto fulfilled=r.Native([result=result.object](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){runtime.ResolvePromise(result,args.empty()?Value::Undefined():args[0]);return Value::Undefined();});auto rejected=r.Native([result=result.object](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){runtime.RejectPromise(result,args.empty()?Value::Undefined():args[0]);return Value::Undefined();});r.PerformThen(item.object,fulfilled,rejected);}return result;
+        });
+        promise.object->props[L"allSettled"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            auto result=r.PromiseValue();const auto input=a.empty()?Value::Undefined():r.Deref(a[0]);
+            if(input.type!=Value::Type::Object||!input.object||input.object->kind!=ObjectKind::Array){r.RejectPromise(result.object,r.ErrorValue(L"TypeError",L"Promise.allSettled requires an array"));return result;}
+            auto values=std::make_shared<std::vector<Value>>(input.object->items.size(),Value::Undefined());auto remaining=std::make_shared<size_t>(values->size());
+            if(values->empty()){r.ResolvePromise(result.object,r.ArrayValue({}));return result;}
+            for(size_t index=0;index<input.object->items.size();++index){const auto item=r.PromiseResolveValue(input.object->items[index]);auto fulfilled=r.Native([result=result.object,values,remaining,index](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){auto record=runtime.ObjectValue(ObjectKind::Plain);record.object->props[L"status"]=Value::String(L"fulfilled");record.object->props[L"value"]=args.empty()?Value::Undefined():args[0];(*values)[index]=record;if(--*remaining==0)runtime.ResolvePromise(result,runtime.ArrayValue(*values));return Value::Undefined();});auto rejected=r.Native([result=result.object,values,remaining,index](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){auto record=runtime.ObjectValue(ObjectKind::Plain);record.object->props[L"status"]=Value::String(L"rejected");record.object->props[L"reason"]=args.empty()?Value::Undefined():args[0];(*values)[index]=record;if(--*remaining==0)runtime.ResolvePromise(result,runtime.ArrayValue(*values));return Value::Undefined();});r.PerformThen(item.object,fulfilled,rejected);}
+            return result;
+        });
+        promise.object->props[L"any"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+            auto result=r.PromiseValue();const auto input=a.empty()?Value::Undefined():r.Deref(a[0]);
+            if(input.type!=Value::Type::Object||!input.object||input.object->kind!=ObjectKind::Array){r.RejectPromise(result.object,r.ErrorValue(L"TypeError",L"Promise.any requires an array"));return result;}
+            auto errors=std::make_shared<std::vector<Value>>(input.object->items.size(),Value::Undefined());auto remaining=std::make_shared<size_t>(errors->size());
+            auto rejectAll=[result=result.object,errors](RuntimeCore& runtime){auto error=runtime.ErrorValue(L"AggregateError",L"All promises were rejected");error.object->props[L"errors"]=runtime.ArrayValue(*errors);runtime.RejectPromise(result,error);};
+            if(errors->empty()){rejectAll(r);return result;}
+            for(size_t index=0;index<input.object->items.size();++index){const auto item=r.PromiseResolveValue(input.object->items[index]);auto fulfilled=r.Native([result=result.object](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){runtime.ResolvePromise(result,args.empty()?Value::Undefined():args[0]);return Value::Undefined();});auto rejected=r.Native([result=result.object,errors,remaining,index](RuntimeCore& runtime,const Value&,const std::vector<Value>& args){(*errors)[index]=args.empty()?Value::Undefined():args[0];if(--*remaining==0){auto error=runtime.ErrorValue(L"AggregateError",L"All promises were rejected");error.object->props[L"errors"]=runtime.ArrayValue(*errors);runtime.RejectPromise(result,error);}return Value::Undefined();});r.PerformThen(item.object,fulfilled,rejected);}
+            return result;
+        });
+        global->values[L"Promise"]=promise;
+        global->values[L"queueMicrotask"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty()||!r.IsCallable(a[0]))throw JavaScriptException{r.ErrorValue(L"TypeError",L"queueMicrotask callback is not callable")};const auto callback=r.Deref(a[0]);auto* runtime=&r;r.EnqueueMicrotask([runtime,callback](){runtime->Call(callback,Value::Undefined(),{});});return Value::Undefined();});
+        auto locationObject=std::make_shared<Object>();locationObject->kind=ObjectKind::Plain;const auto query=location.find(L'?');const auto fragment=location.find(L'#',query==std::wstring::npos?0:query);locationObject->props[L"search"]=Value::String(query==std::wstring::npos?L"":location.substr(query,fragment==std::wstring::npos?std::wstring::npos:fragment-query));global->values[L"location"]=Value::FromObject(locationObject);window->props[L"location"]=Value::FromObject(locationObject);
+        auto storage=ObjectValue(ObjectKind::Storage);global->values[L"localStorage"]=storage;window->props[L"localStorage"]=storage;
+        global->values[L"URLSearchParams"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto parameters=r.ObjectValue(ObjectKind::UrlSearchParams);auto query=a.empty()?L"":r.String(a[0]);if(!query.empty()&&query.front()==L'?')query.erase(query.begin());size_t start=0;while(start<=query.size()){const auto amp=query.find(L'&',start);const auto part=query.substr(start,amp==std::wstring::npos?std::wstring::npos:amp-start);const auto equal=part.find(L'=');if(!part.empty())parameters.object->props[part.substr(0,equal)]=Value::String(equal==std::wstring::npos?L"":part.substr(equal+1));if(amp==std::wstring::npos)break;start=amp+1;}return parameters;});
+        global->values[L"matchMedia"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){auto media=r.ObjectValue(ObjectKind::MediaQuery);media.object->props[L"matches"]=Value::Bool(false);return media;});
+        auto console=ObjectValue(ObjectKind::Plain);console.object->props[L"error"]=Native([](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::Undefined();});global->values[L"console"]=console;
+        global->values[L"fetch"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto resource=a.empty()?L"":r.String(a[0]);std::wstring body;const bool loaded=r.resourceLoader&&r.resourceLoader(resource,body);auto response=r.ObjectValue(ObjectKind::Response);response.object->props[L"ok"]=Value::Bool(loaded);response.object->props[L"status"]=Value::Number(loaded?200:404);response.object->props[L"$body"]=Value::String(std::move(body));return r.PromiseResolveValue(response);});
+    }
+    bool CompileRun(const std::wstring& source,std::wstring* result,std::wstring* error){
+        MutationBatch batch(*this);
+        try{Compiler compiler(module,source);auto value=Run(compiler.CompileProgram(),global);if(result)*result=String(value);DrainMicrotasks();if(error)error->clear();lastError.clear();return true;}
+        catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);if(error)*error=lastError;return false;}
+        catch(const std::exception& e){const auto* text=e.what();const int bytes=static_cast<int>(std::strlen(text));int count=MultiByteToWideChar(CP_UTF8,0,text,bytes,nullptr,0);lastError.assign(std::max(0,count),L'\0');if(count>0)MultiByteToWideChar(CP_UTF8,0,text,bytes,lastError.data(),count);if(error)*error=lastError;return false;}
+    }
+    void DispatchWebMessageValue(const Value& data){
+        MutationBatch batch(*this);
+        auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;event->props[L"data"]=Deref(data);event->props[L"type"]=Value::String(L"message");
+        auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
+        auto found=webViewListeners.find(L"message");
+        if(found!=webViewListeners.end())for(auto& callback:found->second)Call(callback,ObjectValue(ObjectKind::WebView),{eventValue});
+        DrainMicrotasks();
+    }
+    bool DispatchWebMessageJson(const std::wstring& json,std::wstring* error){
+        try{Compiler compiler(module,json);DispatchWebMessageValue(Run(compiler.CompileExpressionOnly(),global));if(error)error->clear();lastError.clear();return true;}
+        catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);if(error)*error=lastError;return false;}
+        catch(const std::exception& e){const auto* text=e.what();const int bytes=static_cast<int>(std::strlen(text));int count=MultiByteToWideChar(CP_UTF8,0,text,bytes,nullptr,0);lastError.assign(std::max(0,count),L'\0');if(count>0)MultiByteToWideChar(CP_UTF8,0,text,bytes,lastError.data(),count);if(error)*error=lastError;return false;}
+    }
+    bool DispatchWindowMessageJson(const std::wstring& json,const std::shared_ptr<Node>& sourceFrame,std::wstring* error){
+        try{
+            Compiler compiler(module,json);
+            const auto data=Run(compiler.CompileExpressionOnly(),global);
+            MutationBatch batch(*this);
+            auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;
+            event->props[L"data"]=Deref(data);event->props[L"type"]=Value::String(L"message");
+            event->props[L"source"]=sourceFrame?FrameWindowValue(sourceFrame):global->values[L"parent"];
+            const auto found=windowListeners.find(L"message");
+            if(found!=windowListeners.end())for(auto& callback:found->second)
+                Call(callback,global->values[L"window"],{Value::FromObject(event)});
+            DrainMicrotasks();
+            if(error)error->clear();lastError.clear();return true;
+        }catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);if(error)*error=lastError;return false;
+        }catch(const std::exception& exception){
+            const auto* message=exception.what();const int bytes=static_cast<int>(std::strlen(message));
+            const int count=MultiByteToWideChar(CP_UTF8,0,message,bytes,nullptr,0);
+            lastError.assign(std::max(0,count),L'\0');
+            if(count>0)MultiByteToWideChar(CP_UTF8,0,message,bytes,lastError.data(),count);
+            if(error)*error=lastError;return false;
+        }
+    }
+    bool Dispatch(const std::shared_ptr<Node>& node,const std::wstring& eventName,
+                  const std::vector<Node::FileInfo>* droppedFiles=nullptr,
+                  const JavaScriptRuntime::EventInit& init={}){
+        MutationBatch batch(*this);
+        auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;event->props[L"type"]=Value::String(eventName);
+        event->props[L"target"]=NodeValue(node);event->props[L"currentTarget"]=NodeValue(node);
+        event->props[L"key"]=Value::String(init.key);event->props[L"button"]=Value::Number(init.button);
+        event->props[L"data"]=Value::String(init.data);event->props[L"inputType"]=Value::String(init.inputType);
+        event->props[L"detail"]=Value::Number(init.detail);event->props[L"ctrlKey"]=Value::Bool(init.ctrlKey);
+        event->props[L"shiftKey"]=Value::Bool(init.shiftKey);event->props[L"altKey"]=Value::Bool(init.altKey);
+        event->props[L"metaKey"]=Value::Bool(init.metaKey);event->props[L"isComposing"]=Value::Bool(init.isComposing);
+        event->props[L"defaultPrevented"]=Value::Bool(false);event->props[L"isTrusted"]=Value::Bool(true);
+        if(droppedFiles){auto transfer=ObjectValue(ObjectKind::Plain);transfer.object->props[L"files"]=FileListValue(*droppedFiles);
+            event->props[L"dataTransfer"]=transfer;}
+        auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
+        auto stopped=[&](const wchar_t* property){const auto found=event->props.find(property);return found!=event->props.end()&&Truth(found->second);};
+        if(node){for(auto current=node;current&&!stopped(L"$propagationStopped");current=current->parent.lock()){event->props[L"currentTarget"]=NodeValue(current);auto a=listeners.find(current.get());if(a!=listeners.end()){auto b=a->second.find(eventName);if(b!=a->second.end())for(auto& callback:b->second){Call(callback,NodeValue(current),{eventValue});if(stopped(L"$immediateStopped"))break;}}}}
+        if(!stopped(L"$propagationStopped")){event->props[L"currentTarget"]=ObjectValue(ObjectKind::Document);auto documentCallbacks=documentListeners.find(eventName);if(documentCallbacks!=documentListeners.end())for(auto& callback:documentCallbacks->second){Call(callback,ObjectValue(ObjectKind::Document),{eventValue});if(stopped(L"$immediateStopped"))break;}}
+        if(node&&eventName==L"click"){const auto inlineCode=node->Attribute(L"onclick");if(!inlineCode.empty())CompileRun(inlineCode,nullptr,nullptr);}
+        DrainMicrotasks();
+        return stopped(L"defaultPrevented");
+    }
+    void DispatchWindow(const std::wstring& eventName){
+        MutationBatch batch(*this);
+        auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;
+        event->props[L"type"]=Value::String(eventName);
+        const auto found=windowListeners.find(eventName);
+        if(found!=windowListeners.end())for(auto& callback:found->second)
+            Call(callback,global->values[L"window"],{Value::FromObject(event)});
+        DrainMicrotasks();
+    }
+};
+
+} // namespace
+
+struct JavaScriptRuntime::Impl {
+    RuntimeCore core;
+    explicit Impl(Document& document):core(document){}
+};
+
+JavaScriptRuntime::JavaScriptRuntime(Document& document):impl_(std::make_unique<Impl>(document)){}
+JavaScriptRuntime::~JavaScriptRuntime()=default;
+void JavaScriptRuntime::SetMessageSink(MessageSink sink){impl_->core.messageSink=std::move(sink);}
+void JavaScriptRuntime::SetMutationSink(MutationSink sink){impl_->core.mutationSink=std::move(sink);}
+void JavaScriptRuntime::SetFrameScheduler(FrameScheduler scheduler){impl_->core.frameScheduler=std::move(scheduler);}
+void JavaScriptRuntime::SetTimerScheduler(TimerScheduler scheduler){impl_->core.timerScheduler=std::move(scheduler);}
+void JavaScriptRuntime::SetGeometryProvider(GeometryProvider provider){impl_->core.geometryProvider=std::move(provider);}
+void JavaScriptRuntime::SetStylePropertyProvider(StylePropertyProvider provider){impl_->core.stylePropertyProvider=std::move(provider);}
+void JavaScriptRuntime::SetResourceLoader(ResourceLoader loader){impl_->core.resourceLoader=std::move(loader);}
+void JavaScriptRuntime::SetFrameMessageSink(FrameMessageSink sink){impl_->core.frameMessageSink=std::move(sink);}
+void JavaScriptRuntime::SetParentMessageSink(ParentMessageSink sink){impl_->core.parentMessageSink=std::move(sink);}
+void JavaScriptRuntime::SetFocusSink(FocusSink sink){impl_->core.focusSink=std::move(sink);}
+void JavaScriptRuntime::SetSelectionProvider(SelectionProvider provider){impl_->core.selectionProvider=std::move(provider);}
+void JavaScriptRuntime::SetSelectionSetter(SelectionSetter setter){impl_->core.selectionSetter=std::move(setter);}
+void JavaScriptRuntime::SetViewportSize(double width,double height){
+    impl_->core.viewportWidth=std::max(0.0,width);impl_->core.viewportHeight=std::max(0.0,height);
+    const auto widthValue=Value::Number(impl_->core.viewportWidth),heightValue=Value::Number(impl_->core.viewportHeight);
+    impl_->core.global->values[L"innerWidth"]=widthValue;impl_->core.global->values[L"innerHeight"]=heightValue;
+    const auto found=impl_->core.global->values.find(L"window");
+    if(found!=impl_->core.global->values.end()&&found->second.type==Value::Type::Object&&found->second.object){
+        found->second.object->props[L"innerWidth"]=widthValue;
+        found->second.object->props[L"innerHeight"]=heightValue;
+    }
+}
+void JavaScriptRuntime::SetLocation(const std::wstring& location){impl_->core.location=location;}
+bool JavaScriptRuntime::Load(const std::wstring& source,std::wstring* error){
+    impl_->core.module=std::make_shared<Module>();impl_->core.listeners.clear();impl_->core.documentListeners.clear();impl_->core.windowListeners.clear();impl_->core.webViewListeners.clear();impl_->core.frameCallbacks.clear();impl_->core.frameScheduled=false;impl_->core.timers.clear();impl_->core.timerScheduled=false;impl_->core.microtasks.clear();impl_->core.possiblyUnhandledRejections.clear();if(impl_->core.timerScheduler)impl_->core.timerScheduler(0);
+    // Preserve native globals, but remove values defined by the previous page.
+    impl_->core.global=std::make_shared<Environment>();impl_->core.InstallGlobals();
+    return impl_->core.CompileRun(source,nullptr,error);
+}
+bool JavaScriptRuntime::Execute(const std::wstring& source,std::wstring* result,std::wstring* error){return impl_->core.CompileRun(source,result,error);}
+void JavaScriptRuntime::DispatchDocumentEvent(const std::wstring& eventName){impl_->core.Dispatch({},eventName);}
+void JavaScriptRuntime::DispatchWindowEvent(const std::wstring& eventName){impl_->core.DispatchWindow(eventName);}
+void JavaScriptRuntime::RunAnimationFrame(){impl_->core.RunAnimationFrame();}
+void JavaScriptRuntime::RunTimers(){impl_->core.RunTimers();}
+bool JavaScriptRuntime::DispatchNodeEvent(const std::shared_ptr<Node>& node,const std::wstring& eventName,const EventInit& init){
+    const bool defaultPrevented=impl_->core.Dispatch(node,eventName,nullptr,init);
+    // A primary pointer press produces a compatibility mousedown event unless
+    // pointerdown was canceled. Keep this rule in the shared DOM event path so
+    // every rendered document receives normal browser input semantics.
+    if(eventName==L"pointerdown"&&!defaultPrevented)
+        return impl_->core.Dispatch(node,L"mousedown",nullptr,init);
+    return defaultPrevented;
+}
+void JavaScriptRuntime::DispatchFileDrop(const std::shared_ptr<Node>& node,const std::vector<Node::FileInfo>& files){impl_->core.Dispatch(node,L"drop",&files);}
+bool JavaScriptRuntime::DispatchWebMessageAsJson(const std::wstring& json,std::wstring* error){return impl_->core.DispatchWebMessageJson(json,error);}
+void JavaScriptRuntime::DispatchWebMessageAsString(const std::wstring& message){impl_->core.DispatchWebMessageValue(Value::String(message));}
+bool JavaScriptRuntime::DispatchWindowMessageAsJson(const std::wstring& json,const std::shared_ptr<Node>& sourceFrame,std::wstring* error){return impl_->core.DispatchWindowMessageJson(json,sourceFrame,error);}
+void JavaScriptRuntime::Clear(){impl_->core.listeners.clear();impl_->core.documentListeners.clear();impl_->core.windowListeners.clear();impl_->core.webViewListeners.clear();impl_->core.nodeObjects.clear();impl_->core.frameWindows.clear();impl_->core.frameCallbacks.clear();impl_->core.frameScheduled=false;impl_->core.timers.clear();impl_->core.timerScheduled=false;impl_->core.microtasks.clear();impl_->core.possiblyUnhandledRejections.clear();if(impl_->core.timerScheduler)impl_->core.timerScheduler(0);impl_->core.module=std::make_shared<Module>();impl_->core.global=std::make_shared<Environment>();impl_->core.InstallGlobals();}
+
+} // namespace TWebFrame::Internal
