@@ -31,6 +31,7 @@ struct Node : std::enable_shared_from_this<Node> {
     bool focused = false;
     bool focusVisible = false;
     bool focusWithin = false;
+    float scrollLeft = 0.0f;
     float scrollTop = 0.0f;
     size_t selectionStart = 0;
     size_t selectionEnd = 0;

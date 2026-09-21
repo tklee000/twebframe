@@ -179,6 +179,8 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
     set(L"visibility", L"visible");
     set(L"flex-grow", L"0");
     set(L"flex-shrink", L"1");
+    set(L"flex-direction", L"row");
+    set(L"flex-wrap", L"nowrap");
     std::wstring display = L"block";
     if (!node || node->type == NodeType::Text) display = L"inline";
     else if (node->tag == L"a" || node->tag == L"abbr" || node->tag == L"b" ||
@@ -761,6 +763,14 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
             setProperty(L"flex-grow", grow, candidate);
             setProperty(L"flex-shrink", shrink, candidate);
             setProperty(L"flex-basis", basis, candidate);
+        } else if (name == L"flex-flow") {
+            const auto parts=SplitWhitespace(value);std::wstring direction=L"row",wrap=L"nowrap";
+            for(const auto& part:parts){const auto token=ToLower(part);
+                if(token==L"row"||token==L"row-reverse"||token==L"column"||token==L"column-reverse")direction=part;
+                else if(token==L"nowrap"||token==L"wrap"||token==L"wrap-reverse")wrap=part;
+            }
+            setProperty(L"flex-direction",direction,candidate);
+            setProperty(L"flex-wrap",wrap,candidate);
         } else if (name == L"font") {
             const auto shorthand=ToLower(Trim(value));
             if(shorthand==L"inherit"){

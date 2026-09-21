@@ -34,7 +34,7 @@ public:
     };
     struct NodeGeometry {
         double x=0,y=0,width=0,height=0;
-        double clientWidth=0,clientHeight=0,scrollHeight=0;
+        double clientWidth=0,clientHeight=0,scrollWidth=0,scrollHeight=0;
     };
     using GeometryProvider = std::function<NodeGeometry(const std::shared_ptr<Node>&)>;
     using StylePropertyProvider = std::function<std::wstring(const std::shared_ptr<Node>&,

@@ -44,6 +44,7 @@ struct LayoutBox {
     bool containsSticky = false;
     bool stickyFlowYValid = false;
     float stickyFlowY = 0.0f;
+    float scrollWidth = 0.0f;
     float scrollHeight = 0.0f;
     // Synthetic line fragments retain their offset in the originating DOM
     // text node so pointer/caret geometry maps back to DOM offsets.
@@ -82,9 +83,14 @@ public:
     void Relayout(float width, float height, float deviceScale = 1.0f);
     void Paint(ID2D1RenderTarget* target, IDWriteFactory* writeFactory);
     bool ScrollAt(float x, float y, float wheelDelta,
-                  std::shared_ptr<Node>* scrolledNode = nullptr);
+                  std::shared_ptr<Node>* scrolledNode = nullptr,
+                  bool horizontal = false);
+    bool BeginScrollbarInteraction(float x, float y, std::shared_ptr<Node>& dragNode,
+                                   float& dragOffset, bool& horizontal);
     bool BeginScrollbarInteraction(float x, float y, std::shared_ptr<Node>& dragNode,
                                    float& dragOffset);
+    bool DragScrollbar(const std::shared_ptr<Node>& node, float x, float y,
+                       float dragOffset, bool horizontal);
     bool DragScrollbar(const std::shared_ptr<Node>& node, float y, float dragOffset);
     bool Restyle(const std::shared_ptr<Node>& node);
     std::shared_ptr<Node> HitTest(float x, float y) const;
@@ -122,9 +128,10 @@ private:
     std::shared_ptr<Node> HitTestStackingContext(const LayoutBox& box, float x, float y) const;
     std::shared_ptr<Node> HitTestBox(const LayoutBox& box, float x, float y) const;
     bool ScrollBox(LayoutBox& box, float x, float y, float wheelDelta,
-                   std::shared_ptr<Node>* scrolledNode);
+                   std::shared_ptr<Node>* scrolledNode, bool horizontal);
     bool BeginScrollbarBox(LayoutBox& box, float x, float y,
-                           std::shared_ptr<Node>& dragNode, float& dragOffset);
+                           std::shared_ptr<Node>& dragNode, float& dragOffset,
+                           bool& horizontal);
     void DumpBox(const LayoutBox& box, std::wstring& output, bool& first) const;
     bool RestyleBox(LayoutBox& box, const ComputedStyle* parentStyle);
     void ApplyTransitions(LayoutBox& box);

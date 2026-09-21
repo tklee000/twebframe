@@ -1104,6 +1104,14 @@ std::wstring CamelToKebab(const std::wstring& value){std::wstring out;for(wchar_
 std::wstring DatasetAttributeName(const std::wstring& value){return L"data-"+CamelToKebab(value);}
 
 struct RuntimeCore {
+    struct EventListener {
+        std::uint64_t id=0;
+        Value callback;
+        bool capture=false;
+        bool once=false;
+        bool passive=false;
+    };
+    using EventListenerMap=FastMap<std::wstring,std::vector<EventListener>>;
     struct MutationBatch {
         RuntimeCore& runtime;
         explicit MutationBatch(RuntimeCore& value):runtime(value){runtime.BeginMutationBatch();}
@@ -1125,10 +1133,10 @@ struct RuntimeCore {
     std::wstring location;
     std::shared_ptr<Environment> global=std::make_shared<Environment>();
     std::shared_ptr<Module> module=std::make_shared<Module>();
-    FastMap<Node*,FastMap<std::wstring,std::vector<Value>>> listeners;
-    FastMap<std::wstring,std::vector<Value>> documentListeners;
-    FastMap<std::wstring,std::vector<Value>> windowListeners;
-    FastMap<std::wstring,std::vector<Value>> webViewListeners;
+    FastMap<Node*,EventListenerMap> listeners;
+    EventListenerMap documentListeners;
+    EventListenerMap windowListeners;
+    EventListenerMap webViewListeners;
     FastMap<Node*,std::weak_ptr<Object>> nodeObjects;
     FastMap<Node*,std::weak_ptr<Object>> frameWindows;
     FastMap<std::wstring,std::shared_ptr<const std::wregex>> regularExpressions;
@@ -1146,6 +1154,7 @@ struct RuntimeCore {
     std::vector<std::weak_ptr<Object>> possiblyUnhandledRejections;
     unsigned nextFrameId=1;
     unsigned nextTimerId=1;
+    std::uint64_t nextEventListenerId=1;
     bool frameScheduled=false;
     bool timerScheduled=false;
     bool drainingMicrotasks=false;
@@ -1406,8 +1415,10 @@ struct RuntimeCore {
     }
     void DispatchPromiseRejectionEvent(const std::wstring& type,const std::shared_ptr<Object>& promise){
         auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;event->props[L"type"]=Value::String(type);event->props[L"promise"]=Value::FromObject(promise);event->props[L"reason"]=promise->promiseResult;
-        const auto found=windowListeners.find(type);if(found==windowListeners.end())return;
-        for(const auto& callback:found->second)try{Call(callback,global->values[L"window"],{Value::FromObject(event)});}catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}
+        const auto eventValue=Value::FromObject(event);const auto target=global->values[L"window"];
+        event->props[L"target"]=target;event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);
+        InvokeEventListeners(windowListeners,type,true,target,eventValue,event);
+        InvokeEventListeners(windowListeners,type,false,target,eventValue,event);
     }
     void DrainMicrotasks(){
         if(drainingMicrotasks)return;drainingMicrotasks=true;
@@ -1819,7 +1830,8 @@ struct RuntimeCore {
             if(key==L"querySelector"||key==L"querySelectorAll")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"createElement")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(r.document.CreateElement(a.empty()?L"div":r.String(a[0])));});
             if(key==L"createTextNode")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";node->text=a.empty()?L"":r.String(a[0]);return r.NodeValue(node);});
-            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.documentListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.documentListeners,a);return Value::Undefined();});
+            if(key==L"removeEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.RemoveEventListener(r.documentListeners,a);return Value::Undefined();});
         }
         if(object->kind==ObjectKind::Node){
             auto node=object->node;if(!node)return Value::Undefined();
@@ -1842,9 +1854,10 @@ struct RuntimeCore {
             if(key==L"open")return Value::Bool(node->attributes.count(L"open")!=0);
             if(key==L"title"||key==L"type"||key==L"draggable"||key==L"colSpan"||key==L"rowSpan"||key==L"returnValue")return key==L"draggable"?Value::Bool(node->Attribute(L"draggable")==L"true"):Value::String(node->Attribute(key==L"colSpan"?L"colspan":(key==L"rowSpan"?L"rowspan":ToLower(key))));
             if(key==L"scrollTop")return Value::Number(node->scrollTop);
-            if(key==L"clientHeight"||key==L"clientWidth"||key==L"scrollHeight"){
+            if(key==L"scrollLeft")return Value::Number(node->scrollLeft);
+            if(key==L"clientHeight"||key==L"clientWidth"||key==L"scrollHeight"||key==L"scrollWidth"){
                 const auto g=geometryProvider?geometryProvider(node):JavaScriptRuntime::NodeGeometry{};
-                return Value::Number(key==L"clientHeight"?g.clientHeight:key==L"clientWidth"?g.clientWidth:g.scrollHeight);
+                return Value::Number(key==L"clientHeight"?g.clientHeight:key==L"clientWidth"?g.clientWidth:key==L"scrollWidth"?g.scrollWidth:g.scrollHeight);
             }
             if(key==L"getBoundingClientRect")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){
                 const auto g=r.geometryProvider?r.geometryProvider(node):JavaScriptRuntime::NodeGeometry{};
@@ -1909,11 +1922,22 @@ struct RuntimeCore {
             if((key==L"showModal"||key==L"show")&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){node->SetAttribute(L"open",L"");r.Mutated();return Value::Undefined();});
             if(key==L"close"&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){node->RemoveAttribute(L"open");node->SetAttribute(L"returnvalue",a.empty()?L"":r.String(a[0]));r.Mutated();r.Dispatch(node,L"close");return Value::Undefined();});
             if(key==L"requestSubmit"&&node->tag==L"form")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){r.Dispatch(node,L"submit");return Value::Undefined();});
-            if(key==L"scrollTo")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
-                double top=0;if(!a.empty()){auto value=r.Deref(a[0]);if(value.type==Value::Type::Object&&value.object&&value.object->props.count(L"top"))top=r.Number(value.object->props[L"top"]);else top=r.Number(value);}node->scrollTop=std::max(0.0f,static_cast<float>(top));r.Mutated();return Value::Undefined();
+            if(key==L"scrollTo"||key==L"scroll"||key==L"scrollBy")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const bool relative=key==L"scrollBy";double left=relative?0:node->scrollLeft,top=relative?0:node->scrollTop;
+                if(!a.empty()){
+                    auto value=r.Deref(a[0]);
+                    if(value.type==Value::Type::Object&&value.object){
+                        if(value.object->props.count(L"left"))left=r.Number(value.object->props[L"left"]);
+                        if(value.object->props.count(L"top"))top=r.Number(value.object->props[L"top"]);
+                    }else{
+                        left=r.Number(value);top=a.size()>1?r.Number(a[1]):0;
+                    }
+                }
+                node->scrollLeft=std::max(0.0f,static_cast<float>((relative?node->scrollLeft:0)+left));node->scrollTop=std::max(0.0f,static_cast<float>((relative?node->scrollTop:0)+top));r.Mutated();return Value::Undefined();
             });
             if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node)return Value::Bool(false);for(auto current=value.object->node;current;current=current->parent.lock())if(current==node)return Value::Bool(true);return Value::Bool(false);});
-            if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.listeners[node.get()][r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+            if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.listeners[node.get()],a);return Value::Undefined();});
+            if(key==L"removeEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto found=r.listeners.find(node.get());if(found!=r.listeners.end())r.RemoveEventListener(found->second,a);return Value::Undefined();});
             if(key==L"querySelector"||key==L"querySelectorAll")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector,node));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector,node))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"closest")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(node->Closest(a.empty()?L"":r.String(a[0])));});
             if(key==L"matches")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&Document::MatchesSelector(node,r.String(a[0])));});
@@ -1939,7 +1963,8 @@ struct RuntimeCore {
         if(object->kind==ObjectKind::Dataset)
             return Value::String(object->node?object->node->Attribute(DatasetAttributeName(key)):L"");
         if(object->kind==ObjectKind::Window){
-            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.windowListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.windowListeners,a);return Value::Undefined();});
+            if(key==L"removeEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.RemoveEventListener(r.windowListeners,a);return Value::Undefined();});
         }
         if(object->kind==ObjectKind::FrameWindow&&key==L"postMessage")return Native([node=object->node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
             if(!a.empty()){
@@ -1952,12 +1977,13 @@ struct RuntimeCore {
         if(object->kind==ObjectKind::Event){
             if(key==L"stopPropagation")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"$propagationStopped"]=Value::Bool(true);return Value::Undefined();});
             if(key==L"stopImmediatePropagation")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"$propagationStopped"]=Value::Bool(true);object->props[L"$immediateStopped"]=Value::Bool(true);return Value::Undefined();});
-            if(key==L"preventDefault")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props[L"defaultPrevented"]=Value::Bool(true);return Value::Undefined();});
+            if(key==L"preventDefault")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){const auto passive=object->props.find(L"$inPassiveListener");if(passive==object->props.end()||!r.Truth(passive->second))object->props[L"defaultPrevented"]=Value::Bool(true);return Value::Undefined();});
             if(key==L"composedPath")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){std::vector<Value> path;auto target=object->props.find(L"target");if(target!=object->props.end()){auto value=r.Deref(target->second);if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)for(auto node=value.object->node;node;node=node->parent.lock())path.push_back(r.NodeValue(node));}return r.ArrayValue(path);});
         }
         if(object->kind==ObjectKind::WebView){
             if(key==L"postMessage")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(r.messageSink&&!a.empty())r.messageSink(r.String(a[0]));return Value::Undefined();});
-            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1)r.webViewListeners[r.String(a[0])].push_back(a[1]);return Value::Undefined();});
+            if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.webViewListeners,a);return Value::Undefined();});
+            if(key==L"removeEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.RemoveEventListener(r.webViewListeners,a);return Value::Undefined();});
         }
         if(object->kind==ObjectKind::Storage){
             if(key==L"getItem")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Null();const auto found=object->props.find(r.String(a[0]));return found==object->props.end()?Value::Null():found->second;});
@@ -1972,6 +1998,63 @@ struct RuntimeCore {
         if(object->kind==ObjectKind::ArrayConstructor&&(key==L"from"||key==L"isArray"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"isArray")return Value::Bool(!a.empty()&&r.Deref(a[0]).type==Value::Type::Object&&r.Deref(a[0]).object->kind==ObjectKind::Array);if(a.empty())return r.ArrayValue({});auto v=r.Deref(a[0]);std::vector<Value> values;if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Array)values=v.object->items;else if(v.type==Value::Type::Object&&v.object){const auto length=v.object->props.find(L"length");const auto count=length==v.object->props.end()?0:static_cast<size_t>(std::max(0.0,r.Number(length->second)));values.resize(count,Value::Undefined());}if(a.size()>1)for(size_t i=0;i<values.size();++i)values[i]=r.Deref(r.Call(a[1],Value::Undefined(),{values[i],Value::Number(static_cast<double>(i))}));return r.ArrayValue(values);});
         if(object->kind==ObjectKind::NumberConstructor&&(key==L"isFinite"||key==L"isNaN"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto value=a.empty()?Value::Undefined():r.Deref(a[0]);return Value::Bool(key==L"isFinite"?value.type==Value::Type::Number&&std::isfinite(value.number):value.type==Value::Type::Number&&std::isnan(value.number));});
         return Value::Undefined();
+    }
+    struct ParsedEventListenerOptions { bool capture=false,once=false,passive=false; };
+    ParsedEventListenerOptions EventListenerOptions(const Value& input){
+        ParsedEventListenerOptions options;const auto value=Deref(input);
+        if(value.type==Value::Type::Boolean){options.capture=value.boolean;return options;}
+        if(value.type!=Value::Type::Object||!value.object)return options;
+        options.capture=Truth(GetProperty(value,L"capture"));
+        options.once=Truth(GetProperty(value,L"once"));
+        options.passive=Truth(GetProperty(value,L"passive"));
+        return options;
+    }
+    bool IsEventCallback(const Value& input){
+        const auto callback=Deref(input);if(IsCallable(callback))return true;
+        return callback.type==Value::Type::Object&&callback.object&&
+            IsCallable(GetProperty(callback,L"handleEvent"));
+    }
+    void AddEventListener(EventListenerMap& map,const std::vector<Value>& arguments){
+        if(arguments.size()<2||!IsEventCallback(arguments[1]))return;
+        const auto type=String(arguments[0]);const auto callback=Deref(arguments[1]);
+        const auto options=arguments.size()>2?EventListenerOptions(arguments[2]):ParsedEventListenerOptions{};
+        auto& entries=map[type];
+        for(const auto& entry:entries)
+            if(entry.capture==options.capture&&EqualValues(entry.callback,callback))return;
+        entries.push_back({nextEventListenerId++,callback,options.capture,options.once,options.passive});
+    }
+    void RemoveEventListener(EventListenerMap& map,const std::vector<Value>& arguments){
+        if(arguments.size()<2)return;const auto found=map.find(String(arguments[0]));if(found==map.end())return;
+        const auto callback=Deref(arguments[1]);const bool capture=arguments.size()>2?EventListenerOptions(arguments[2]).capture:false;
+        auto& entries=found->second;
+        entries.erase(std::remove_if(entries.begin(),entries.end(),[&](const EventListener& entry){return entry.capture==capture&&EqualValues(entry.callback,callback);}),entries.end());
+        if(entries.empty())map.erase(String(arguments[0]));
+    }
+    void CallEventCallback(const Value& callback,const Value& currentTarget,const Value& eventValue){
+        const auto value=Deref(callback);
+        if(IsCallable(value)){Call(value,currentTarget,{eventValue});return;}
+        if(value.type==Value::Type::Object&&value.object){const auto handler=GetProperty(value,L"handleEvent");if(IsCallable(handler))Call(handler,value,{eventValue});}
+    }
+    void InvokeEventListeners(EventListenerMap& map,const std::wstring& type,bool capture,
+                              const Value& currentTarget,const Value& eventValue,
+                              const std::shared_ptr<Object>& event){
+        const auto immediate=event->props.find(L"$immediateStopped");
+        if(immediate!=event->props.end()&&Truth(immediate->second))return;
+        const auto found=map.find(type);if(found==map.end())return;
+        const auto snapshot=found->second;
+        for(const auto& entry:snapshot){
+            auto live=map.find(type);if(live==map.end())break;
+            const auto position=std::find_if(live->second.begin(),live->second.end(),[&](const EventListener& candidate){return candidate.id==entry.id;});
+            if(position==live->second.end()||position->capture!=capture)continue;
+            const auto callback=position->callback;const bool passive=position->passive;
+            if(position->once){live->second.erase(position);if(live->second.empty())map.erase(type);}
+            event->props[L"$inPassiveListener"]=Value::Bool(passive);
+            try{CallEventCallback(callback,currentTarget,eventValue);}
+            catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);}
+            catch(const std::exception& exception){lastError=Utf8ToWide(exception.what());}
+            event->props[L"$inPassiveListener"]=Value::Bool(false);
+            const auto stopped=event->props.find(L"$immediateStopped");if(stopped!=event->props.end()&&Truth(stopped->second))break;
+        }
     }
     void SetProperty(const Value& input,const std::wstring& key,const Value& value){
         auto base=Deref(input);if(base.type!=Value::Type::Object||!base.object)return;auto object=base.object;auto v=Deref(value);
@@ -1990,6 +2073,7 @@ struct RuntimeCore {
             else if(key==L"draggable")n->SetAttribute(L"draggable",Truth(v)?L"true":L"false");
             else if(key==L"hidden"||key==L"open"){if(Truth(v))n->SetAttribute(key,L"");else n->RemoveAttribute(key);Mutated();return;}
             else if(key==L"scrollTop"){n->scrollTop=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}
+            else if(key==L"scrollLeft"){n->scrollLeft=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}
             else if(key==L"checked")n->checked=Truth(v);else if(key==L"disabled")n->disabled=Truth(v);
             else if(key==L"innerText"||key==L"textContent"){n->SetInnerText(String(v));Mutated(true);return;}else if(key==L"innerHTML"){document.SetInnerHtml(n,String(v),false);Mutated(true);return;}else object->props[key]=v;Mutated(key==L"id");return;}
         if(object->kind==ObjectKind::Style&&object->node){object->node->inlineStyle[CamelToKebab(key)]=String(v);Mutated();return;}
@@ -2378,8 +2462,10 @@ struct RuntimeCore {
         MutationBatch batch(*this);
         auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;event->props[L"data"]=Deref(data);event->props[L"type"]=Value::String(L"message");
         auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
-        auto found=webViewListeners.find(L"message");
-        if(found!=webViewListeners.end())for(auto& callback:found->second)Call(callback,ObjectValue(ObjectKind::WebView),{eventValue});
+        const auto target=GetProperty(global->values[L"window"],L"twebframe");
+        event->props[L"target"]=target;event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);
+        InvokeEventListeners(webViewListeners,L"message",true,target,eventValue,event);
+        InvokeEventListeners(webViewListeners,L"message",false,target,eventValue,event);
         DrainMicrotasks();
     }
     bool DispatchWebMessageJson(const std::wstring& json,std::wstring* error){
@@ -2395,9 +2481,10 @@ struct RuntimeCore {
             auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;
             event->props[L"data"]=Deref(data);event->props[L"type"]=Value::String(L"message");
             event->props[L"source"]=sourceFrame?FrameWindowValue(sourceFrame):global->values[L"parent"];
-            const auto found=windowListeners.find(L"message");
-            if(found!=windowListeners.end())for(auto& callback:found->second)
-                Call(callback,global->values[L"window"],{Value::FromObject(event)});
+            const auto eventValue=Value::FromObject(event),target=global->values[L"window"];
+            event->props[L"target"]=target;event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);
+            InvokeEventListeners(windowListeners,L"message",true,target,eventValue,event);
+            InvokeEventListeners(windowListeners,L"message",false,target,eventValue,event);
             DrainMicrotasks();
             if(error)error->clear();lastError.clear();return true;
         }catch(const JavaScriptException& exception){lastError=L"Uncaught "+String(exception.value);if(error)*error=lastError;return false;
@@ -2444,27 +2531,61 @@ struct RuntimeCore {
         event->props[L"shiftKey"]=Value::Bool(init.shiftKey);event->props[L"altKey"]=Value::Bool(init.altKey);
         event->props[L"metaKey"]=Value::Bool(init.metaKey);event->props[L"isComposing"]=Value::Bool(init.isComposing);
         event->props[L"defaultPrevented"]=Value::Bool(false);event->props[L"isTrusted"]=Value::Bool(true);
+        event->props[L"bubbles"]=Value::Bool(true);event->props[L"cancelable"]=Value::Bool(true);event->props[L"eventPhase"]=Value::Number(0);
         if(droppedFiles){auto transfer=ObjectValue(ObjectKind::Plain);transfer.object->props[L"files"]=FileListValue(*droppedFiles);
             event->props[L"dataTransfer"]=transfer;}
         auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
         auto stopped=[&](const wchar_t* property){const auto found=event->props.find(property);return found!=event->props.end()&&Truth(found->second);};
-        if(node){for(auto current=node;current&&!stopped(L"$propagationStopped");current=current->parent.lock()){
-            event->props[L"currentTarget"]=NodeValue(current);
-            DispatchInlineEventHandler(current,eventName,eventValue,event);
-            if(stopped(L"$immediateStopped"))break;
-            auto a=listeners.find(current.get());if(a!=listeners.end()){auto b=a->second.find(eventName);if(b!=a->second.end())for(auto& callback:b->second){Call(callback,NodeValue(current),{eventValue});if(stopped(L"$immediateStopped"))break;}}
-        }}
-        if(!stopped(L"$propagationStopped")){event->props[L"currentTarget"]=ObjectValue(ObjectKind::Document);auto documentCallbacks=documentListeners.find(eventName);if(documentCallbacks!=documentListeners.end())for(auto& callback:documentCallbacks->second){Call(callback,ObjectValue(ObjectKind::Document),{eventValue});if(stopped(L"$immediateStopped"))break;}}
+        const auto windowTarget=global->values[L"window"],documentTarget=global->values[L"document"];
+        auto invoke=[&](EventListenerMap& map,const Value& target,bool capture,int phase){event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(phase);InvokeEventListeners(map,eventName,capture,target,eventValue,event);};
+        if(node){
+            std::vector<std::shared_ptr<Node>> ancestors;
+            for(auto current=node->parent.lock();current;current=current->parent.lock())
+                if(current->type!=NodeType::Document)ancestors.push_back(current);
+            invoke(windowListeners,windowTarget,true,1);
+            if(!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,true,1);
+            if(!stopped(L"$propagationStopped"))for(auto iterator=ancestors.rbegin();iterator!=ancestors.rend();++iterator){
+                auto found=listeners.find(iterator->get());if(found!=listeners.end())invoke(found->second,NodeValue(*iterator),true,1);
+                if(stopped(L"$propagationStopped"))break;
+            }
+            if(!stopped(L"$propagationStopped")){
+                const auto target=NodeValue(node);auto found=listeners.find(node.get());
+                if(found!=listeners.end())invoke(found->second,target,true,2);
+                if(!stopped(L"$immediateStopped")){event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);DispatchInlineEventHandler(node,eventName,eventValue,event);}
+                if(!stopped(L"$immediateStopped")&&found!=listeners.end())invoke(found->second,target,false,2);
+            }
+            if(!stopped(L"$propagationStopped"))for(const auto& current:ancestors){
+                const auto target=NodeValue(current);event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(3);
+                DispatchInlineEventHandler(current,eventName,eventValue,event);
+                if(!stopped(L"$immediateStopped")){auto found=listeners.find(current.get());if(found!=listeners.end())invoke(found->second,target,false,3);}
+                if(stopped(L"$propagationStopped"))break;
+            }
+            if(!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,false,3);
+            if(!stopped(L"$propagationStopped"))invoke(windowListeners,windowTarget,false,3);
+        }else{
+            event->props[L"target"]=documentTarget;
+            invoke(windowListeners,windowTarget,true,1);
+            if(!stopped(L"$propagationStopped")){
+                invoke(documentListeners,documentTarget,true,2);
+                if(!stopped(L"$immediateStopped"))invoke(documentListeners,documentTarget,false,2);
+            }
+            if(!stopped(L"$propagationStopped"))invoke(windowListeners,windowTarget,false,3);
+        }
+        event->props[L"currentTarget"]=Value::Null();event->props[L"eventPhase"]=Value::Number(0);
         DrainMicrotasks();
         return stopped(L"defaultPrevented");
     }
     void DispatchWindow(const std::wstring& eventName){
         MutationBatch batch(*this);
         auto event=std::make_shared<Object>();event->kind=ObjectKind::Event;
-        event->props[L"type"]=Value::String(eventName);
-        const auto found=windowListeners.find(eventName);
-        if(found!=windowListeners.end())for(auto& callback:found->second)
-            Call(callback,global->values[L"window"],{Value::FromObject(event)});
+        const auto target=global->values[L"window"],eventValue=Value::FromObject(event);
+        event->props[L"type"]=Value::String(eventName);event->props[L"target"]=target;
+        event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);
+        event->props[L"defaultPrevented"]=Value::Bool(false);event->props[L"isTrusted"]=Value::Bool(true);
+        InvokeEventListeners(windowListeners,eventName,true,target,eventValue,event);
+        const auto immediate=event->props.find(L"$immediateStopped");
+        if(immediate==event->props.end()||!Truth(immediate->second))InvokeEventListeners(windowListeners,eventName,false,target,eventValue,event);
+        event->props[L"currentTarget"]=Value::Null();event->props[L"eventPhase"]=Value::Number(0);
         DrainMicrotasks();
     }
 };

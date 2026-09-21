@@ -8,8 +8,8 @@
 namespace TWebFrame {
 
 inline constexpr unsigned int VersionMajor = 0;
-inline constexpr unsigned int VersionMinor = 4;
-inline constexpr wchar_t VersionString[] = L"0.4";
+inline constexpr unsigned int VersionMinor = 5;
+inline constexpr wchar_t VersionString[] = L"0.5";
 
 // TWebFrame is a small, embeddable HTML/CSS/JavaScript surface.  The API is
 // intentionally small and keeps a compatibility bridge for existing local pages

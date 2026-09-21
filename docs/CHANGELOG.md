@@ -2,6 +2,19 @@
 
 This document records user-visible changes cumulatively by released version. Add each new release above the previous entries.
 
+## 0.5 - 2026-09-21
+
+### Added
+
+- Added shared listener registration/removal behavior for capture, once, and passive options across window, document, element, and host-message targets.
+- Added horizontal overflow geometry, `scrollLeft`/`scrollWidth`, `scroll()`/`scrollTo()`/`scrollBy()`, horizontal scrollbar painting and interaction, and horizontal wheel routing.
+- Added focused horizontal-scroll regression coverage at 100% and 150% DPI scaling.
+
+### Improved
+
+- Extended flex wrapping to column, reverse-direction, `flex-flow`, and cross-axis `wrap-reverse` layouts.
+- Kept scrollbar geometry and pointer conversion in CSS DIPs so rendering and interaction remain stable across monitor DPI changes.
+
 ## 0.3 - 2026-09-21
 
 ### Added

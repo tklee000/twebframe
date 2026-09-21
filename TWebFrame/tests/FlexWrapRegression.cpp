@@ -92,6 +92,42 @@ void CheckScale(float scale) {
     Check(wideConnection && wideStorage &&
               std::abs(wideConnection->rect.y - wideStorage->rect.y) < 0.01f,
           L"growing the viewport across the breakpoint restores the single flex line");
+
+    const wchar_t* directionalHtml = LR"HTML(
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            #row-reverse { display: flex; flex-direction: row-reverse; width: 300px; height: 40px; }
+            #row-reverse > div { width: 50px; height: 30px; flex: none; }
+            #column-wrap { display: flex; flex-flow: column wrap; align-content: flex-start;
+                           align-items: flex-start; width: 180px; height: 120px; gap: 10px; }
+            #column-wrap > div { width: 50px; height: 50px; flex: none; }
+            #wrap-reverse { display: flex; flex-flow: row wrap-reverse; align-content: flex-start;
+                            width: 120px; height: 120px; gap: 10px; }
+            #wrap-reverse > div { width: 50px; height: 40px; flex: none; }
+        </style>
+        <div id="row-reverse"><div id="reverse-a"></div><div id="reverse-b"></div></div>
+        <div id="column-wrap"><div id="column-a"></div><div id="column-b"></div><div id="column-c"></div></div>
+        <div id="wrap-reverse"><div id="wrap-a"></div><div></div><div id="wrap-c"></div></div>
+    )HTML";
+    Document directionalDocument;
+    Check(directionalDocument.Parse(directionalHtml, &error), error.c_str());
+    StyleSheet directionalStyles;
+    Check(directionalStyles.Parse(directionalDocument.StyleText(), &error), error.c_str());
+    LayoutEngine directional(directionalDocument, directionalStyles);
+    directional.Layout(640.0f, 480.0f, scale);
+    const auto* reverseA=directional.BoxFor(directionalDocument.GetElementById(L"reverse-a"));
+    const auto* reverseB=directional.BoxFor(directionalDocument.GetElementById(L"reverse-b"));
+    Check(reverseA&&reverseB&&reverseA->rect.x>reverseB->rect.x,
+          L"row-reverse places the first flex item at the reversed main start");
+    const auto* columnA=directional.BoxFor(directionalDocument.GetElementById(L"column-a"));
+    const auto* columnB=directional.BoxFor(directionalDocument.GetElementById(L"column-b"));
+    const auto* columnC=directional.BoxFor(directionalDocument.GetElementById(L"column-c"));
+    Check(columnA&&columnB&&columnC&&columnB->rect.y>columnA->rect.y&&columnC->rect.x>columnA->rect.x,
+          L"flex-flow column wrap creates vertical lines and advances the cross axis");
+    const auto* wrapA=directional.BoxFor(directionalDocument.GetElementById(L"wrap-a"));
+    const auto* wrapC=directional.BoxFor(directionalDocument.GetElementById(L"wrap-c"));
+    Check(wrapA&&wrapC&&wrapA->rect.y>wrapC->rect.y,
+          L"wrap-reverse reverses the cross-axis line order");
 }
 
 } // namespace

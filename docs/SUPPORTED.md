@@ -1,8 +1,8 @@
-# Version 0.3 Supported Subset
+# Version 0.5 Supported Subset
 
 This document records the behavior currently implemented and exercised by the TWebFrame regression suite. It is not a claim of complete HTML, CSS, DOM, Web API, accessibility, or ECMAScript conformance.
 
-TWebFrame 0.3 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
+TWebFrame 0.5 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
 
 Unless a feature is listed here and covered by a test, applications should treat it as unsupported.
 
@@ -53,9 +53,9 @@ The parser does not implement the complete WHATWG state machine, error recovery,
 
 ### Events
 
-- Document, window, WebView bridge, and element event listeners.
+- Document, window, WebView bridge, and element event listeners, including removal, capture, once, and passive options.
 - Inline HTML event attributes with element-bound `this`, the current `event`, bubbling, and `return false` cancellation.
-- Event bubbling for the implemented events.
+- Capture, target, and bubbling phases for the implemented events.
 - `preventDefault()`, `stopPropagation()`, `stopImmediatePropagation()`, and `composedPath()` for the current tree model.
 - Tested event families include `DOMContentLoaded`, `load`, `click`, `dblclick`, `pointerdown`, compatible mouse input, keyboard input, `focusin`, `focusout`, `beforeinput`, `input`, `change`, `scroll`, `drop`, and `message`.
 - Tested metadata includes `key`, `button`, `detail`, modifier keys, input data/type, composition state, target, current target, and default-prevented state.
@@ -83,7 +83,7 @@ Shadow DOM, Custom Elements, browser observer APIs, the full Event constructor f
 - Shorthand expansion used by the current style and layout properties.
 - Viewport `min-width`, `max-width`, `min-height`, and `max-height` media conditions.
 
-JavaScript `matchMedia()` is only a compatibility placeholder in version 0.3 and does not mirror the stylesheet engine's complete media-query state.
+JavaScript `matchMedia()` is only a compatibility placeholder in version 0.5 and does not mirror the stylesheet engine's complete media-query state.
 
 ## CSS layout and paint
 
@@ -91,13 +91,13 @@ JavaScript `matchMedia()` is only a compatibility placeholder in version 0.3 and
 
 - Block, inline, inline-block, inline-flex, and inline-grid participation used by the tested layouts.
 - Collapsible and preserved whitespace, line breaks, nowrap behavior, tabs, clipping, and ellipsis.
-- Flex row/column layout, tested `flex-wrap`/`wrap-reverse`, gaps, common alignment/justification values, baseline alignment, and automatic minimum-size behavior.
+- Flex row/column and reverse-direction layout, tested `flex-flow`, `flex-wrap`/`wrap-reverse`, gaps, common alignment/justification values, baseline alignment, and automatic minimum-size behavior.
 - Explicit and implicit grid tracks, `fr`, `minmax()`, `repeat()`, tested `auto-fit`, named grid areas, spans, and gaps.
 - Automatic and fixed table layout used by the tests.
 - Width, height, minimum/maximum sizes, intrinsic `min-content`/`max-content`, percentages, and aspect-independent control sizing.
 - Margin, padding, border, border radius, gap, and `box-sizing`.
 - Absolute, fixed, relative, and sticky positioning with tested inset behavior.
-- Overflow clipping, `overflow: auto/scroll`, mouse-wheel scrolling, scrollbar dragging, thin scrollbar styling, and stable scrollbar gutters.
+- Overflow clipping, `overflow: auto/scroll`, vertical and horizontal mouse-wheel scrolling, `scrollLeft`/`scrollWidth`, scrollbar dragging, thin scrollbar styling, and stable scrollbar gutters.
 - Z-index stacking contexts, overflow-visible hit testing, and `pointer-events: none`.
 - Parent-window sizing hit forwarding and Windows resize cursors.
 
@@ -207,7 +207,7 @@ Image decoding, canvas, WebGL, video/audio, printing, browser plug-ins, and gene
 - `:focus-visible`, bubbling focus events, and keyboard activation for common buttons, links, and ARIA controls.
 - Tested ARIA menu navigation with arrows, Home/End, Escape, Enter, and Space.
 
-Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.3.
+Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.5.
 
 ## Accessibility
 
@@ -230,4 +230,4 @@ The provider is a practical subset for the implemented controls, not a complete 
 - UI Automation accessibility.
 - C++17 and the Visual Studio v142 toolset in the documented build.
 
-Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.3.
+Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.5.

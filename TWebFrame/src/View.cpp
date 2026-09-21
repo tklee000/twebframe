@@ -248,6 +248,7 @@ struct View::Impl {
     std::vector<std::shared_ptr<Node>> hoverPath;
     std::shared_ptr<Node> scrollbarDragNode;
     float scrollbarDragOffset=0;
+    bool scrollbarDragHorizontal=false;
     std::shared_ptr<Node> openSelectPopup;
     int selectPopupHotIndex=-1;
     float selectPopupScrollOffset=0;
@@ -379,6 +380,7 @@ struct View::Impl {
                 geometry.x=box->rect.x;geometry.y=box->rect.y;
                 geometry.width=box->rect.width;geometry.height=box->rect.height;
                 geometry.clientWidth=box->content.width;geometry.clientHeight=box->content.height;
+                geometry.scrollWidth=std::max(box->content.width,box->scrollWidth);
                 geometry.scrollHeight=std::max(box->content.height,box->scrollHeight);
             }
             return geometry;
@@ -1580,7 +1582,7 @@ struct View::Impl {
                 }
                 CloseSelectPopup();
             }
-            if(layout.BeginScrollbarInteraction(x,y,scrollbarDragNode,scrollbarDragOffset)){if(scrollbarDragNode)SetCapture(hwnd);else javascript.DispatchNodeEvent(layout.HitTest(x,y),L"scroll");if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+            if(layout.BeginScrollbarInteraction(x,y,scrollbarDragNode,scrollbarDragOffset,scrollbarDragHorizontal)){if(scrollbarDragNode)SetCapture(hwnd);else javascript.DispatchNodeEvent(layout.HitTest(x,y),L"scroll");if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);return 0;}
             SetFocus(hwnd);auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=1;if(javascript.DispatchNodeEvent(target,L"pointerdown",pointer))return 0;Activate(target,x,y);
             if(editingNode&&focused&&FocusTarget(target)==focused&&
                (IsTextControl(focused)||IsContentEditable(focused))){
@@ -1591,7 +1593,7 @@ struct View::Impl {
         case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=2;javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
         case WM_LBUTTONUP:
             if(selectPopupScrollDragging){selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
-            if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
+            if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
             if(textSelectionDragging){
                 const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam)));
                 const float y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));
@@ -1599,12 +1601,17 @@ struct View::Impl {
                 if(GetCapture()==hwnd)ReleaseCapture();return 0;
             }
             break;
-        case WM_CAPTURECHANGED:textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;return 0;
+        case WM_CAPTURECHANGED:textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;return 0;
         case WM_MOUSEWHEEL:{
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
             if(openSelectPopup){SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y)){ScrollSelectPopup(-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/WHEEL_DELTA*popup.rowHeight*3.0f);return 0;}CloseSelectPopup();}
             std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+        }
+        case WM_MOUSEHWHEEL:{
+            if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
+            const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
+            std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled,true)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
         case WM_MOUSEMOVE:{
             if(!trackingMouseLeave){TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};trackingMouseLeave=TrackMouseEvent(&tracking)!=FALSE;}
@@ -1616,7 +1623,7 @@ struct View::Impl {
                 const float previous=selectPopupScrollOffset;selectPopupScrollOffset=travel>0?thumbTop/travel*maximum:0;
                 if(std::abs(previous-selectPopupScrollOffset)>0.01f)InvalidateRect(hwnd,nullptr,FALSE);
             }return 0;}
-            if(scrollbarDragNode){if(layout.DragScrollbar(scrollbarDragNode,y,scrollbarDragOffset)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
+            if(scrollbarDragNode){if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
             if(textSelectionDragging){UpdateTextSelectionAt(x,y);return 0;}
             if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y))return 0;}
             auto n=layout.HitTest(x,y);if(n!=hovered){layoutDirty=SetHoveredNode(n);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
@@ -1675,7 +1682,7 @@ struct View::Impl {
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
         case WM_DESTROY:KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
-        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();
         for(const auto& link:document.QuerySelectorAll(L"link[rel='stylesheet']")){
             std::wstring external;if(LoadTextResource(link->Attribute(L"href"),external))css+=external+L"\n";

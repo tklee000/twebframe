@@ -83,6 +83,26 @@ struct VerticalScrollbarMetrics {
     bool standardStyling = false;
 };
 
+struct HorizontalScrollbarGeometry {
+    LayoutRect track;
+    LayoutRect thumb;
+    float trackStart = 0;
+    float travel = 0;
+    float maximum = 0;
+    float arrowWidth = 0;
+    bool compactArrows = false;
+    bool standardStyling = false;
+};
+
+struct HorizontalScrollbarMetrics {
+    float height = 15.0f;
+    float arrowWidth = 0;
+    float minimumThumbWidth = 0;
+    float thumbInset = 0;
+    bool compactArrows = false;
+    bool standardStyling = false;
+};
+
 Edges BorderValues(const ComputedStyle& style);
 
 LayoutRect ScrollbarPaddingBox(const LayoutBox& box) {
@@ -124,17 +144,50 @@ VerticalScrollbarMetrics VerticalScrollbarMetricsFor(const LayoutBox& box,const 
     return metrics;
 }
 
+HorizontalScrollbarMetrics HorizontalScrollbarMetricsFor(const LayoutBox& box,const StyleSheet& styleSheet) {
+    HorizontalScrollbarMetrics metrics;
+    const auto width=ToLower(Trim(box.style.Get(L"scrollbar-width",L"auto")));
+    if(width==L"none"){metrics.height=0;metrics.arrowWidth=0;return metrics;}
+    const auto standardColors=ToLower(Trim(box.style.Get(L"scrollbar-color")));
+    metrics.standardStyling=width!=L"auto"||(!standardColors.empty()&&standardColors!=L"auto");
+    const auto scrollbarStyle=styleSheet.HasPseudoRules(L"-webkit-scrollbar")?
+        styleSheet.Compute(box.node,&box.style,L"-webkit-scrollbar"):ComputedStyle{};
+    const auto customHeight=Trim(scrollbarStyle.Get(L"height"));
+    const bool custom=!customHeight.empty()&&customHeight!=L"auto";
+    if(custom)metrics.height=std::max(0.0f,StyleSheet::Length(customHeight,box.content.height,box.content.height,metrics.height));
+    else if(width==L"thin")metrics.height=10.0f;
+    metrics.compactArrows=width==L"thin"||custom;
+    // Metrics remain CSS DIPs; the render target and pointer conversion apply
+    // the monitor DPI exactly once at both 100% and 150% scaling.
+    metrics.arrowWidth=metrics.height*1.2f;
+    metrics.minimumThumbWidth=metrics.height*(metrics.compactArrows?3.6f:1.15f);
+    metrics.thumbInset=metrics.height*0.2f;
+    const auto thumbStyle=styleSheet.HasPseudoRules(L"-webkit-scrollbar-thumb")?
+        styleSheet.Compute(box.node,&box.style,L"-webkit-scrollbar-thumb"):ComputedStyle{};
+    const auto minimum=Trim(thumbStyle.Get(L"min-width"));
+    if(!metrics.standardStyling&&!minimum.empty())
+        metrics.minimumThumbWidth=std::max(0.0f,StyleSheet::Length(minimum,box.content.width,box.content.width,metrics.minimumThumbWidth));
+    const auto border=Trim(thumbStyle.Get(L"border-width",thumbStyle.Get(L"border")));
+    if(!metrics.standardStyling&&!border.empty())
+        metrics.thumbInset=std::max(0.0f,StyleSheet::Length(border,metrics.height,metrics.height,metrics.thumbInset));
+    return metrics;
+}
+
 bool VerticalScrollbarFor(const LayoutBox& box,const StyleSheet& styleSheet,VerticalScrollbarGeometry& geometry) {
-    const auto overflowY=box.style.Get(L"overflow-y",L"visible");
+    const auto overflowY=box.style.Get(L"overflow-y",box.style.Get(L"overflow",L"visible"));
     if((overflowY!=L"auto"&&overflowY!=L"scroll")||box.children.empty()||
        box.scrollHeight<=box.content.height+1)return false;
     const auto metrics=VerticalScrollbarMetricsFor(box,styleSheet);
     const float trackWidth=metrics.width;
     if(trackWidth<=0)return false;
     const auto paddingBox=ScrollbarPaddingBox(box);
+    const auto overflowX=box.style.Get(L"overflow-x",box.style.Get(L"overflow",L"visible"));
+    const bool horizontal=(overflowX==L"auto"||overflowX==L"scroll")&&box.scrollWidth>box.content.width+1;
+    const float horizontalHeight=horizontal?HorizontalScrollbarMetricsFor(box,styleSheet).height:0;
     const float arrowHeight=metrics.arrowHeight;
     const float minimumThumbHeight=metrics.minimumThumbHeight;
-    const float available=std::max(0.0f,paddingBox.height-2*arrowHeight);
+    const float trackHeight=std::max(0.0f,paddingBox.height-horizontalHeight);
+    const float available=std::max(0.0f,trackHeight-2*arrowHeight);
     if(available<=0)return false;
     const float paddingHeight=std::max(0.0f,paddingBox.height-box.content.height);
     const float scrollExtent=box.scrollHeight+paddingHeight;
@@ -144,16 +197,49 @@ bool VerticalScrollbarFor(const LayoutBox& box,const StyleSheet& styleSheet,Vert
     const float travel=std::max(0.0f,available-thumbHeight);
     const float trackStart=paddingBox.y+arrowHeight;
     const float thumbY=trackStart+(maximum>0?travel*(box.node->scrollTop/maximum):0);
-    geometry.track={paddingBox.x+paddingBox.width-trackWidth,paddingBox.y,trackWidth,paddingBox.height};
+    geometry.track={paddingBox.x+paddingBox.width-trackWidth,paddingBox.y,trackWidth,trackHeight};
     const float thumbInset=std::min(trackWidth/2.0f,metrics.thumbInset);
     geometry.thumb={geometry.track.x+thumbInset,thumbY,std::max(1.0f,trackWidth-2*thumbInset),thumbHeight};
     geometry.trackStart=trackStart;geometry.travel=travel;geometry.maximum=maximum;geometry.arrowHeight=arrowHeight;geometry.compactArrows=metrics.compactArrows;geometry.standardStyling=metrics.standardStyling;
     return true;
 }
 
+bool HorizontalScrollbarFor(const LayoutBox& box,const StyleSheet& styleSheet,HorizontalScrollbarGeometry& geometry) {
+    const auto overflowX=box.style.Get(L"overflow-x",box.style.Get(L"overflow",L"visible"));
+    if((overflowX!=L"auto"&&overflowX!=L"scroll")||box.children.empty()||
+       box.scrollWidth<=box.content.width+1)return false;
+    const auto metrics=HorizontalScrollbarMetricsFor(box,styleSheet);
+    const float trackHeight=metrics.height;if(trackHeight<=0)return false;
+    const auto paddingBox=ScrollbarPaddingBox(box);
+    const auto overflowY=box.style.Get(L"overflow-y",box.style.Get(L"overflow",L"visible"));
+    const bool vertical=(overflowY==L"auto"||overflowY==L"scroll")&&box.scrollHeight>box.content.height+1;
+    const float verticalWidth=vertical?VerticalScrollbarMetricsFor(box,styleSheet).width:0;
+    const float trackWidth=std::max(0.0f,paddingBox.width-verticalWidth);
+    const float arrowWidth=metrics.arrowWidth;
+    const float available=std::max(0.0f,trackWidth-2*arrowWidth);if(available<=0)return false;
+    const float paddingWidth=std::max(0.0f,paddingBox.width-box.content.width);
+    const float scrollExtent=box.scrollWidth+paddingWidth;
+    const float thumbWidth=std::min(available,std::max(metrics.minimumThumbWidth,
+        available*paddingBox.width/std::max(paddingBox.width,scrollExtent)));
+    const float maximum=std::max(0.0f,box.scrollWidth-box.content.width);
+    const float travel=std::max(0.0f,available-thumbWidth);
+    const float trackStart=paddingBox.x+arrowWidth;
+    const float thumbX=trackStart+(maximum>0?travel*(box.node->scrollLeft/maximum):0);
+    geometry.track={paddingBox.x,paddingBox.y+paddingBox.height-trackHeight,trackWidth,trackHeight};
+    const float thumbInset=std::min(trackHeight/2.0f,metrics.thumbInset);
+    geometry.thumb={thumbX,geometry.track.y+thumbInset,thumbWidth,std::max(1.0f,trackHeight-2*thumbInset)};
+    geometry.trackStart=trackStart;geometry.travel=travel;geometry.maximum=maximum;geometry.arrowWidth=arrowWidth;geometry.compactArrows=metrics.compactArrows;geometry.standardStyling=metrics.standardStyling;
+    return true;
+}
+
 bool IsInlineLevel(const std::wstring& display) {
     return display==L"inline"||display==L"inline-block"||
            display==L"inline-flex"||display==L"inline-grid";
+}
+
+bool IsColumnFlexDirection(const ComputedStyle& style) {
+    const auto direction=ToLower(Trim(style.Get(L"flex-direction",L"row")));
+    return direction==L"column"||direction==L"column-reverse";
 }
 
 bool HasStableScrollbarGutter(const ComputedStyle& style) {
@@ -1372,7 +1458,7 @@ float NaturalWidth(const LayoutBox& box){
         auto padding=EdgeValues(box.style,L"padding",500,500);auto border=BorderValues(box.style);
         const auto display=box.style.Get(L"display");
         const bool flex=display==L"flex"||display==L"inline-flex";
-        const bool row=!flex||!box.style.Is(L"flex-direction",L"column");
+        const bool row=!flex||!IsColumnFlexDirection(box.style);
         float content=0;int visible=0;
         for(const auto& child:box.children)
             if(child->visible&&!child->style.Is(L"position",L"absolute")&&!child->style.Is(L"position",L"fixed")){
@@ -1385,7 +1471,7 @@ float NaturalWidth(const LayoutBox& box){
         value=content+padding.left+padding.right+border.left+border.right;
     }
     else{
-        const auto display=box.style.Get(L"display");const bool flex=display==L"flex"||display==L"inline-flex";const bool horizontal=IsInlineLevel(display)||display==L"table-row"||(flex&&!box.style.Is(L"flex-direction",L"column"));int visible=0;
+        const auto display=box.style.Get(L"display");const bool flex=display==L"flex"||display==L"inline-flex";const bool horizontal=IsInlineLevel(display)||display==L"table-row"||(flex&&!IsColumnFlexDirection(box.style));int visible=0;
         if(horizontal){
             float lineWidth=0;
             for(auto& c:box.children)if(c->visible&&!c->style.Is(L"position",L"absolute")&&!c->style.Is(L"position",L"fixed")){
@@ -1507,7 +1593,7 @@ float MinContentWidth(const LayoutBox& box){
     if(box.node->tag==L"br")return remember(0.0f);
     if(box.node->tag==L"input"||box.node->tag==L"select"||box.node->tag==L"button")return remember(NaturalWidth(box));
     const auto display=box.style.Get(L"display");const bool flex=display==L"flex"||display==L"inline-flex";
-    const bool horizontal=IsInlineLevel(display)||display==L"table-row"||(flex&&!box.style.Is(L"flex-direction",L"column"));
+    const bool horizontal=IsInlineLevel(display)||display==L"table-row"||(flex&&!IsColumnFlexDirection(box.style));
     const auto flexWrap=ToLower(Trim(box.style.Get(L"flex-wrap",L"nowrap")));
     const bool wraps=flex&&horizontal&&(flexWrap==L"wrap"||flexWrap==L"wrap-reverse");
     float value=0;int visible=0;
@@ -1573,7 +1659,7 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
             value=NaturalGridHeight(box,innerWidth);
         }else{
             const bool flex=display==L"flex"||display==L"inline-flex";
-            const bool row=(flex&&!box.style.Is(L"flex-direction",L"column"))||
+            const bool row=(flex&&!IsColumnFlexDirection(box.style))||
                 (IsInlineLevel(display)&&!IsBlockifiedItem(box))||display==L"table-row";
             int visible=0;
             const auto flexWrap=ToLower(Trim(box.style.Get(L"flex-wrap",L"nowrap")));
@@ -2557,9 +2643,10 @@ void ApplySticky(LayoutBox& box,float clipTop,float viewportHeight){
     if(HasTableDisplay(box,L"table-row")||IsTableRowGroup(box)){bool found=false;float left=0,top=0,right=0,bottom=0;for(const auto& child:box.children)if(child->visible&&child->rect.width>0&&child->rect.height>0){if(!found){left=child->rect.x;top=child->rect.y;right=child->rect.x+child->rect.width;bottom=child->rect.y+child->rect.height;found=true;}else{left=std::min(left,child->rect.x);top=std::min(top,child->rect.y);right=std::max(right,child->rect.x+child->rect.width);bottom=std::max(bottom,child->rect.y+child->rect.height);}}if(found){box.rect={left,top,right-left,bottom-top};box.content=box.rect;}}
 }
 
-void ApplyScrollOffset(LayoutBox& box,float oldScrollTop,float viewportHeight){
-    const float dy=oldScrollTop-box.node->scrollTop;if(std::abs(dy)<0.001f)return;
-    for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,0,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
+void ApplyScrollOffset(LayoutBox& box,float oldScrollLeft,float oldScrollTop,float viewportHeight){
+    const float dx=oldScrollLeft-box.node->scrollLeft,dy=oldScrollTop-box.node->scrollTop;
+    if(std::abs(dx)<0.001f&&std::abs(dy)<0.001f)return;
+    for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,dx,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
 }
 
 std::vector<float> SvgNumbers(const std::wstring& source){
@@ -3147,39 +3234,52 @@ void LayoutEngine::UpdateStackingContexts(LayoutBox& scope){
 }
 
 void LayoutEngine::FinalizeScroll(LayoutBox& box){
+    const auto overflowX=box.style.Get(L"overflow-x",box.style.Get(L"overflow",L"visible"));
     const auto overflowY=box.style.Get(L"overflow-y",box.style.Get(L"overflow",L"visible"));
-    box.scrollHeight=box.content.height;
-    if(overflowY!=L"auto"&&overflowY!=L"scroll")return;
+    box.scrollWidth=box.content.width;box.scrollHeight=box.content.height;
+    const auto scrollable=[](const std::wstring& overflow){return overflow==L"auto"||overflow==L"scroll"||overflow==L"hidden";};
+    const bool scrollX=scrollable(overflowX),scrollY=scrollable(overflowY);
+    if(!scrollX&&!scrollY){box.node->scrollLeft=0;box.node->scrollTop=0;return;}
     if(box.node->tag==L"textarea"){
         const auto padding=EdgeValues(box.style,L"padding",box.rect.width,viewportWidth_);
-        box.scrollHeight=std::max(box.content.height,
+        if(scrollY)box.scrollHeight=std::max(box.content.height,
             TextHeight(box.node->Attribute(L"value"),box.style,box.content.width)+padding.bottom);
-        const float maximum=std::max(0.0f,box.scrollHeight-box.content.height);
-        box.node->scrollTop=std::max(0.0f,std::min(maximum,box.node->scrollTop));
+        if(scrollX&&PreventsTextWrapping(box.style.Get(L"white-space")))box.scrollWidth=std::max(box.content.width,
+            TextWidth(box.node->Attribute(L"value"),box.style)+padding.right);
+        box.node->scrollLeft=std::max(0.0f,std::min(std::max(0.0f,box.scrollWidth-box.content.width),box.node->scrollLeft));
+        box.node->scrollTop=std::max(0.0f,std::min(std::max(0.0f,box.scrollHeight-box.content.height),box.node->scrollTop));
         return;
     }
-    std::function<float(const LayoutBox&)> measure=[&](const LayoutBox& current){
-        if(!current.visible||current.style.Is(L"position",L"fixed"))return current.content.y;
-        float descendantBottom=current.content.y;
-        for(const auto& child:current.children)descendantBottom=std::max(descendantBottom,measure(*child));
-        float extent=std::max(current.rect.y+current.rect.height,descendantBottom);
+    struct ScrollExtent { float right=0,bottom=0; };
+    std::function<ScrollExtent(const LayoutBox&)> measure=[&](const LayoutBox& current){
+        if(!current.visible||current.style.Is(L"position",L"fixed"))return ScrollExtent{current.content.x,current.content.y};
+        ScrollExtent descendants{current.content.x,current.content.y};
+        for(const auto& child:current.children){const auto extent=measure(*child);descendants.right=std::max(descendants.right,extent.right);descendants.bottom=std::max(descendants.bottom,extent.bottom);}
+        ScrollExtent extent{std::max(current.rect.x+current.rect.width,descendants.right),
+                            std::max(current.rect.y+current.rect.height,descendants.bottom)};
+        const float contentRight=current.content.x+current.content.width;
         const float contentBottom=current.content.y+current.content.height;
-        if(descendantBottom>contentBottom+0.01f){
+        if(descendants.right>contentRight+0.01f){
+            const float endInset=std::max(0.0f,current.rect.x+current.rect.width-contentRight);
+            extent.right=std::max(extent.right,descendants.right+endInset);
+        }
+        if(descendants.bottom>contentBottom+0.01f){
             // End padding follows overflowing content in the scrollable
             // overflow area. A forced grid/flex item may be shorter than its
             // contents, but its authored padding must not disappear.
             const float endInset=std::max(0.0f,current.rect.y+current.rect.height-contentBottom);
-            extent=std::max(extent,descendantBottom+endInset);
+            extent.bottom=std::max(extent.bottom,descendants.bottom+endInset);
         }
         return extent;
     };
-    float bottom=box.content.y;
-    for(const auto& child:box.children)bottom=std::max(bottom,measure(*child));
-    box.scrollHeight=std::max(box.content.height,bottom-box.content.y);
-    const float maximum=std::max(0.0f,box.scrollHeight-box.content.height);
-    box.node->scrollTop=std::max(0.0f,std::min(maximum,box.node->scrollTop));
-    if(box.node->scrollTop>0){
-        for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed"))TranslateBox(*child,0,-box.node->scrollTop);
+    ScrollExtent extent{box.content.x,box.content.y};
+    for(const auto& child:box.children){const auto childExtent=measure(*child);extent.right=std::max(extent.right,childExtent.right);extent.bottom=std::max(extent.bottom,childExtent.bottom);}
+    if(scrollX)box.scrollWidth=std::max(box.content.width,extent.right-box.content.x);
+    if(scrollY)box.scrollHeight=std::max(box.content.height,extent.bottom-box.content.y);
+    box.node->scrollLeft=std::max(0.0f,std::min(std::max(0.0f,box.scrollWidth-box.content.width),box.node->scrollLeft));
+    box.node->scrollTop=std::max(0.0f,std::min(std::max(0.0f,box.scrollHeight-box.content.height),box.node->scrollTop));
+    if(box.node->scrollLeft>0||box.node->scrollTop>0){
+        for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed"))TranslateBox(*child,-box.node->scrollLeft,-box.node->scrollTop);
         for(auto& child:box.children)ApplySticky(*child,box.content.y,viewportHeight_);
     }
 }
@@ -3301,9 +3401,12 @@ void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
 
 void LayoutEngine::LayoutFlex(LayoutBox& box){
     std::vector<LayoutBox*> children;for(auto& c:box.children)if(c->visible&& !c->style.Is(L"position",L"absolute")&&!c->style.Is(L"position",L"fixed"))children.push_back(c.get());
-    const bool column=box.style.Is(L"flex-direction",L"column");const float mainSize=column?box.content.height:box.content.width;const float crossSize=column?box.content.width:box.content.height;const float gap=GapValue(box.style,!column,mainSize,viewportWidth_);
+    const auto direction=ToLower(Trim(box.style.Get(L"flex-direction",L"row")));
+    const bool column=direction==L"column"||direction==L"column-reverse";
+    const bool reverse=direction==L"row-reverse"||direction==L"column-reverse";
+    const float mainSize=column?box.content.height:box.content.width;const float crossSize=column?box.content.width:box.content.height;const float gap=GapValue(box.style,!column,mainSize,viewportWidth_);
     const auto wrapMode=ToLower(Trim(box.style.Get(L"flex-wrap",L"nowrap")));
-    if(!column&&(wrapMode==L"wrap"||wrapMode==L"wrap-reverse")&&!children.empty()){
+    if((wrapMode==L"wrap"||wrapMode==L"wrap-reverse")&&!children.empty()){
         const size_t count=children.size();
         std::vector<float> sizes(count),minimums(count),grows(count),shrinkWeights(count),crossExtents(count);
         std::vector<bool> mainAutoBefore(count),mainAutoAfter(count),
@@ -3313,37 +3416,39 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
         for(size_t index=0;index<count;++index){
             auto* child=children[index];
             const auto margin=EdgeValues(child->style,L"margin",mainSize,viewportWidth_);
-            const float mainMargin=margin.left+margin.right;
+            const float mainMargin=column?margin.top+margin.bottom:margin.left+margin.right;
             const auto isAutoMargin=[&](const wchar_t* property){
                 return ToLower(Trim(child->style.Get(property)))==L"auto";
             };
-            mainAutoBefore[index]=isAutoMargin(L"margin-left");
-            mainAutoAfter[index]=isAutoMargin(L"margin-right");
-            crossAutoBefore[index]=isAutoMargin(L"margin-top");
-            crossAutoAfter[index]=isAutoMargin(L"margin-bottom");
+            mainAutoBefore[index]=isAutoMargin(column?L"margin-top":L"margin-left");
+            mainAutoAfter[index]=isAutoMargin(column?L"margin-bottom":L"margin-right");
+            crossAutoBefore[index]=isAutoMargin(column?L"margin-left":L"margin-top");
+            crossAutoAfter[index]=isAutoMargin(column?L"margin-right":L"margin-bottom");
             grows[index]=StyleSheet::Length(child->style.Get(L"flex-grow",L"0"),0,0,0);
             const float shrink=StyleSheet::Length(child->style.Get(L"flex-shrink",L"1"),0,0,1);
             auto raw=child->style.Get(L"flex-basis");
-            if(raw.empty()||raw==L"auto")raw=child->style.Get(L"width");
+            if(raw.empty()||raw==L"auto")raw=child->style.Get(column?L"height":L"width");
             const bool natural=raw.empty()||raw==L"auto"||ToLower(Trim(raw))==L"max-content";
-            float base=natural?NaturalWidth(*child):StyleSheet::Length(raw,mainSize,viewportWidth_,0);
+            float base=natural?(column?NaturalHeight(*child,crossSize):NaturalWidth(*child)):
+                StyleSheet::Length(raw,mainSize,column?viewportHeight_:viewportWidth_,0);
             if(!natural){
-                base=Constrain(child->style,L"min-width",L"max-width",base,mainSize,viewportWidth_);
+                base=column?Constrain(child->style,L"min-height",L"max-height",base,mainSize,viewportHeight_):
+                    Constrain(child->style,L"min-width",L"max-width",base,mainSize,viewportWidth_);
                 base+=mainMargin;
             }
-            sizes[index]=base;minimums[index]=MinContentWidth(*child);
+            sizes[index]=base;minimums[index]=column?mainMargin:MinContentWidth(*child);
             shrinkWeights[index]=shrink*std::max(0.0f,base-mainMargin);
 
             auto align=child->style.Get(L"align-self",L"auto");
             if(align.empty()||align==L"auto")align=parentAlign;
             alignments[index]=align;
-            const auto height=child->style.Get(L"height");
-            crossDefinite[index]=!height.empty()&&height!=L"auto";
+            const auto crossProperty=child->style.Get(column?L"width":L"height");
+            crossDefinite[index]=!crossProperty.empty()&&crossProperty!=L"auto";
             if(crossDefinite[index]){
-                crossExtents[index]=StyleSheet::Length(height,crossSize,viewportHeight_,0)+
-                    margin.top+margin.bottom;
+                crossExtents[index]=StyleSheet::Length(crossProperty,crossSize,column?viewportWidth_:viewportHeight_,0)+
+                    (column?margin.left+margin.right:margin.top+margin.bottom);
             }else{
-                crossExtents[index]=NaturalHeight(*child,std::max(1.0f,sizes[index]));
+                crossExtents[index]=column?NaturalWidth(*child):NaturalHeight(*child,std::max(1.0f,sizes[index]));
             }
         }
 
@@ -3396,13 +3501,13 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
                 }
             }
             for(const auto index:line.items){
-                if(!crossDefinite[index])
+                if(!column&&!crossDefinite[index])
                     crossExtents[index]=NaturalHeight(*children[index],std::max(1.0f,sizes[index]));
                 line.cross=std::max(line.cross,crossExtents[index]);
             }
         }
 
-        const float crossGap=GapValue(box.style,false,mainSize,viewportWidth_);
+        const float crossGap=GapValue(box.style,column,crossSize,viewportWidth_);
         float occupiedCross=crossGap*std::max(0,static_cast<int>(lines.size())-1);
         for(const auto& line:lines)occupiedCross+=line.cross;
         float crossRemain=std::max(0.0f,crossSize-occupiedCross);
@@ -3424,7 +3529,7 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
             crossOffset=extra;dynamicCrossGap+=extra;
         }
 
-        float crossCursor=box.content.y+crossOffset;
+        float crossCursor=(column?box.content.x:box.content.y)+crossOffset;
         std::vector<size_t> lineOrder;lineOrder.reserve(lines.size());
         if(wrapMode==L"wrap-reverse")
             for(size_t index=lines.size();index>0;--index)lineOrder.push_back(index-1);
@@ -3441,18 +3546,20 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
             float remain=std::max(0.0f,mainSize-occupied);
             const float autoMargin=autoMarginCount?remain/static_cast<float>(autoMarginCount):0;
             if(autoMarginCount)remain=0;
-            float mainCursor=box.content.x,dynamicGap=gap;
-            if(justify==L"center")mainCursor+=remain/2;
-            else if(justify==L"flex-end"||justify==L"end")mainCursor+=remain;
+            float mainOffset=0,dynamicGap=gap;
+            if(justify==L"center")mainOffset=remain/2;
+            else if(justify==L"flex-end"||justify==L"end")mainOffset=remain;
             else if(justify==L"space-between"&&line.items.size()>1)
                 dynamicGap+=remain/static_cast<float>(line.items.size()-1);
             else if(justify==L"space-around"&&!line.items.empty()){
                 const float extra=remain/static_cast<float>(line.items.size());
-                mainCursor+=extra/2;dynamicGap+=extra;
+                mainOffset=extra/2;dynamicGap+=extra;
             }else if(justify==L"space-evenly"&&!line.items.empty()){
                 const float extra=remain/static_cast<float>(line.items.size()+1);
-                mainCursor+=extra;dynamicGap+=extra;
+                mainOffset=extra;dynamicGap+=extra;
             }
+            float mainCursor=reverse?(column?box.content.y+box.content.height:box.content.x+box.content.width)-mainOffset:
+                (column?box.content.y:box.content.x)+mainOffset;
 
             float sharedBaseline=0;
             for(const auto index:line.items)
@@ -3461,7 +3568,7 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
                         *children[index],sizes[index],crossExtents[index]));
             for(const auto index:line.items){
                 auto* child=children[index];const auto& align=alignments[index];
-                if(mainAutoBefore[index])mainCursor+=autoMargin;
+                if(mainAutoBefore[index])mainCursor+=reverse?-autoMargin:autoMargin;
                 const bool autoCross=crossAutoBefore[index]||crossAutoAfter[index];
                 const bool stretch=!autoCross&&!crossDefinite[index]&&align==L"stretch";
                 const float childCross=stretch?line.cross:std::min(line.cross,crossExtents[index]);
@@ -3474,9 +3581,13 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
                 else if(!crossAutoAfter[index]&&align==L"baseline")
                     childCrossPosition+=sharedBaseline-FlexItemBaselineOffset(
                         *child,sizes[index],childCross);
-                LayoutBoxTree(*child,{mainCursor,childCrossPosition,sizes[index],childCross},
-                              true,true,stretch||crossDefinite[index]);
-                mainCursor+=sizes[index]+(mainAutoAfter[index]?autoMargin:0)+dynamicGap;
+                const float childMainPosition=reverse?mainCursor-sizes[index]:mainCursor;
+                const LayoutRect area=column?LayoutRect{childCrossPosition,childMainPosition,childCross,sizes[index]}:
+                    LayoutRect{childMainPosition,childCrossPosition,sizes[index],childCross};
+                LayoutBoxTree(*child,area,true,column?stretch||crossDefinite[index]:true,
+                              column?true:stretch||crossDefinite[index]);
+                const float advance=sizes[index]+(mainAutoAfter[index]?autoMargin:0)+dynamicGap;
+                mainCursor+=reverse?-advance:advance;
             }
             crossCursor+=line.cross+dynamicCrossGap;
         }
@@ -3529,11 +3640,13 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
     const float autoMainMargin=mainAutoMarginCount&&remain>0?
         remain/static_cast<float>(mainAutoMarginCount):0;
     if(autoMainMargin>0)remain=0;
-    float cursor=column?box.content.y:box.content.x;const auto justify=box.style.Get(L"justify-content");float dynamicGap=gap;
-    if(justify==L"center")cursor+=remain/2;else if(justify==L"flex-end"||justify==L"end")cursor+=remain;
+    const auto justify=box.style.Get(L"justify-content");float dynamicGap=gap,mainOffset=0;
+    if(justify==L"center")mainOffset=remain/2;else if(justify==L"flex-end"||justify==L"end")mainOffset=remain;
     else if(justify==L"space-between"&&children.size()>1)dynamicGap+=remain/(children.size()-1);
-    else if(justify==L"space-around"&&!children.empty()){const float extra=remain/children.size();cursor+=extra/2;dynamicGap+=extra;}
-    else if(justify==L"space-evenly"&&!children.empty()){const float extra=remain/(children.size()+1);cursor+=extra;dynamicGap+=extra;}
+    else if(justify==L"space-around"&&!children.empty()){const float extra=remain/children.size();mainOffset=extra/2;dynamicGap+=extra;}
+    else if(justify==L"space-evenly"&&!children.empty()){const float extra=remain/(children.size()+1);mainOffset=extra;dynamicGap+=extra;}
+    float cursor=reverse?(column?box.content.y+box.content.height:box.content.x+box.content.width)-mainOffset:
+        (column?box.content.y:box.content.x)+mainOffset;
     const auto parentAlign=box.style.Get(L"align-items",L"stretch");
     std::vector<std::wstring> alignments(children.size());
     std::vector<float> crossExtents(children.size(),crossSize);
@@ -3568,12 +3681,14 @@ void LayoutEngine::LayoutFlex(LayoutBox& box){
         else if(!crossAutoAfter[i]&&(align==L"flex-end"||align==L"end"))crossPos+=crossFree;
         else if(!crossAutoAfter[i]&&!column&&align==L"baseline")crossPos+=sharedBaseline-
             FlexItemBaselineOffset(*child,sizes[i],cross);
-        if(mainAutoBefore[i])cursor+=autoMainMargin;
-        const LayoutRect area=column?LayoutRect{crossPos,cursor,cross,sizes[i]}:
-            LayoutRect{cursor,crossPos,sizes[i],cross};
+        if(mainAutoBefore[i])cursor+=reverse?-autoMainMargin:autoMainMargin;
+        const float mainPosition=reverse?cursor-sizes[i]:cursor;
+        const LayoutRect area=column?LayoutRect{crossPos,mainPosition,cross,sizes[i]}:
+            LayoutRect{mainPosition,crossPos,sizes[i],cross};
         LayoutBoxTree(*child,area,true,column?crossDefinite[i]:true,
                       column?true:crossDefinite[i]);
-        cursor+=sizes[i]+(mainAutoAfter[i]?autoMainMargin:0)+dynamicGap;
+        const float advance=sizes[i]+(mainAutoAfter[i]?autoMainMargin:0)+dynamicGap;
+        cursor+=reverse?-advance:advance;
     }
     for(auto& c:box.children)if(c->visible&&(c->style.Is(L"position",L"absolute")||c->style.Is(L"position",L"fixed"))){
         const LayoutRect area=c->style.Is(L"position",L"fixed")?LayoutRect{0,0,viewportWidth_,viewportHeight_}:AbsoluteContainingBlock(box);
@@ -3915,6 +4030,40 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
             }
         }
     }
+    HorizontalScrollbarGeometry horizontalScrollbar;if(HorizontalScrollbarFor(box,styleSheet_,horizontalScrollbar)){
+        const auto colorScheme=ToLower(Trim(box.style.Get(L"color-scheme",L"light")));
+        const bool darkScheme=!colorScheme.empty()&&Words(colorScheme).front()==L"dark";
+        unsigned int thumbColor=darkScheme?0xff9f9f9f:0xff8b8b8b;
+        unsigned int trackColor=darkScheme?0xff2c2c2c:0xfffcfcfc;
+        const auto colors=Words(box.style.Get(L"scrollbar-color"));
+        if(colors.size()>=2){thumbColor=StyleSheet::Color(colors[0],thumbColor);trackColor=StyleSheet::Color(colors[1],trackColor);}
+        const auto trackStyle=styleSheet_.HasPseudoRules(L"-webkit-scrollbar-track")?styleSheet_.Compute(box.node,&box.style,L"-webkit-scrollbar-track"):ComputedStyle{};
+        const auto trackBackground=trackStyle.Get(L"background-color",trackStyle.Get(L"background"));
+        if(!horizontalScrollbar.standardStyling&&!trackBackground.empty())trackColor=StyleSheet::Color(trackBackground,trackColor);
+        const auto thumbStyle=styleSheet_.HasPseudoRules(L"-webkit-scrollbar-thumb")?styleSheet_.Compute(box.node,&box.style,L"-webkit-scrollbar-thumb"):ComputedStyle{};
+        const auto thumbBackground=thumbStyle.Get(L"background-color",thumbStyle.Get(L"background"));
+        if(!horizontalScrollbar.standardStyling&&!thumbBackground.empty())thumbColor=StyleSheet::Color(thumbBackground,thumbColor);
+        const float trackRight=horizontalScrollbar.track.x+horizontalScrollbar.track.width;
+        if((trackColor>>24)!=0){target->CreateSolidColorBrush(D2DColor(trackColor),&brush);target->FillRectangle(D2D1::RectF(horizontalScrollbar.track.x,horizontalScrollbar.track.y,trackRight,horizontalScrollbar.track.y+horizontalScrollbar.track.height),brush.Get());}
+        target->CreateSolidColorBrush(D2DColor(thumbColor),&brush);const auto thumbRadii=UniformCornerRadii(thumbStyle,horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height,viewportWidth_);const float thumbRadius=horizontalScrollbar.standardStyling?std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(horizontalScrollbar.thumb.x,horizontalScrollbar.thumb.y,horizontalScrollbar.thumb.x+horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.y+horizontalScrollbar.thumb.height),thumbRadius,thumbRadius),brush.Get());
+        if(horizontalScrollbar.arrowWidth>0){
+            Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;target->GetFactory(&d2dFactory);
+            Microsoft::WRL::ComPtr<ID2D1PathGeometry> arrows;Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+            if(d2dFactory&&SUCCEEDED(d2dFactory->CreatePathGeometry(&arrows))&&SUCCEEDED(arrows->Open(&sink))){
+                const float center=horizontalScrollbar.track.y+horizontalScrollbar.track.height/2.0f;
+                const float halfHeight=horizontalScrollbar.thumb.height/2.0f;
+                const float figureWidth=horizontalScrollbar.arrowWidth/3.0f;
+                const float padding=(horizontalScrollbar.arrowWidth-figureWidth)/2.0f;
+                const float leftApex=horizontalScrollbar.track.x+padding,leftBase=leftApex+figureWidth;
+                const float rightBase=trackRight-padding-figureWidth,rightApex=trackRight-padding;
+                sink->BeginFigure(D2D1::Point2F(leftApex,center),D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(leftBase,center-halfHeight));sink->AddLine(D2D1::Point2F(leftBase,center+halfHeight));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->BeginFigure(D2D1::Point2F(rightBase,center-halfHeight),D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(rightApex,center));sink->AddLine(D2D1::Point2F(rightBase,center+halfHeight));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();target->FillGeometry(arrows.Get(),brush.Get());
+            }
+        }
+    }
     if(opacityLayer)target->PopLayer();
     if(transformed)target->SetTransform(previousTransform);
 }
@@ -4067,7 +4216,7 @@ std::shared_ptr<Node> LayoutEngine::HitTestBox(const LayoutBox& box,float x,floa
 const LayoutBox* LayoutEngine::BoxFor(const std::shared_ptr<Node>& node)const{if(!root_||!node)return nullptr;const auto found=boxIndex_.find(node.get());return found==boxIndex_.end()?nullptr:found->second;}
 bool LayoutEngine::Restyle(const std::shared_ptr<Node>& node){if(!root_||!node)return false;const auto found=boxIndex_.find(node.get());if(found==boxIndex_.end())return true;auto* box=found->second;const ComputedStyle* parentStyle=nullptr;if(auto parent=node->parent.lock()){const auto parentBox=boxIndex_.find(parent.get());if(parentBox!=boxIndex_.end())parentStyle=&parentBox->second->style;}return RestyleBox(*box,parentStyle);}
 bool LayoutEngine::RestyleBox(LayoutBox& box,const ComputedStyle* parentStyle){auto updated=box.generatedFrom?styleSheet_.Compute(box.generatedFrom,parentStyle,box.pseudo):styleSheet_.Compute(box.node,parentStyle);updated.deviceScale=deviceScale_;bool layoutChanged=HasLayoutStyleChange(box.style,updated);box.style=updated;for(auto& child:box.children)layoutChanged=RestyleBox(*child,&box.style)||layoutChanged;return layoutChanged;}
-bool LayoutEngine::ScrollAt(float x,float y,float wheelDelta,std::shared_ptr<Node>* scrolledNode){
+bool LayoutEngine::ScrollAt(float x,float y,float wheelDelta,std::shared_ptr<Node>* scrolledNode,bool horizontal){
     if(scrolledNode)scrolledNode->reset();
     if(!root_)return false;
     const auto target=HitTest(x,y);
@@ -4079,26 +4228,60 @@ bool LayoutEngine::ScrollAt(float x,float y,float wheelDelta,std::shared_ptr<Nod
     // covered sibling (for example, the page behind a menu), which browsers do
     // not include in the scroll chain.
     for(auto* box=found->second;box;box=box->parent)
-        if(ScrollBox(*box,x,y,wheelDelta,scrolledNode))return true;
+        if(ScrollBox(*box,x,y,wheelDelta,scrolledNode,horizontal))return true;
     return false;
 }
-bool LayoutEngine::ScrollBox(LayoutBox& box,float x,float y,float wheelDelta,std::shared_ptr<Node>* scrolledNode){if(!box.visible)return false;const auto overflowY=box.style.Get(L"overflow-y",L"visible");if((overflowY==L"auto"||overflowY==L"scroll")&&box.content.Contains(x,y)&&box.scrollHeight>box.content.height+1){const float maximum=std::max(0.0f,box.scrollHeight-box.content.height),old=box.node->scrollTop;box.node->scrollTop=std::max(0.0f,std::min(maximum,old-wheelDelta/120.0f*90.0f));ApplyScrollOffset(box,old,viewportHeight_);if(box.node->scrollTop!=old){if(scrolledNode)*scrolledNode=box.node;return true;}}return false;}
-bool LayoutEngine::BeginScrollbarInteraction(float x,float y,std::shared_ptr<Node>& dragNode,float& dragOffset){
-    dragNode.reset();dragOffset=0;if(!root_)return false;
-    for(auto it=root_->nonNegativeStackingContexts.rbegin();it!=root_->nonNegativeStackingContexts.rend();++it)
-        if(StackingContextAllowsPoint(**it,*root_,x,y)&&BeginScrollbarBox(**it,x,y,dragNode,dragOffset))return true;
-    return BeginScrollbarBox(*root_,x,y,dragNode,dragOffset);
+bool LayoutEngine::ScrollBox(LayoutBox& box,float x,float y,float wheelDelta,std::shared_ptr<Node>* scrolledNode,bool horizontal){
+    if(!box.visible||!box.content.Contains(x,y))return false;
+    const auto overflow=box.style.Get(L"overflow",L"visible");
+    const auto axisOverflow=box.style.Get(horizontal?L"overflow-x":L"overflow-y",overflow);
+    if(axisOverflow!=L"auto"&&axisOverflow!=L"scroll")return false;
+    const float extent=horizontal?box.scrollWidth:box.scrollHeight,client=horizontal?box.content.width:box.content.height;
+    if(extent<=client+1)return false;
+    const float maximum=std::max(0.0f,extent-client),oldLeft=box.node->scrollLeft,oldTop=box.node->scrollTop;
+    float& value=horizontal?box.node->scrollLeft:box.node->scrollTop;
+    value=std::max(0.0f,std::min(maximum,value-wheelDelta/120.0f*90.0f));
+    ApplyScrollOffset(box,oldLeft,oldTop,viewportHeight_);
+    if((horizontal?box.node->scrollLeft!=oldLeft:box.node->scrollTop!=oldTop)){if(scrolledNode)*scrolledNode=box.node;return true;}
+    return false;
 }
-bool LayoutEngine::BeginScrollbarBox(LayoutBox& box,float x,float y,std::shared_ptr<Node>& dragNode,float& dragOffset){
+bool LayoutEngine::BeginScrollbarInteraction(float x,float y,std::shared_ptr<Node>& dragNode,float& dragOffset,bool& horizontal){
+    dragNode.reset();dragOffset=0;horizontal=false;if(!root_)return false;
+    for(auto it=root_->nonNegativeStackingContexts.rbegin();it!=root_->nonNegativeStackingContexts.rend();++it)
+        if(StackingContextAllowsPoint(**it,*root_,x,y)&&BeginScrollbarBox(**it,x,y,dragNode,dragOffset,horizontal))return true;
+    return BeginScrollbarBox(*root_,x,y,dragNode,dragOffset,horizontal);
+}
+bool LayoutEngine::BeginScrollbarInteraction(float x,float y,std::shared_ptr<Node>& dragNode,float& dragOffset){
+    bool horizontal=false;return BeginScrollbarInteraction(x,y,dragNode,dragOffset,horizontal);
+}
+bool LayoutEngine::BeginScrollbarBox(LayoutBox& box,float x,float y,std::shared_ptr<Node>& dragNode,float& dragOffset,bool& horizontal){
     if(!box.visible||!box.rect.Contains(x,y))return false;VerticalScrollbarGeometry geometry;
     if(VerticalScrollbarFor(box,styleSheet_,geometry)&&geometry.track.Contains(x,y)){
         if(y>=geometry.thumb.y&&y<geometry.thumb.y+geometry.thumb.height){dragNode=box.node;dragOffset=y-geometry.thumb.y;return true;}
-        const float old=box.node->scrollTop;if(y<geometry.trackStart)box.node->scrollTop=std::max(0.0f,old-90.0f);else if(y>=geometry.track.y+geometry.track.height-geometry.arrowHeight)box.node->scrollTop=std::min(geometry.maximum,old+90.0f);else if(y<geometry.thumb.y)box.node->scrollTop=std::max(0.0f,old-box.content.height*0.9f);else box.node->scrollTop=std::min(geometry.maximum,old+box.content.height*0.9f);ApplyScrollOffset(box,old,viewportHeight_);return true;
+        const float oldLeft=box.node->scrollLeft,oldTop=box.node->scrollTop;if(y<geometry.trackStart)box.node->scrollTop=std::max(0.0f,oldTop-90.0f);else if(y>=geometry.track.y+geometry.track.height-geometry.arrowHeight)box.node->scrollTop=std::min(geometry.maximum,oldTop+90.0f);else if(y<geometry.thumb.y)box.node->scrollTop=std::max(0.0f,oldTop-box.content.height*0.9f);else box.node->scrollTop=std::min(geometry.maximum,oldTop+box.content.height*0.9f);ApplyScrollOffset(box,oldLeft,oldTop,viewportHeight_);return true;
     }
-    for(auto it=box.children.rbegin();it!=box.children.rend();++it)if(BeginScrollbarBox(**it,x,y,dragNode,dragOffset))return true;return false;
+    HorizontalScrollbarGeometry horizontalGeometry;
+    if(HorizontalScrollbarFor(box,styleSheet_,horizontalGeometry)&&horizontalGeometry.track.Contains(x,y)){
+        horizontal=true;
+        if(x>=horizontalGeometry.thumb.x&&x<horizontalGeometry.thumb.x+horizontalGeometry.thumb.width){dragNode=box.node;dragOffset=x-horizontalGeometry.thumb.x;return true;}
+        const float oldLeft=box.node->scrollLeft,oldTop=box.node->scrollTop;
+        if(x<horizontalGeometry.trackStart)box.node->scrollLeft=std::max(0.0f,oldLeft-90.0f);
+        else if(x>=horizontalGeometry.track.x+horizontalGeometry.track.width-horizontalGeometry.arrowWidth)box.node->scrollLeft=std::min(horizontalGeometry.maximum,oldLeft+90.0f);
+        else if(x<horizontalGeometry.thumb.x)box.node->scrollLeft=std::max(0.0f,oldLeft-box.content.width*0.9f);
+        else box.node->scrollLeft=std::min(horizontalGeometry.maximum,oldLeft+box.content.width*0.9f);
+        ApplyScrollOffset(box,oldLeft,oldTop,viewportHeight_);return true;
+    }
+    for(auto it=box.children.rbegin();it!=box.children.rend();++it)if(BeginScrollbarBox(**it,x,y,dragNode,dragOffset,horizontal))return true;return false;
+}
+bool LayoutEngine::DragScrollbar(const std::shared_ptr<Node>& node,float x,float y,float dragOffset,bool horizontal){
+    if(!root_||!node)return false;const auto found=boxIndex_.find(node.get());auto* box=found==boxIndex_.end()?nullptr:found->second;if(!box)return false;
+    const float oldLeft=node->scrollLeft,oldTop=node->scrollTop;
+    if(horizontal){HorizontalScrollbarGeometry geometry;if(!HorizontalScrollbarFor(*box,styleSheet_,geometry)||geometry.travel<=0||geometry.maximum<=0)return false;const float thumbX=std::max(geometry.trackStart,std::min(geometry.trackStart+geometry.travel,x-dragOffset));node->scrollLeft=std::max(0.0f,std::min(geometry.maximum,(thumbX-geometry.trackStart)/geometry.travel*geometry.maximum));}
+    else{VerticalScrollbarGeometry geometry;if(!VerticalScrollbarFor(*box,styleSheet_,geometry)||geometry.travel<=0||geometry.maximum<=0)return false;const float thumbY=std::max(geometry.trackStart,std::min(geometry.trackStart+geometry.travel,y-dragOffset));node->scrollTop=std::max(0.0f,std::min(geometry.maximum,(thumbY-geometry.trackStart)/geometry.travel*geometry.maximum));}
+    ApplyScrollOffset(*box,oldLeft,oldTop,viewportHeight_);return horizontal?std::abs(node->scrollLeft-oldLeft)>0.01f:std::abs(node->scrollTop-oldTop)>0.01f;
 }
 bool LayoutEngine::DragScrollbar(const std::shared_ptr<Node>& node,float y,float dragOffset){
-    if(!root_||!node)return false;const auto found=boxIndex_.find(node.get());auto* box=found==boxIndex_.end()?nullptr:found->second;VerticalScrollbarGeometry geometry;if(!box||!VerticalScrollbarFor(*box,styleSheet_,geometry)||geometry.travel<=0||geometry.maximum<=0)return false;const float thumbY=std::max(geometry.trackStart,std::min(geometry.trackStart+geometry.travel,y-dragOffset));const float value=(thumbY-geometry.trackStart)/geometry.travel*geometry.maximum;const float old=node->scrollTop;node->scrollTop=std::max(0.0f,std::min(geometry.maximum,value));ApplyScrollOffset(*box,old,viewportHeight_);return std::abs(node->scrollTop-old)>0.01f;
+    return DragScrollbar(node,0,y,dragOffset,false);
 }
 
 void LayoutEngine::DumpBox(const LayoutBox& box,std::wstring& output,bool& first)const{if(!box.visible)return;if(box.node->type==NodeType::Element){if(!first)output+=L",";first=false;std::wostringstream s;s<<L"{\"tag\":\""<<EscapeJson(box.node->tag)<<L"\",\"id\":\""<<EscapeJson(box.node->Attribute(L"id"))<<L"\",\"x\":"<<std::lround(box.rect.x)<<L",\"y\":"<<std::lround(box.rect.y)<<L",\"width\":"<<std::lround(box.rect.width)<<L",\"height\":"<<std::lround(box.rect.height)<<L"}";output+=s.str();}for(auto& c:box.children)DumpBox(*c,output,first);}
