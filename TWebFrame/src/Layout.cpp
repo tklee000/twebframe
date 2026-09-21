@@ -1211,6 +1211,113 @@ size_t GridColumnCount(const LayoutBox& box,float availableWidth){
     return std::max<size_t>(1,Words(definition).size());
 }
 
+bool HasTableDisplay(const LayoutBox& box,const wchar_t* display){
+    return box.visible&&box.style.Is(L"display",display);
+}
+
+bool IsTableRowGroup(const LayoutBox& box){
+    const auto display=box.style.Get(L"display");
+    return box.visible&&(display==L"table-header-group"||display==L"table-row-group"||
+        display==L"table-footer-group");
+}
+
+size_t TableSpan(const std::shared_ptr<Node>& node,const wchar_t* attribute,
+                 size_t maximum,bool zeroIsSpecial=false){
+    const auto raw=Trim(node?node->Attribute(attribute):L"");
+    if(raw.empty())return 1;
+    size_t value=0;
+    for(const wchar_t c:raw){
+        if(c<L'0'||c>L'9')return 1;
+        const size_t digit=static_cast<size_t>(c-L'0');
+        if(value>(maximum-digit)/10)return maximum;
+        value=value*10+digit;
+    }
+    if(value==0)return zeroIsSpecial?0:1;
+    return std::min(value,maximum);
+}
+
+struct TableRowEntry {
+    LayoutBox* box = nullptr;
+    LayoutBox* group = nullptr;
+};
+
+struct TableCellEntry {
+    LayoutBox* box = nullptr;
+    size_t row = 0;
+    size_t column = 0;
+    size_t rowSpan = 1;
+    size_t columnSpan = 1;
+};
+
+struct TableGridModel {
+    std::vector<TableRowEntry> rows;
+    std::vector<TableCellEntry> cells;
+    size_t columnCount = 0;
+};
+
+TableGridModel BuildTableGrid(LayoutBox& table){
+    TableGridModel model;
+    std::function<void(LayoutBox&,LayoutBox*)> collectRows=
+        [&](LayoutBox& current,LayoutBox* group){
+            if(!current.visible)return;
+            if(&current!=&table&&HasTableDisplay(current,L"table"))return;
+            if(IsTableRowGroup(current))group=&current;
+            if(HasTableDisplay(current,L"table-row")){
+                model.rows.push_back({&current,group?group:&table});
+                return;
+            }
+            for(auto& child:current.children)collectRows(*child,group);
+        };
+    for(auto& child:table.children)collectRows(*child,nullptr);
+    if(model.rows.empty())return model;
+
+    std::vector<size_t> groupEnds(model.rows.size());
+    for(size_t begin=0;begin<model.rows.size();){
+        size_t end=begin+1;
+        while(end<model.rows.size()&&model.rows[end].group==model.rows[begin].group)++end;
+        for(size_t row=begin;row<end;++row)groupEnds[row]=end;
+        begin=end;
+    }
+
+    std::vector<std::vector<unsigned char>> occupied(model.rows.size());
+    for(size_t row=0;row<model.rows.size();++row){
+        size_t searchColumn=0;
+        for(auto& child:model.rows[row].box->children){
+            if(!HasTableDisplay(*child,L"table-cell")||
+               child->style.Is(L"position",L"absolute")||
+               child->style.Is(L"position",L"fixed"))continue;
+            const size_t columnSpan=TableSpan(child->node,L"colspan",1000);
+            const size_t authoredRowSpan=TableSpan(child->node,L"rowspan",65534,true);
+            const size_t rowSpan=authoredRowSpan==0?groupEnds[row]-row:
+                std::min(authoredRowSpan,groupEnds[row]-row);
+            for(;;++searchColumn){
+                if(occupied[row].size()<searchColumn+columnSpan)
+                    occupied[row].resize(searchColumn+columnSpan);
+                bool available=true;
+                for(size_t column=searchColumn;column<searchColumn+columnSpan;++column)
+                    if(occupied[row][column]){available=false;break;}
+                if(available)break;
+            }
+            for(size_t targetRow=row;targetRow<row+rowSpan;++targetRow){
+                if(occupied[targetRow].size()<searchColumn+columnSpan)
+                    occupied[targetRow].resize(searchColumn+columnSpan);
+                for(size_t column=searchColumn;column<searchColumn+columnSpan;++column)
+                    occupied[targetRow][column]=1;
+            }
+            model.cells.push_back({child.get(),row,searchColumn,rowSpan,columnSpan});
+            model.columnCount=std::max(model.columnCount,searchColumn+columnSpan);
+            searchColumn+=columnSpan;
+        }
+        model.columnCount=std::max(model.columnCount,occupied[row].size());
+    }
+    return model;
+}
+
+std::vector<float> ResolveTableColumns(const LayoutBox& table,const TableGridModel& model,
+                                       float availableWidth,float viewportWidth);
+std::vector<float> ResolveTableRows(const TableGridModel& model,
+                                    const std::vector<float>& columns);
+
 float NaturalWidth(const LayoutBox& box){
     if(box.naturalWidthValid)return box.naturalWidth;
     auto remember=[&](float value){box.naturalWidth=value;box.naturalWidthValid=true;return value;};
@@ -1310,6 +1417,75 @@ float NaturalWidth(const LayoutBox& box){
     value=Constrain(box.style,L"min-width",L"max-width",value,500,500);auto margin=EdgeValues(box.style,L"margin",500,500);return remember(value+margin.left+margin.right);
 }
 
+std::vector<float> ResolveTableColumns(const LayoutBox& table,const TableGridModel& model,
+                                       float availableWidth,float viewportWidth){
+    if(!model.columnCount)return {};
+    std::vector<float> explicitWidths(model.columnCount),preferredWidths(model.columnCount);
+    size_t columnIndex=0;
+    std::function<void(const std::shared_ptr<Node>&)> collectColumns=
+        [&](const std::shared_ptr<Node>& node){
+            if(!node||columnIndex>=model.columnCount)return;
+            if(node->tag==L"col"){
+                const size_t span=TableSpan(node,L"span",1000);
+                const auto styleWidth=node->inlineStyle.find(L"width");
+                const auto authoredWidth=styleWidth==node->inlineStyle.end()?
+                    node->Attribute(L"width"):styleWidth->second;
+                const float width=authoredWidth.empty()?0.0f:
+                    StyleSheet::Length(authoredWidth,availableWidth,viewportWidth,0);
+                for(size_t offset=0;offset<span&&columnIndex<model.columnCount;
+                    ++offset,++columnIndex)explicitWidths[columnIndex]=std::max(0.0f,width);
+                return;
+            }
+            for(const auto& child:node->children)collectColumns(child);
+        };
+    collectColumns(table.node);
+
+    const bool fixed=table.style.Is(L"table-layout",L"fixed");
+    auto distributeDeficit=[&](std::vector<float>& widths,const TableCellEntry& cell,float required,
+                               const std::vector<float>* reserved){
+        const size_t end=std::min(model.columnCount,cell.column+cell.columnSpan);
+        float current=0;
+        for(size_t column=cell.column;column<end;++column)
+            current+=std::max(widths[column],reserved?(*reserved)[column]:0.0f);
+        const float deficit=required-current;
+        if(deficit<=0||end<=cell.column)return;
+        std::vector<size_t> flexible;
+        for(size_t column=cell.column;column<end;++column)
+            if(!reserved||(*reserved)[column]<=0)flexible.push_back(column);
+        if(flexible.empty())for(size_t column=cell.column;column<end;++column)
+            flexible.push_back(column);
+        const float share=deficit/static_cast<float>(flexible.size());
+        for(const auto column:flexible)widths[column]+=share;
+    };
+
+    for(const auto& cell:model.cells){
+        if(fixed&&cell.row!=0)continue;
+        const auto raw=Trim(cell.box->style.Get(L"width"));
+        if(!raw.empty()&&raw!=L"auto")
+            distributeDeficit(explicitWidths,cell,
+                StyleSheet::Length(raw,availableWidth,viewportWidth,0),nullptr);
+    }
+    if(!fixed)for(const auto& cell:model.cells)
+        distributeDeficit(preferredWidths,cell,NaturalWidth(*cell.box),&explicitWidths);
+
+    std::vector<float> result=explicitWidths;
+    float assigned=0,preferred=0;size_t automatic=0;
+    for(size_t column=0;column<result.size();++column){
+        assigned+=result[column];
+        if(result[column]<=0){++automatic;preferred+=preferredWidths[column];}
+    }
+    if(automatic){
+        const float remaining=std::max(0.0f,availableWidth-assigned);
+        for(size_t column=0;column<result.size();++column)if(result[column]<=0)
+            result[column]=preferred>0?remaining*preferredWidths[column]/preferred:
+                remaining/static_cast<float>(automatic);
+    }else if(assigned>0&&assigned<availableWidth){
+        const float scale=availableWidth/assigned;
+        for(auto& width:result)width*=scale;
+    }
+    return result;
+}
+
 float MinContentWidth(const LayoutBox& box){
     if(box.minimumWidthValid)return box.minimumWidth;
     auto remember=[&](float value){box.minimumWidth=value;box.minimumWidthValid=true;return value;};
@@ -1387,7 +1563,13 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
     else if(!box.children.empty()){
         const auto display=box.style.Get(L"display");const float rowGap=GapValue(box.style,false,availableWidth,availableWidth);
         auto padding=EdgeValues(box.style,L"padding",availableWidth,availableWidth);auto border=BorderValues(box.style);const float innerWidth=std::max(1.0f,availableWidth-padding.left-padding.right-border.left-border.right);
-        if(display==L"grid"){
+        if(display==L"table"){
+            auto& mutableBox=const_cast<LayoutBox&>(box);
+            const auto model=BuildTableGrid(mutableBox);
+            const auto columns=ResolveTableColumns(box,model,innerWidth,availableWidth);
+            const auto rows=ResolveTableRows(model,columns);
+            for(const auto rowHeight:rows)value+=rowHeight;
+        }else if(display==L"grid"){
             value=NaturalGridHeight(box,innerWidth);
         }else{
             const bool flex=display==L"flex"||display==L"inline-flex";
@@ -1478,6 +1660,34 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
     // measurement. Resolve them later from a definite containing block rather
     // than from this routine's measurement fallback.
     value=ConstrainIntrinsicHeight(box.style,value,500);auto margin=EdgeValues(box.style,L"margin",availableWidth,availableWidth);return remember(value+margin.top+margin.bottom);
+}
+
+std::vector<float> ResolveTableRows(const TableGridModel& model,
+                                    const std::vector<float>& columns){
+    std::vector<float> rows(model.rows.size(),20.0f);
+    for(size_t row=0;row<model.rows.size();++row){
+        const auto raw=Trim(model.rows[row].box->style.Get(L"height"));
+        if(!raw.empty()&&raw!=L"auto"&&raw.find(L'%')==std::wstring::npos)
+            rows[row]=std::max(rows[row],StyleSheet::Length(raw,500,500,0));
+    }
+    auto cellWidth=[&](const TableCellEntry& cell){
+        float width=0;
+        const size_t end=std::min(columns.size(),cell.column+cell.columnSpan);
+        for(size_t column=cell.column;column<end;++column)width+=columns[column];
+        return width;
+    };
+    for(const auto& cell:model.cells)if(cell.rowSpan==1&&cell.row<rows.size())
+        rows[cell.row]=std::max(rows[cell.row],NaturalHeight(*cell.box,cellWidth(cell)));
+    for(const auto& cell:model.cells)if(cell.rowSpan>1&&cell.row<rows.size()){
+        const size_t end=std::min(rows.size(),cell.row+cell.rowSpan);
+        float current=0;
+        for(size_t row=cell.row;row<end;++row)current+=rows[row];
+        const float deficit=NaturalHeight(*cell.box,cellWidth(cell))-current;
+        if(deficit<=0||end<=cell.row)continue;
+        const float share=deficit/static_cast<float>(end-cell.row);
+        for(size_t row=cell.row;row<end;++row)rows[row]+=share;
+    }
+    return rows;
 }
 
 LayoutRect PositionedRect(const LayoutBox& box,const LayoutRect& area,float viewportWidth,float viewportHeight){
@@ -2344,7 +2554,7 @@ void ShiftStickyFlow(LayoutBox& box,float dy){if(!box.containsSticky)return;if(b
 void ApplySticky(LayoutBox& box,float clipTop,float viewportHeight){
     if(box.style.Is(L"position",L"sticky")){if(!box.stickyFlowYValid){box.stickyFlowY=box.rect.y;box.stickyFlowYValid=true;}const float top=StyleSheet::Length(box.style.Get(L"top",L"0"),viewportHeight,viewportHeight,0),desired=std::max(box.stickyFlowY,clipTop+top);if(std::abs(box.rect.y-desired)>0.001f)TranslateBox(box,0,desired-box.rect.y);}
     for(auto& child:box.children)if(child->containsSticky)ApplySticky(*child,clipTop,viewportHeight);
-    if(box.node->tag==L"tr"||box.node->tag==L"thead"||box.node->tag==L"tbody"||box.node->tag==L"tfoot"){bool found=false;float left=0,top=0,right=0,bottom=0;for(const auto& child:box.children)if(child->visible&&child->rect.width>0&&child->rect.height>0){if(!found){left=child->rect.x;top=child->rect.y;right=child->rect.x+child->rect.width;bottom=child->rect.y+child->rect.height;found=true;}else{left=std::min(left,child->rect.x);top=std::min(top,child->rect.y);right=std::max(right,child->rect.x+child->rect.width);bottom=std::max(bottom,child->rect.y+child->rect.height);}}if(found){box.rect={left,top,right-left,bottom-top};box.content=box.rect;}}
+    if(HasTableDisplay(box,L"table-row")||IsTableRowGroup(box)){bool found=false;float left=0,top=0,right=0,bottom=0;for(const auto& child:box.children)if(child->visible&&child->rect.width>0&&child->rect.height>0){if(!found){left=child->rect.x;top=child->rect.y;right=child->rect.x+child->rect.width;bottom=child->rect.y+child->rect.height;found=true;}else{left=std::min(left,child->rect.x);top=std::min(top,child->rect.y);right=std::max(right,child->rect.x+child->rect.width);bottom=std::max(bottom,child->rect.y+child->rect.height);}}if(found){box.rect={left,top,right-left,bottom-top};box.content=box.rect;}}
 }
 
 void ApplyScrollOffset(LayoutBox& box,float oldScrollTop,float viewportHeight){
@@ -3441,25 +3651,60 @@ void LayoutEngine::LayoutGrid(LayoutBox& box,bool definiteWidth,bool definiteHei
 }
 
 void LayoutEngine::LayoutTable(LayoutBox& box){
-    std::vector<LayoutBox*> rows;std::function<void(LayoutBox&)> find=[&](LayoutBox& b){if(b.node->tag==L"tr")rows.push_back(&b);else for(auto& c:b.children)find(*c);};for(auto& c:box.children)find(*c);
-    auto span=[](const std::shared_ptr<Node>& node){
-        const auto raw=Trim(node->Attribute(L"colspan"));
-        if(raw.empty())return size_t{1};
-        size_t value=0;
-        for(const wchar_t c:raw){
-            if(c<L'0'||c>L'9'||value>(static_cast<size_t>(-1)-9)/10)return size_t{1};
-            value=value*10+static_cast<size_t>(c-L'0');
-        }
-        return std::max<size_t>(1,value);
-    };
-    size_t count=0;for(auto* r:rows){size_t n=0;for(auto& c:r->children)if(c->node->tag==L"td"||c->node->tag==L"th")n+=span(c->node);count=std::max(count,n);}if(count==0){LayoutBlock(box);return;}
-    std::vector<float> columnWidths;std::function<void(const std::shared_ptr<Node>&)> findCols=[&](const std::shared_ptr<Node>& n){if(n->tag==L"col"){auto it=n->inlineStyle.find(L"width");columnWidths.push_back(it==n->inlineStyle.end()?0:StyleSheet::Length(it->second,box.content.width,viewportWidth_,0));}else for(auto& c:n->children)findCols(c);};findCols(box.node);columnWidths.resize(count,0);std::vector<float> preferredWidths(count,0);
-    const bool fixedColumns=box.style.Is(L"table-layout",L"fixed");
-    for(auto* row:rows){size_t column=0;for(auto& cell:row->children)if(cell->node->tag==L"td"||cell->node->tag==L"th"){const size_t cellSpan=std::min(span(cell->node),count-column);const auto raw=cell->style.Get(L"width");if(cellSpan==1){if(!raw.empty()&&raw!=L"auto")columnWidths[column]=std::max(columnWidths[column],StyleSheet::Length(raw,box.content.width,viewportWidth_,0));else if(!fixedColumns)preferredWidths[column]=std::max(preferredWidths[column],NaturalWidth(*cell));}column+=cellSpan;if(column>=count)break;}if(fixedColumns)break;}
-    float assigned=0,preferredTotal=0;int automatic=0;for(size_t i=0;i<columnWidths.size();++i){assigned+=columnWidths[i];if(columnWidths[i]<=0){++automatic;preferredTotal+=preferredWidths[i];}}if(automatic){const float remaining=std::max(0.0f,box.content.width-assigned);for(size_t i=0;i<columnWidths.size();++i)if(columnWidths[i]<=0)columnWidths[i]=preferredTotal>0?remaining*preferredWidths[i]/preferredTotal:remaining/automatic;}else if(assigned>0&&assigned<box.content.width){const float scale=box.content.width/assigned;for(auto& w:columnWidths)w*=scale;}
-    float y=box.content.y;
-    for(auto* row:rows){float rowHeight=0;size_t measureColumn=0;for(auto& cell:row->children)if(cell->node->tag==L"td"||cell->node->tag==L"th"){const size_t cellSpan=std::min(span(cell->node),count-measureColumn);float cellWidth=0;for(size_t i=0;i<cellSpan;++i)cellWidth+=columnWidths[measureColumn+i];rowHeight=std::max(rowHeight,NaturalHeight(*cell,cellWidth));measureColumn+=cellSpan;if(measureColumn>=count)break;}rowHeight=std::max(20.0f,rowHeight);row->rect={box.content.x,y,box.content.width,rowHeight};row->content=row->rect;float x=box.content.x;size_t column=0;for(auto& cell:row->children)if(cell->node->tag==L"td"||cell->node->tag==L"th"){const size_t cellSpan=std::min(span(cell->node),count-column);float w=0;for(size_t i=0;i<cellSpan;++i)w+=columnWidths[column+i];LayoutBoxTree(*cell,{x,y,w,rowHeight},true);x+=w;column+=cellSpan;if(column>=count)break;}y+=rowHeight;}
-    std::function<bool(LayoutBox&,LayoutRect&)> fitGroups=[&](LayoutBox& current,LayoutRect& bounds){bool found=false;float left=0,top=0,right=0,bottom=0;if(current.node->tag==L"tr"){bounds=current.rect;return true;}for(auto& child:current.children){LayoutRect childBounds;if(!fitGroups(*child,childBounds))continue;if(!found){left=childBounds.x;top=childBounds.y;right=childBounds.x+childBounds.width;bottom=childBounds.y+childBounds.height;found=true;}else{left=std::min(left,childBounds.x);top=std::min(top,childBounds.y);right=std::max(right,childBounds.x+childBounds.width);bottom=std::max(bottom,childBounds.y+childBounds.height);}}if(found&&(current.node->tag==L"thead"||current.node->tag==L"tbody"||current.node->tag==L"tfoot")){current.rect={left,top,right-left,bottom-top};current.content=current.rect;}if(found)bounds={left,top,right-left,bottom-top};return found;};LayoutRect ignored;for(auto& child:box.children)fitGroups(*child,ignored);
+    const auto model=BuildTableGrid(box);
+    if(!model.columnCount||model.rows.empty()){LayoutBlock(box);return;}
+    const auto columns=ResolveTableColumns(box,model,box.content.width,viewportWidth_);
+    auto rows=ResolveTableRows(model,columns);
+    float rowsHeight=0;for(const auto height:rows)rowsHeight+=height;
+    if(rowsHeight>0&&box.content.height>rowsHeight+0.01f){
+        const float share=(box.content.height-rowsHeight)/static_cast<float>(rows.size());
+        for(auto& height:rows)height+=share;
+    }
+
+    std::vector<float> x(columns.size()),y(rows.size());
+    float position=box.content.x;
+    for(size_t column=0;column<columns.size();++column){
+        x[column]=position;position+=columns[column];
+    }
+    position=box.content.y;
+    for(size_t row=0;row<rows.size();++row){
+        y[row]=position;
+        auto* rowBox=model.rows[row].box;
+        rowBox->rect={box.content.x,position,box.content.width,rows[row]};
+        rowBox->content=rowBox->rect;
+        position+=rows[row];
+    }
+    for(const auto& cell:model.cells){
+        if(cell.row>=rows.size()||cell.column>=columns.size())continue;
+        float width=0,height=0;
+        for(size_t column=cell.column;
+            column<std::min(columns.size(),cell.column+cell.columnSpan);++column)
+            width+=columns[column];
+        for(size_t row=cell.row;row<std::min(rows.size(),cell.row+cell.rowSpan);++row)
+            height+=rows[row];
+        LayoutBoxTree(*cell.box,{x[cell.column],y[cell.row],width,height},true);
+    }
+    std::function<bool(LayoutBox&,LayoutRect&)> fitGroups=
+        [&](LayoutBox& current,LayoutRect& bounds){
+            if(&current!=&box&&HasTableDisplay(current,L"table"))return false;
+            if(HasTableDisplay(current,L"table-row")){bounds=current.rect;return true;}
+            bool found=false;float left=0,top=0,right=0,bottom=0;
+            for(auto& child:current.children){
+                LayoutRect childBounds;if(!fitGroups(*child,childBounds))continue;
+                if(!found){left=childBounds.x;top=childBounds.y;
+                    right=childBounds.x+childBounds.width;
+                    bottom=childBounds.y+childBounds.height;found=true;}
+                else{left=std::min(left,childBounds.x);top=std::min(top,childBounds.y);
+                    right=std::max(right,childBounds.x+childBounds.width);
+                    bottom=std::max(bottom,childBounds.y+childBounds.height);}
+            }
+            if(found&&IsTableRowGroup(current)){
+                current.rect={left,top,right-left,bottom-top};current.content=current.rect;
+            }
+            if(found)bounds={left,top,right-left,bottom-top};
+            return found;
+        };
+    LayoutRect ignored;for(auto& child:box.children)fitGroups(*child,ignored);
 }
 
 void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory){if(!root_||!target||!factory)return;PaintStackingContext(target,factory,*root_,{0,0,viewportWidth_,viewportHeight_});}
@@ -3489,7 +3734,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     PaintInsetBoxShadows(target,box.style,box.rect,viewportWidth_);
     const auto borders=BorderValues(box.style);const bool uniform=borders.top==borders.right&&borders.top==borders.bottom&&borders.top==borders.left;
     bool collapsedTableCell=false;
-    if(box.node->tag==L"th"||box.node->tag==L"td")for(auto* ancestor=box.parent;ancestor;ancestor=ancestor->parent)if(ancestor->node->tag==L"table"){collapsedTableCell=ancestor->style.Is(L"border-collapse",L"collapse");break;}
+    if(HasTableDisplay(box,L"table-cell"))for(auto* ancestor=box.parent;ancestor;ancestor=ancestor->parent)if(HasTableDisplay(*ancestor,L"table")){collapsedTableCell=ancestor->style.Is(L"border-collapse",L"collapse");break;}
     if(uniform&&borders.top>0){auto color=BorderColor(box.style,L"top");target->CreateSolidColorBrush(D2DColor(color),&brush);const float inset=borders.top/2;auto rect=D2D1::RectF(std::round(box.rect.x)+inset,std::round(box.rect.y)+inset,std::round(box.rect.x+box.rect.width)-inset,std::round(box.rect.y+box.rect.height)-inset);if(radius.x>0&&radius.y>0){const float strokeRadiusX=std::max(0.0f,radius.x-inset),strokeRadiusY=std::max(0.0f,radius.y-inset);target->DrawRoundedRectangle(D2D1::RoundedRect(rect,strokeRadiusX,strokeRadiusY),brush.Get(),borders.top);}else target->DrawRectangle(rect,brush.Get(),borders.top);}
     else{
         FLOAT dpiX=USER_DEFAULT_SCREEN_DPI,dpiY=USER_DEFAULT_SCREEN_DPI;target->GetDpi(&dpiX,&dpiY);

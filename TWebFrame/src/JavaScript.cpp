@@ -1840,7 +1840,7 @@ struct RuntimeCore {
             if(key==L"disabled")return Value::Bool(node->disabled);
             if(key==L"hidden")return Value::Bool(node->attributes.count(L"hidden")!=0);
             if(key==L"open")return Value::Bool(node->attributes.count(L"open")!=0);
-            if(key==L"title"||key==L"type"||key==L"draggable"||key==L"colSpan"||key==L"returnValue")return key==L"draggable"?Value::Bool(node->Attribute(L"draggable")==L"true"):Value::String(node->Attribute(key==L"colSpan"?L"colspan":ToLower(key)));
+            if(key==L"title"||key==L"type"||key==L"draggable"||key==L"colSpan"||key==L"rowSpan"||key==L"returnValue")return key==L"draggable"?Value::Bool(node->Attribute(L"draggable")==L"true"):Value::String(node->Attribute(key==L"colSpan"?L"colspan":(key==L"rowSpan"?L"rowspan":ToLower(key))));
             if(key==L"scrollTop")return Value::Number(node->scrollTop);
             if(key==L"clientHeight"||key==L"clientWidth"||key==L"scrollHeight"){
                 const auto g=geometryProvider?geometryProvider(node):JavaScriptRuntime::NodeGeometry{};
@@ -1986,7 +1986,7 @@ struct RuntimeCore {
                 if(key==L"selectionStart")n->selectionStart=position;else n->selectionEnd=position;
                 if(selectionSetter)selectionSetter(n,n->selectionStart,n->selectionEnd);return;
             }
-            else if(key==L"title"||key==L"type"||key==L"lang"||key==L"colSpan"||key==L"returnValue")n->SetAttribute(key==L"colSpan"?L"colspan":ToLower(key),String(v));
+            else if(key==L"title"||key==L"type"||key==L"lang"||key==L"colSpan"||key==L"rowSpan"||key==L"returnValue")n->SetAttribute(key==L"colSpan"?L"colspan":(key==L"rowSpan"?L"rowspan":ToLower(key)),String(v));
             else if(key==L"draggable")n->SetAttribute(L"draggable",Truth(v)?L"true":L"false");
             else if(key==L"hidden"||key==L"open"){if(Truth(v))n->SetAttribute(key,L"");else n->RemoveAttribute(key);Mutated();return;}
             else if(key==L"scrollTop"){n->scrollTop=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}

@@ -196,6 +196,7 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
     else if (node->tag == L"table") display = L"table";
     else if (node->tag == L"thead") display = L"table-header-group";
     else if (node->tag == L"tbody") display = L"table-row-group";
+    else if (node->tag == L"tfoot") display = L"table-footer-group";
     else if (node->tag == L"tr") display = L"table-row";
     else if (node->tag == L"td" || node->tag == L"th") display = L"table-cell";
     else if (node->tag == L"head" || node->tag == L"style" || node->tag == L"script" || node->tag == L"meta" || node->tag == L"title" || node->tag == L"col" || node->tag == L"colgroup" || node->tag == L"option" || node->tag == L"datalist" || node->tag == L"template" || (node->tag == L"dialog" && !node->attributes.count(L"open")) || node->attributes.count(L"hidden")) display = L"none";
