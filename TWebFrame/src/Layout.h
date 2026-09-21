@@ -35,7 +35,7 @@ struct LayoutBox {
     // Cache it after layout instead of rebuilding and sorting a temporary
     // vector for every frame and pointer event.
     std::vector<LayoutBox*> paintChildren;
-    std::vector<LayoutBox*> positiveStackingContexts;
+    std::vector<LayoutBox*> nonNegativeStackingContexts;
     std::vector<LayoutBox*> verticallyOrderedChildren;
     std::vector<LayoutBox*> overlayChildren;
     bool visible = true;

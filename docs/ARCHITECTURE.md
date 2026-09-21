@@ -1,6 +1,6 @@
 # TWebFrame Architecture
 
-TWebFrame 0.2 is a Windows-native HTML UI runtime for C and C++ hosts. It follows a browser-like processing pipeline within a deliberately smaller scope:
+TWebFrame 0.3 is a Windows-native HTML UI runtime for C and C++ hosts. It follows a browser-like processing pipeline within a deliberately smaller scope:
 
 1. `DOM.cpp` tokenizes HTML and builds the document tree, attributes, entities, and fragments.
 2. `CSS.cpp` parses rules, matches selectors, calculates specificity and cascade order, resolves inheritance and custom properties, and tracks media-query state.
@@ -30,7 +30,7 @@ The bridge name is compatible with existing local pages, but no WebView2 compone
 
 ## Document lifecycle
 
-Page loading is synchronous in version 0.2:
+Page loading is synchronous in version 0.3:
 
 1. Parse the HTML document.
 2. Resolve host-provided external stylesheets and scripts.
@@ -39,7 +39,7 @@ Page loading is synchronous in version 0.2:
 5. Dispatch `DOMContentLoaded`.
 6. Notify the C++ load handler.
 
-DOM and inline-style mutations invalidate style or layout state. The next paint recalculates the required shared engine state. Viewport-only size changes can reuse the layout and text caches when no media-query boundary is crossed. Dirty-subtree layout and browser-scale incremental rendering are not goals of version 0.2.
+DOM and inline-style mutations invalidate style or layout state. The next paint recalculates the required shared engine state. Viewport-only size changes can reuse the layout and text caches when no media-query boundary is crossed. Dirty-subtree layout and browser-scale incremental rendering are not goals of version 0.3.
 
 ## DOM model
 

@@ -255,6 +255,7 @@ struct View::Impl {
     bool selectPopupScrollDragging=false;
     float selectPopupScrollDragOffset=0;
     std::shared_ptr<Node> editingNode;
+    bool textSelectionDragging=false;
     size_t selectionAnchor=0;
     size_t caretPosition=0;
     bool caretVisible=true;
@@ -343,7 +344,7 @@ struct View::Impl {
         });
         javascript.SetSelectionProvider([this](const std::shared_ptr<Node>& node,size_t& start,size_t& end){
             if(!IsTextControl(node))return false;
-            if(node==focused&&editingNode==node){start=selectionAnchor;end=caretPosition;}
+            if(node==focused&&editingNode==node){start=std::min(selectionAnchor,caretPosition);end=std::max(selectionAnchor,caretPosition);}
             else{start=node->selectionStart;end=node->selectionEnd;}
             return true;
         });
@@ -761,7 +762,10 @@ struct View::Impl {
         else editingNode->SetAttribute(L"value",value);
     }
     void StoreControlSelection(){
-        if(IsTextControl(focused)){focused->selectionStart=selectionAnchor;focused->selectionEnd=caretPosition;}
+        if(IsTextControl(focused)){
+            focused->selectionStart=std::min(selectionAnchor,caretPosition);
+            focused->selectionEnd=std::max(selectionAnchor,caretPosition);
+        }
     }
     std::shared_ptr<Node> FirstEditableText(const std::shared_ptr<Node>& parent)const{
         if(!parent)return {};
@@ -803,6 +807,17 @@ struct View::Impl {
         }
         StoreControlSelection();
         textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();
+    }
+    bool UpdateTextSelectionAt(float x,float y){
+        if(!textSelectionDragging||!editingNode||!focused)return false;
+        if(layoutDirty)Rebuild();
+        std::shared_ptr<Node> hitNode;size_t hitOffset=0;
+        const auto scope=IsTextControl(focused)?focused:editingNode;
+        if(!layout.HitTestText(scope,x,y,hitNode,hitOffset)||hitNode!=editingNode)return false;
+        const auto next=std::min(hitOffset,EditingValue().size());
+        if(caretPosition==next)return true;
+        caretPosition=next;StoreControlSelection();
+        textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();return true;
     }
     bool CanBlinkCaret()const{
         return hwnd&&editingNode&&focused&&GetFocus()==hwnd&&
@@ -1566,13 +1581,25 @@ struct View::Impl {
                 CloseSelectPopup();
             }
             if(layout.BeginScrollbarInteraction(x,y,scrollbarDragNode,scrollbarDragOffset)){if(scrollbarDragNode)SetCapture(hwnd);else javascript.DispatchNodeEvent(layout.HitTest(x,y),L"scroll");if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);return 0;}
-            SetFocus(hwnd);auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=1;if(javascript.DispatchNodeEvent(target,L"pointerdown",pointer))return 0;Activate(target,x,y);return 0;
+            SetFocus(hwnd);auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=1;if(javascript.DispatchNodeEvent(target,L"pointerdown",pointer))return 0;Activate(target,x,y);
+            if(editingNode&&focused&&FocusTarget(target)==focused&&
+               (IsTextControl(focused)||IsContentEditable(focused))){
+                textSelectionDragging=true;SetCapture(hwnd);
+            }
+            return 0;
         }
         case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=2;javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
         case WM_LBUTTONUP:
             if(selectPopupScrollDragging){selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
-            if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}break;
-        case WM_CAPTURECHANGED:selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;return 0;
+            if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
+            if(textSelectionDragging){
+                const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam)));
+                const float y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));
+                UpdateTextSelectionAt(x,y);textSelectionDragging=false;
+                if(GetCapture()==hwnd)ReleaseCapture();return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;return 0;
         case WM_MOUSEWHEEL:{
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
@@ -1590,6 +1617,7 @@ struct View::Impl {
                 if(std::abs(previous-selectPopupScrollOffset)>0.01f)InvalidateRect(hwnd,nullptr,FALSE);
             }return 0;}
             if(scrollbarDragNode){if(layout.DragScrollbar(scrollbarDragNode,y,scrollbarDragOffset)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
+            if(textSelectionDragging){UpdateTextSelectionAt(x,y);return 0;}
             if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y))return 0;}
             auto n=layout.HitTest(x,y);if(n!=hovered){layoutDirty=SetHoveredNode(n);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
@@ -1641,13 +1669,13 @@ struct View::Impl {
         case WM_UNDO:ApplyHistory(false);return 0;
         case WM_CHAR:if(textInput.IsComposing())return 0;else if(CanEditText()){if(wParam==VK_BACK)Backspace();else if(wParam==L'\r'){if(!IsTextInput(focused))ReplaceSelection(L"\n",L"insertLineBreak");}else if(wParam>=32&&wParam!=127)ReplaceSelection(std::wstring(1,static_cast<wchar_t>(wParam)));return 0;}break;
         case WM_UNICHAR:if(wParam==UNICODE_NOCHAR)return TRUE;else if(CanEditText()&&wParam>=32&&wParam<=0x10ffff){std::wstring text;if(wParam<=0xffff)text.push_back(static_cast<wchar_t>(wParam));else{const auto value=static_cast<unsigned>(wParam)-0x10000;text.push_back(static_cast<wchar_t>(0xd800+(value>>10)));text.push_back(static_cast<wchar_t>(0xdc00+(value&0x3ff)));}ReplaceSelection(text);return 0;}break;
-        case WM_KILLFOCUS:CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return 0;
+        case WM_KILLFOCUS:textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return 0;
         case WM_SETCURSOR:{POINT screenPoint{};GetCursorPos(&screenPoint);const LRESULT parentHit=ParentResizeHit(screenPoint);if(const HCURSOR resize=ResizeCursor(parentHit)){SetCursor(resize);return TRUE;}const UINT hit=LOWORD(lParam);
             if(const HCURSOR resize=ResizeCursor(hit)){SetCursor(resize);return TRUE;}
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
         case WM_DESTROY:KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
-        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();
         for(const auto& link:document.QuerySelectorAll(L"link[rel='stylesheet']")){
             std::wstring external;if(LoadTextResource(link->Attribute(L"href"),external))css+=external+L"\n";

@@ -2,6 +2,19 @@
 
 This document records user-visible changes cumulatively by released version. Add each new release above the previous entries.
 
+## 0.3 - 2026-09-21
+
+### Added
+
+- Added multiline `flex-wrap` and `wrap-reverse` layout with per-line sizing, alignment, gaps, and intrinsic-height calculation.
+- Added inline HTML event-attribute dispatch with the current element as `this`, an `event` argument, bubbling behavior, and `return false` cancellation.
+- Added pointer-drag text selection for editable controls, including normalized DOM selection ranges and DPI-aware clipboard workflows.
+
+### Improved
+
+- Improved sticky table-header painting, hit testing, and scrollbar interaction by including zero-index stacking contexts in non-negative stacking order.
+- Added focused regression projects for flex wrapping, inline events, sticky table headers, and pointer text selection.
+
 ## 0.2 - 2026-09-20
 
 ### Added

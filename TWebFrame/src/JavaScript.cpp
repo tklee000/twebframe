@@ -2409,6 +2409,29 @@ struct RuntimeCore {
             if(error)*error=lastError;return false;
         }
     }
+    void DispatchInlineEventHandler(const std::shared_ptr<Node>& current,
+                                    const std::wstring& eventName,
+                                    const Value& eventValue,
+                                    const std::shared_ptr<Object>& event){
+        if(!current)return;
+        const auto source=current->Attribute(L"on"+ToLower(eventName));
+        if(source.empty())return;
+        try{
+            // HTML event attributes execute as functions whose `this` value and
+            // event argument are the element currently handling the event. Keep
+            // this in the shared dispatcher so inline handlers and listeners see
+            // the same target/currentTarget state during bubbling.
+            Compiler compiler(module,L"(function(event){\n"+source+L"\n})");
+            const auto callback=Run(compiler.CompileExpressionOnly(),global);
+            const auto result=Deref(Call(callback,NodeValue(current),{eventValue}));
+            if(result.type==Value::Type::Boolean&&!result.boolean)
+                event->props[L"defaultPrevented"]=Value::Bool(true);
+        }catch(const JavaScriptException& exception){
+            lastError=L"Uncaught "+String(exception.value);
+        }catch(const std::exception& exception){
+            lastError=Utf8ToWide(exception.what());
+        }
+    }
     bool Dispatch(const std::shared_ptr<Node>& node,const std::wstring& eventName,
                   const std::vector<Node::FileInfo>* droppedFiles=nullptr,
                   const JavaScriptRuntime::EventInit& init={}){
@@ -2425,9 +2448,13 @@ struct RuntimeCore {
             event->props[L"dataTransfer"]=transfer;}
         auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
         auto stopped=[&](const wchar_t* property){const auto found=event->props.find(property);return found!=event->props.end()&&Truth(found->second);};
-        if(node){for(auto current=node;current&&!stopped(L"$propagationStopped");current=current->parent.lock()){event->props[L"currentTarget"]=NodeValue(current);auto a=listeners.find(current.get());if(a!=listeners.end()){auto b=a->second.find(eventName);if(b!=a->second.end())for(auto& callback:b->second){Call(callback,NodeValue(current),{eventValue});if(stopped(L"$immediateStopped"))break;}}}}
+        if(node){for(auto current=node;current&&!stopped(L"$propagationStopped");current=current->parent.lock()){
+            event->props[L"currentTarget"]=NodeValue(current);
+            DispatchInlineEventHandler(current,eventName,eventValue,event);
+            if(stopped(L"$immediateStopped"))break;
+            auto a=listeners.find(current.get());if(a!=listeners.end()){auto b=a->second.find(eventName);if(b!=a->second.end())for(auto& callback:b->second){Call(callback,NodeValue(current),{eventValue});if(stopped(L"$immediateStopped"))break;}}
+        }}
         if(!stopped(L"$propagationStopped")){event->props[L"currentTarget"]=ObjectValue(ObjectKind::Document);auto documentCallbacks=documentListeners.find(eventName);if(documentCallbacks!=documentListeners.end())for(auto& callback:documentCallbacks->second){Call(callback,ObjectValue(ObjectKind::Document),{eventValue});if(stopped(L"$immediateStopped"))break;}}
-        if(node&&eventName==L"click"){const auto inlineCode=node->Attribute(L"onclick");if(!inlineCode.empty())CompileRun(inlineCode,nullptr,nullptr);}
         DrainMicrotasks();
         return stopped(L"defaultPrevented");
     }
