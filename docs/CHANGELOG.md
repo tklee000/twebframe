@@ -2,6 +2,23 @@
 
 This document records user-visible changes cumulatively by released version. Add each new release above the previous entries.
 
+## 0.7 - 2026-09-23
+
+### Added
+
+- Added a reusable Canvas 2D subset with paths, fills, strokes, gradients, text, transforms, and DPI-independent compositing.
+- Added common-engine regression coverage for form controls at 100% and 150% DPI, canvas rendering, table spans, inline events, and heap/GUI-resource teardown.
+
+### Improved
+
+- Extended shared JavaScript, DOM, CSS, and layout behavior used by application navigation and settings views, including named functions, location/dialog behavior, dynamic script execution, SVG data-URL backgrounds, and table spanning.
+- Matched standard checkbox and radio control states, including `appearance: none`, checked, unchecked, disabled, and indeterminate rendering without page- or ID-specific rules.
+
+### Fixed
+
+- Released cyclic JavaScript graphs, timers, callbacks, node wrappers, canvas contexts, and detached-node listener entries during reload and teardown.
+- Disconnected UI Automation providers and released accessibility, layout-thread, render-target, and child-frame resources when a view is destroyed.
+
 ## 0.6 - 2026-09-22
 
 ### Added

@@ -3,11 +3,18 @@
 #include "JavaScript.h"
 #include "Layout.h"
 
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <string>
 
 using namespace TWebFrame::Internal;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -22,6 +29,126 @@ void CheckNear(float actual,float expected,const wchar_t* message){
         std::wcerr<<L"FAIL: "<<message<<L" (actual "<<actual<<L", expected "<<expected<<L")\n";
         ++failures;
     }
+}
+
+void CheckImplicitDocumentStructure(){
+    std::wstring error;
+    Document document;
+    Check(document.Parse(
+        L"<!doctype html><meta charset='utf-8'><title>Cards</title>"
+        L"<style>table{width:100%}</style><h2 id='heading'>Cards</h2>"
+        L"<table id='cards'><tbody><tr><td>One</td></tr></tbody></table>"
+        L"<script>window.loaded=true;</script>",
+        &error),error.c_str());
+
+    const auto html=document.QuerySelector(L"html");
+    const auto head=document.QuerySelector(L"head");
+    const auto body=document.Body();
+    const auto heading=document.GetElementById(L"heading");
+    const auto cards=document.GetElementById(L"cards");
+    Check(html&&head&&body,L"omitted html, head, and body tags are synthesized");
+    Check(html&&html->parent.lock()==document.Root(),L"the synthesized html element owns the document tree");
+    Check(head&&document.QuerySelector(L"meta")->parent.lock()==head&&
+          document.QuerySelector(L"title")->parent.lock()==head&&
+          document.QuerySelector(L"style")->parent.lock()==head,
+          L"leading metadata is placed in the synthesized head");
+    Check(body&&heading&&cards&&heading->parent.lock()==body&&cards->parent.lock()==body&&
+          document.QuerySelector(L"script")->parent.lock()==body,
+          L"rendered content and following scripts are placed in the synthesized body");
+
+    StyleSheet styles;
+    Check(styles.Parse(document.StyleText(),&error),error.c_str());
+    LayoutEngine layout(document,styles);
+    layout.Layout(500.0f,300.0f,1.0f);
+    const auto* bodyBox=layout.BoxFor(body);
+    const auto* tableBox=layout.BoxFor(cards);
+    Check(bodyBox&&tableBox,L"the synthesized body and its content are laid out");
+    if(bodyBox&&tableBox){
+        CheckNear(bodyBox->rect.x,8.0f,L"the default body left margin is applied");
+        CheckNear(bodyBox->rect.width,484.0f,L"the default body margins reduce the containing width");
+        CheckNear(tableBox->rect.x,8.0f,L"full-width content begins at the body content edge");
+        CheckNear(tableBox->rect.width,484.0f,L"percentage width resolves inside the body margins");
+    }
+}
+
+void CheckCollapsedBorderRaster(float scale){
+    const wchar_t* html=LR"HTML(
+        <style>
+            html,body { margin:0; padding:0; }
+            table { width:80px; border-collapse:collapse; table-layout:fixed; }
+            td { width:40px; height:20px; padding:0; border:1px solid #ccc; }
+        </style>
+        <table><tbody><tr><td></td><td></td></tr><tr><td></td><td></td></tr></tbody></table>
+    )HTML";
+    std::wstring error;
+    Document document;Check(document.Parse(html,&error),error.c_str());
+    StyleSheet styles;Check(styles.Parse(document.StyleText(),&error),error.c_str());
+    LayoutEngine layout(document,styles);layout.Layout(80.0f,40.0f,scale);
+
+    const auto pixelWidth=static_cast<UINT>(std::lround(80.0f*scale));
+    const auto pixelHeight=static_cast<UINT>(std::lround(40.0f*scale));
+    ComPtr<IWICImagingFactory> wicFactory;
+    ComPtr<IWICBitmap> bitmap;
+    ComPtr<ID2D1Factory> d2dFactory;
+    ComPtr<ID2D1RenderTarget> target;
+    ComPtr<IDWriteFactory> writeFactory;
+    const bool resources=
+        SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&wicFactory)))&&
+        SUCCEEDED(wicFactory->CreateBitmap(pixelWidth,pixelHeight,
+            GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad,&bitmap))&&
+        SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                    d2dFactory.ReleaseAndGetAddressOf()))&&
+        SUCCEEDED(d2dFactory->CreateWicBitmapRenderTarget(bitmap.Get(),
+            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                  D2D1_ALPHA_MODE_PREMULTIPLIED),
+                USER_DEFAULT_SCREEN_DPI*scale,USER_DEFAULT_SCREEN_DPI*scale),
+            &target))&&
+        SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf())));
+    Check(resources,L"collapsed-border raster resources are created");
+    if(!resources)return;
+
+    target->BeginDraw();
+    target->Clear(D2D1::ColorF(D2D1::ColorF::White));
+    layout.Paint(target.Get(),writeFactory.Get());
+    Check(SUCCEEDED(target->EndDraw()),L"collapsed-border fixture paints");
+
+    WICRect lockRect{0,0,static_cast<INT>(pixelWidth),static_cast<INT>(pixelHeight)};
+    ComPtr<IWICBitmapLock> lock;
+    Check(SUCCEEDED(bitmap->Lock(&lockRect,WICBitmapLockRead,&lock)),
+          L"collapsed-border pixels are readable");
+    if(!lock)return;
+    UINT stride=0,bufferSize=0;BYTE* bytes=nullptr;
+    Check(SUCCEEDED(lock->GetStride(&stride))&&
+          SUCCEEDED(lock->GetDataPointer(&bufferSize,&bytes))&&bytes,
+          L"collapsed-border pixel buffer is available");
+    if(!bytes)return;
+    const auto isBorder=[&](UINT x,UINT y){
+        const auto* pixel=bytes+y*stride+x*4;
+        return pixel[0]<240&&pixel[1]<240&&pixel[2]<240;
+    };
+    const auto countHorizontalRun=[&](int centerX,UINT y){
+        int count=0;
+        for(int x=std::max(0,centerX-4);x<=std::min<int>(pixelWidth-1,centerX+4);++x)
+            if(isBorder(static_cast<UINT>(x),y))++count;
+        return count;
+    };
+    const auto countVerticalRun=[&](UINT x,int centerY){
+        int count=0;
+        for(int y=std::max(0,centerY-4);y<=std::min<int>(pixelHeight-1,centerY+4);++y)
+            if(isBorder(x,static_cast<UINT>(y)))++count;
+        return count;
+    };
+    const auto verticalX=static_cast<int>(std::lround(40.0f*scale));
+    const auto horizontalY=static_cast<int>(std::lround(20.0f*scale));
+    const auto sampleX=static_cast<UINT>(std::lround(20.0f*scale));
+    const auto sampleY=static_cast<UINT>(std::lround(10.0f*scale));
+    Check(countHorizontalRun(verticalX,sampleY)==1,
+          L"a collapsed vertical join occupies one physical pixel");
+    Check(countVerticalRun(sampleX,horizontalY)==1,
+          L"a collapsed horizontal join occupies one physical pixel");
 }
 
 const LayoutBox* Box(const LayoutEngine& layout,const Document& document,const wchar_t* id){
@@ -155,8 +282,13 @@ void CheckScale(float scale){
 } // namespace
 
 int wmain(){
+    const auto initialized=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    CheckImplicitDocumentStructure();
     CheckScale(1.0f);
     CheckScale(1.5f);
+    CheckCollapsedBorderRaster(1.0f);
+    CheckCollapsedBorderRaster(1.5f);
+    if(SUCCEEDED(initialized))CoUninitialize();
     if(failures){std::wcerr<<failures<<L" test(s) failed\n";return 1;}
     std::wcout<<L"Table span regression tests passed at 100% and 150% scaling\n";
     return 0;

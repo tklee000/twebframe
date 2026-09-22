@@ -8,7 +8,9 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace TWebFrame::Internal {
@@ -46,6 +48,13 @@ struct AccessibilityNodeInfo {
     bool expandCollapse = false;
 };
 
+struct AccessibilityProviderRegistration {
+    std::mutex mutex;
+    IRawElementProviderSimple* provider = nullptr;
+    std::weak_ptr<Node> node;
+    bool root = false;
+};
+
 class AccessibilityHost final : public std::enable_shared_from_this<AccessibilityHost> {
 public:
     using NodePtr = std::shared_ptr<Node>;
@@ -67,6 +76,7 @@ public:
                       PointCallback point, FocusedCallback focused, ActionCallback focus,
                       ActionCallback invoke, ValueCallback setValue, ActionCallback select,
                       ActionCallback toggle, ExpandCallback expand);
+    IRawElementProviderSimple* ProviderFor(const NodePtr& node, bool root);
     void Disconnect();
     void Invalidate() noexcept { revision_.fetch_add(1,std::memory_order_relaxed); }
     unsigned long long Revision() const noexcept {
@@ -111,6 +121,11 @@ private:
     ActionCallback select_;
     ActionCallback toggle_;
     ExpandCallback expand_;
+    std::mutex providersMutex_;
+    std::vector<std::weak_ptr<AccessibilityProviderRegistration>> providers_;
+    std::weak_ptr<AccessibilityProviderRegistration> rootProvider_;
+    std::unordered_map<const Node*,std::weak_ptr<AccessibilityProviderRegistration>> nodeProviders_;
+    bool disconnected_ = false;
     std::atomic<unsigned long long> revision_{1};
 };
 

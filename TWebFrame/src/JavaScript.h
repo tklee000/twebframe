@@ -21,6 +21,7 @@ public:
     using FrameScheduler = std::function<void()>;
     using TimerScheduler = std::function<void(unsigned)>;
     using ResourceLoader = std::function<bool(const std::wstring&, std::wstring&)>;
+    using DialogSink = std::function<void(const std::wstring&)>;
     using FrameMessageSink = std::function<void(const std::shared_ptr<Node>&, const std::wstring&)>;
     using ParentMessageSink = std::function<void(const std::wstring&)>;
     using FocusSink = std::function<void(const std::shared_ptr<Node>&)>;
@@ -58,13 +59,16 @@ public:
     void SetGeometryProvider(GeometryProvider provider);
     void SetStylePropertyProvider(StylePropertyProvider provider);
     void SetResourceLoader(ResourceLoader loader);
+    void SetDialogSink(DialogSink sink);
     void SetFrameMessageSink(FrameMessageSink sink);
     void SetParentMessageSink(ParentMessageSink sink);
     void SetFocusSink(FocusSink sink);
     void SetSelectionProvider(SelectionProvider provider);
     void SetSelectionSetter(SelectionSetter setter);
     void SetViewportSize(double width, double height);
+    void SetDevicePixelRatio(double ratio);
     void SetLocation(const std::wstring& location);
+    void NavigateToFragment(const std::wstring& fragment);
     bool Load(const std::wstring& source, std::wstring* error = nullptr);
     bool Execute(const std::wstring& source, std::wstring* result = nullptr,
                  std::wstring* error = nullptr);

@@ -1,8 +1,8 @@
-# Version 0.6 Supported Subset
+# Version 0.7 Supported Subset
 
 This document records the behavior currently implemented and exercised by the TWebFrame regression suite. It is not a claim of complete HTML, CSS, DOM, Web API, accessibility, or ECMAScript conformance.
 
-TWebFrame 0.6 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
+TWebFrame 0.7 is intended for trusted HTML user interfaces owned by a C or C++ Windows application. New behavior is implemented as a reusable rule in the common JavaScript, DOM, CSS, layout, input, or accessibility engine rather than as an exception for a particular page.
 
 Unless a feature is listed here and covered by a test, applications should treat it as unsupported.
 
@@ -70,7 +70,7 @@ Shadow DOM, Custom Elements, browser observer APIs, the full Event constructor f
 - Descendant, child (`>`), adjacent-sibling (`+`), and general-sibling (`~`) combinators.
 - Comma-separated selector lists.
 - Attribute presence and `=`, `^=`, `$=`, `*=`, `~=`, and `|=` matching, including the tested ASCII-insensitive flag.
-- `:root`, `:scope`, `:checked`, `:disabled`, `:hover`, `:focus`, `:focus-visible`, and `:focus-within`.
+- `:root`, `:scope`, `:checked`, `:indeterminate`, `:disabled`, `:hover`, `:focus`, `:focus-visible`, and `:focus-within`.
 - `:first-child`, `:last-child`, `:not(...)`, `:has(...)`, `:nth-child(...)`, and `:nth-of-type(...)` for tested patterns.
 - `::before` and `::after` generated boxes.
 
@@ -83,7 +83,7 @@ Shadow DOM, Custom Elements, browser observer APIs, the full Event constructor f
 - Shorthand expansion used by the current style and layout properties.
 - Viewport `min-width`, `max-width`, `min-height`, and `max-height` media conditions.
 
-JavaScript `matchMedia()` is only a compatibility placeholder in version 0.6 and does not mirror the stylesheet engine's complete media-query state.
+JavaScript `matchMedia()` is only a compatibility placeholder in version 0.7 and does not mirror the stylesheet engine's complete media-query state.
 
 ## CSS layout and paint
 
@@ -185,14 +185,15 @@ Promise combinators do not accept every ECMAScript iterable pattern, and schedul
 
 ## Rendering and controls
 
-- Direct2D backgrounds, borders, shadows, gradients, controls, and basic SVG paint.
+- Direct2D backgrounds, borders, shadows, gradients, controls, SVG paint, and SVG data-URL backgrounds.
 - DirectWrite text measurement and drawing.
-- Checkbox, radio, button, input, textarea, select, datalist, and `contenteditable` UI needed by the tests.
+- Checkbox, radio, button, input, textarea, select, datalist, and `contenteditable` UI needed by the tests, including native checked/unchecked/indeterminate states and `appearance: none`.
+- A Canvas 2D subset with fill/stroke rectangles and paths, gradients, text, transforms, save/restore, and intrinsic backing-store scaling.
 - Pointer hit testing that follows layout, clipping, transforms, overflow, pointer-events, and stacking order for tested cases.
 - Dynamic restyle and relayout after DOM or style mutation.
 - Native select/datalist popup behavior integrated with DOM input/change events.
 
-Image decoding, canvas, WebGL, video/audio, printing, browser plug-ins, and general replaced-element rendering are not implemented.
+Image decoding, Canvas pixel/image APIs, WebGL, video/audio, printing, browser plug-ins, and general replaced-element rendering are not implemented.
 
 ## Keyboard and text input
 
@@ -207,7 +208,7 @@ Image decoding, canvas, WebGL, video/audio, printing, browser plug-ins, and gene
 - `:focus-visible`, bubbling focus events, and keyboard activation for common buttons, links, and ARIA controls.
 - Tested ARIA menu navigation with arrows, Home/End, Escape, Enter, and Space.
 
-Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.6.
+Text services other than the current IMM32 boundary and complete browser editing/selection specifications are outside version 0.7.
 
 ## Accessibility
 
@@ -230,4 +231,4 @@ The provider is a practical subset for the implemented controls, not a complete 
 - UI Automation accessibility.
 - C++17 and the Visual Studio v142 toolset in the documented build.
 
-Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.6.
+Cross-platform rendering, non-Windows window systems, mobile platforms, and browser embedding are not part of version 0.7.

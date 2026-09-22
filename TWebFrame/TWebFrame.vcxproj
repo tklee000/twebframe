@@ -27,7 +27,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="include\TWebFrame\TWebFrame.h" />
-    <ClInclude Include="src\Accessibility.h" /><ClInclude Include="src\CSS.h" /><ClInclude Include="src\DOM.h" /><ClInclude Include="src\FastMap.h" /><ClInclude Include="src\JavaScript.h" /><ClInclude Include="src\Layout.h" /><ClInclude Include="src\TextInput.h" />
+    <ClInclude Include="src\Accessibility.h" /><ClInclude Include="src\Canvas.h" /><ClInclude Include="src\CSS.h" /><ClInclude Include="src\DOM.h" /><ClInclude Include="src\FastMap.h" /><ClInclude Include="src\JavaScript.h" /><ClInclude Include="src\Layout.h" /><ClInclude Include="src\TextInput.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\Accessibility.cpp" /><ClCompile Include="src\CSS.cpp" /><ClCompile Include="src\DOM.cpp" /><ClCompile Include="src\JavaScript.cpp" /><ClCompile Include="src\Layout.cpp" /><ClCompile Include="src\TextInput.cpp" /><ClCompile Include="src\View.cpp" />

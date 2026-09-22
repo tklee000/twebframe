@@ -41,6 +41,101 @@ bool ClosesOpenParagraph(const std::wstring& tag) {
     return false;
 }
 
+bool IsMetadataElement(const std::shared_ptr<Node>& node) {
+    if (!node || node->type != NodeType::Element) return false;
+    static const wchar_t* tags[] = {
+        L"base", L"basefont", L"bgsound", L"link", L"meta", L"noframes",
+        L"style", L"template", L"title"};
+    for (const auto* candidate : tags) if (node->tag == candidate) return true;
+    return false;
+}
+
+bool IsWhitespaceText(const std::shared_ptr<Node>& node) {
+    return node && node->type == NodeType::Text && Trim(node->text).empty();
+}
+
+std::shared_ptr<Node> MakeElement(const wchar_t* tag,
+                                  const std::shared_ptr<Node>& parent) {
+    auto node = std::make_shared<Node>();
+    node->type = NodeType::Element;
+    node->tag = tag;
+    node->parent = parent;
+    return node;
+}
+
+void AppendChildren(const std::shared_ptr<Node>& parent,
+                    std::vector<std::shared_ptr<Node>> children) {
+    for (auto& child : children) {
+        child->parent = parent;
+        parent->children.push_back(std::move(child));
+    }
+}
+
+// A browser always exposes an html/head/body tree, including for HTML source
+// that omits all three optional tags.  Keeping the parser's lightweight token
+// handling and normalizing its document result here gives layout the real body
+// box (and therefore the user-agent body margin) without making fragment
+// parsing invent document-only elements.
+void NormalizeDocumentTree(const std::shared_ptr<Node>& document) {
+    if (!document || document->type != NodeType::Document) return;
+
+    std::shared_ptr<Node> html;
+    for (const auto& child : document->children)
+        if (child->type == NodeType::Element && child->tag == L"html") {
+            html = child;
+            break;
+        }
+
+    if (!html) {
+        html = MakeElement(L"html", document);
+        auto looseChildren = std::move(document->children);
+        document->children.clear();
+        document->children.push_back(html);
+        AppendChildren(html, std::move(looseChildren));
+    } else {
+        std::vector<std::shared_ptr<Node>> documentSiblings;
+        for (auto& child : document->children)
+            if (child != html) documentSiblings.push_back(std::move(child));
+        document->children.clear();
+        html->parent = document;
+        document->children.push_back(html);
+        AppendChildren(html, std::move(documentSiblings));
+    }
+
+    std::shared_ptr<Node> head;
+    std::shared_ptr<Node> body;
+    std::vector<std::shared_ptr<Node>> looseChildren;
+    for (auto& child : html->children) {
+        if (!head && child->type == NodeType::Element && child->tag == L"head") {
+            head = child;
+        } else if (!body && child->type == NodeType::Element && child->tag == L"body") {
+            body = child;
+        } else {
+            looseChildren.push_back(std::move(child));
+        }
+    }
+    html->children.clear();
+    if (!head) head = MakeElement(L"head", html);
+    if (!body) body = MakeElement(L"body", html);
+    head->parent = html;
+    body->parent = html;
+    html->children.push_back(head);
+    html->children.push_back(body);
+
+    bool bodyStarted = !body->children.empty();
+    for (auto& child : looseChildren) {
+        const bool metadata = IsMetadataElement(child);
+        if (!bodyStarted && (metadata || IsWhitespaceText(child))) {
+            child->parent = head;
+            head->children.push_back(std::move(child));
+        } else {
+            if (!IsWhitespaceText(child)) bodyStarted = true;
+            child->parent = body;
+            body->children.push_back(std::move(child));
+        }
+    }
+}
+
 void CloseOpenElement(std::vector<std::shared_ptr<Node>>& stack,
                       const std::wstring& tag) {
     size_t match = stack.size();
@@ -153,6 +248,7 @@ bool MatchSimple(const std::shared_ptr<Node>& node, std::wstring selector) {
         selector.erase(position,5);
     }
     if (!consumePseudo(L":checked", node->checked) ||
+        !consumePseudo(L":indeterminate", node->indeterminate) ||
         !consumePseudo(L":disabled", node->disabled) ||
         !consumePseudo(L":hover", node->hovered) ||
         !consumePseudo(L":focus-within", node->focusWithin||node->focused) ||
@@ -162,7 +258,9 @@ bool MatchSimple(const std::shared_ptr<Node>& node, std::wstring selector) {
         !consumePseudo(L":first-child",isEdgeChild(true)) ||
         !consumePseudo(L":last-child",isEdgeChild(false))) return false;
     if(selector.find(L":active")!=std::wstring::npos)return false;
-    selector.erase(std::remove(selector.begin(), selector.end(), L':'), selector.end());
+    // Unsupported pseudo-classes invalidate a selector. Removing only the
+    // colon would make a state rule match every element with its base selector.
+    if(selector.find(L':')!=std::wstring::npos)return false;
 
     size_t i = 0;
     if (i < selector.size() && (std::iswalpha(selector[i]) || selector[i] == L'_')) {
@@ -470,6 +568,7 @@ public:
                 stack.push_back(node);
             }
         }
+        if (!fragment) NormalizeDocumentTree(root);
         if (error) error->clear();
         return root;
     }

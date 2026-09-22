@@ -123,6 +123,61 @@ int wmain() {
               document.GetElementById(L"panel-two")->HasClass(L"active"),
           L"the same inline handler can update associated content through common DOM APIs");
 
+    javascript.SetResourceLoader([](const std::wstring& resource, std::wstring& content) {
+        if (resource == L"fragment.html") {
+            content = L"<section class='loaded-fragment'>Loaded</section>";
+            return true;
+        }
+        if (resource == L"dynamic.js") {
+            content = L"dynamicRuns += 1;";
+            return true;
+        }
+        return false;
+    });
+    std::wstring hostMessage;
+    javascript.SetMessageSink([&](const std::wstring& message) { hostMessage = message; });
+    Check(javascript.Execute(LR"JS(
+        let dynamicRuns = 0;
+        let hashEvents = 0;
+        let customDetail = '';
+        window.addEventListener('hashchange', () => hashEvents += 1);
+        window.addEventListener('host-data', e => customDetail = e.detail.value);
+        const mount = document.createElement('div');
+        document.body.appendChild(mount);
+        fetch('fragment.html').then(response => response.text()).then(html => mount.innerHTML = html);
+        const dynamicScript = document.createElement('script');
+        dynamicScript.src = 'dynamic.js';
+        dynamicScript.defer = true;
+        document.body.appendChild(dynamicScript);
+        window.dispatchEvent(new CustomEvent('host-data', { detail: { value: 'ok' } }));
+        location.hash = '#/dashboard';
+        const removedScript = document.body.removeChild(dynamicScript);
+        window.twebframe.postMessage({ type: 'login', nested: { ok: true } });
+    )JS", nullptr, &error), error.c_str());
+
+    std::wstring browserApiResult;
+    Check(javascript.Execute(
+              L"return dynamicRuns + '|' + hashEvents + '|' + customDetail + '|' + location.hash + '|' + (removedScript.parentNode === null);",
+              &browserApiResult, &error) &&
+              browserApiResult == L"1|1|ok|#/dashboard|true",
+          L"shared fetch, dynamic-script, event, location and DOM-removal rules work together");
+    Check(document.QuerySelector(L".loaded-fragment") &&
+              document.QuerySelector(L".loaded-fragment")->InnerText() == L"Loaded",
+          L"Response.text resolves HTML used by the common innerHTML parser");
+    Check(hostMessage.find(L"\"type\":\"login\"") != std::wstring::npos &&
+              hostMessage.find(L"\"nested\":{") != std::wstring::npos &&
+              hostMessage != L"[object Object]",
+          L"the host bridge serializes object messages as JSON");
+    Check(javascript.Execute(
+              L"return (function namedExpression(value) { return value > 1 ? namedExpression(value - 1) + 1 : 1; })(3);",
+              &browserApiResult, &error) && browserApiResult == L"3",
+          L"named function expressions retain their local recursive binding");
+    javascript.NavigateToFragment(L"#/settings");
+    Check(javascript.Execute(L"return location.hash + '|' + hashEvents;",
+                             &browserApiResult, &error) &&
+              browserApiResult == L"#/settings|2",
+          L"shared fragment navigation updates location and dispatches hashchange");
+
     for (const float scale : {1.0f, 1.5f}) {
         layout.Layout(600.0f, 300.0f, scale);
         const auto* firstBox = layout.BoxFor(document.GetElementById(L"first"));

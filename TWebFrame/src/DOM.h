@@ -13,6 +13,7 @@ namespace TWebFrame::Internal {
 enum class NodeType { Document, Element, Text };
 
 class Document;
+struct CanvasSurface;
 
 struct Node : std::enable_shared_from_this<Node> {
     struct FileInfo {
@@ -31,15 +32,18 @@ struct Node : std::enable_shared_from_this<Node> {
     std::weak_ptr<Node> parent;
     Document* ownerDocument = nullptr;
     bool checked = false;
+    bool indeterminate = false;
     bool disabled = false;
     bool hovered = false;
     bool focused = false;
     bool focusVisible = false;
     bool focusWithin = false;
+    bool scriptStarted = false;
     float scrollLeft = 0.0f;
     float scrollTop = 0.0f;
     size_t selectionStart = 0;
     size_t selectionEnd = 0;
+    std::shared_ptr<CanvasSurface> canvas;
 
     std::wstring Attribute(const std::wstring& name) const;
     void SetAttribute(const std::wstring& name, const std::wstring& value);

@@ -6,7 +6,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
-    <ProjectGuid>{5F37E44A-16C8-4EC9-97BA-128D24C940D5}</ProjectGuid>
+    <ProjectGuid>{242447DC-B468-475F-B256-23F0AA6DF1AC}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
@@ -38,7 +38,7 @@
     </ClCompile>
     <Link><SubSystem>Console</SubSystem><AdditionalDependencies>d2d1.lib;dwrite.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="TableSpanRegression.cpp" /></ItemGroup>
+  <ItemGroup><ClCompile Include="FormControlRegression.cpp" /></ItemGroup>
   <ItemGroup><ProjectReference Include="..\TWebFrame.vcxproj"><Project>{05D5ACB1-7F24-4E5A-9BC0-D910A099A271}</Project></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

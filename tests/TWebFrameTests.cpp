@@ -1512,7 +1512,7 @@ int wmain(int argc,wchar_t** argv) {
     Check(tabTextStyle.Get(L"tab-size")==L"8",L"tab-size inherits into text runs");
 
     Document checkDoc;
-    Check(checkDoc.Parse(L"<style>*{box-sizing:border-box}.check{width:100px;height:25px;display:flex;align-items:center;gap:7px}.check input{width:15px;height:15px}</style><label class='check'><input id='check' type='checkbox'><span id='check-label'>Choice</span></label>",&error),
+    Check(checkDoc.Parse(L"<style>html,body{margin:0}*{box-sizing:border-box}.check{width:100px;height:25px;display:flex;align-items:center;gap:7px}.check input{width:15px;height:15px}</style><label class='check'><input id='check' type='checkbox'><span id='check-label'>Choice</span></label>",&error),
           L"checkbox user-agent fixture parses");
     StyleSheet checkCss;Check(checkCss.Parse(checkDoc.StyleText(),&error),L"checkbox user-agent CSS parses");
     const auto checkStyle=checkCss.Compute(checkDoc.GetElementById(L"check"));
@@ -1685,6 +1685,51 @@ int wmain(int argc,wchar_t** argv) {
     const auto modernCard=modernJsDoc.QuerySelector(L".card");
     Check(modernCard&&modernCard->InnerText()==L"3"&&modernCard->Attribute(L"data-state")==L"ready",
           L"bound methods, lexical arrow this and for-of iterables run on animation frames");
+
+    Document hostTableDoc;
+    Check(hostTableDoc.Parse(L"<table><tbody id='rows'></tbody></table>",&error),
+          L"host-fed table DOM fixture parses");
+    JavaScriptRuntime hostTableJs(hostTableDoc);
+    const wchar_t* hostTableSource=LR"JS(
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll('&','&amp;')
+                .replaceAll('<','&lt;')
+                .replaceAll('>','&gt;')
+                .replaceAll('"','&quot;')
+                .replaceAll("'","&#39;");
+        }
+        function renderTable(rows) {
+            const body = document.getElementById('rows');
+            body.innerHTML = '';
+            for (const row of rows) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${escapeHtml(row.id)}</td><td>${escapeHtml(row.name)}</td><td>${escapeHtml(row.value)}</td>`;
+                body.appendChild(tr);
+            }
+        }
+        window.twebframe?.addEventListener('message', (event) => {
+            const message = event.data;
+            if (message && message.type === 'cards' && Array.isArray(message.rows)) {
+                renderTable(message.rows);
+                console.log(`[WebMsg] received ${message.rows.length} rows`);
+            }
+        });
+    )JS";
+    Check(hostTableJs.Load(hostTableSource,&error),error.c_str());
+    Check(hostTableJs.DispatchWebMessageAsJson(
+              L"{\"type\":\"cards\",\"rows\":[{\"id\":\"001\",\"name\":\"<GPU>\",\"value\":\"A&B\"},{\"id\":\"002\",\"name\":\"Memory\",\"value\":\"64GB\"}]}",
+              &error),error.c_str());
+    const auto hostTableBody=hostTableDoc.GetElementById(L"rows");
+    const auto hostTableRows=hostTableDoc.QuerySelectorAll(L"tr",hostTableBody);
+    const auto firstHostTableCells=hostTableRows.empty()?std::vector<std::shared_ptr<Node>>{}:
+        hostTableDoc.QuerySelectorAll(L"td",hostTableRows.front());
+    Check(hostTableRows.size()==2&&firstHostTableCells.size()==3&&
+          firstHostTableCells[0]->InnerText()==L"001"&&
+          firstHostTableCells[1]->InnerText()==L"<GPU>"&&
+          firstHostTableCells[2]->InnerText()==L"A&B"&&
+          hostTableDoc.QuerySelectorAll(L"gpu",hostTableBody).empty(),
+          L"host JSON messages render table rows through generic modern JavaScript and DOM bindings");
 
     Document fileDoc;
     Check(fileDoc.Parse(L"<input id='file' type='file'>",&error),L"file input fixture parses");

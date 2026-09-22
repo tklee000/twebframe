@@ -193,8 +193,9 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
              node->tag == L"small" || node->tag == L"span" || node->tag == L"strong" ||
              node->tag == L"sub" || node->tag == L"sup" || node->tag == L"time" ||
              node->tag == L"u" || node->tag == L"var" || node->tag == L"wbr") display = L"inline";
-    else if (node->tag == L"button" || node->tag == L"input" || node->tag == L"select" ||
-             node->tag == L"textarea" || node->tag == L"svg") display = L"inline-block";
+    else if (node->tag == L"button" || node->tag == L"canvas" || node->tag == L"input" ||
+             node->tag == L"select" || node->tag == L"textarea" || node->tag == L"svg")
+        display = L"inline-block";
     else if (node->tag == L"table") display = L"table";
     else if (node->tag == L"thead") display = L"table-header-group";
     else if (node->tag == L"tbody") display = L"table-row-group";

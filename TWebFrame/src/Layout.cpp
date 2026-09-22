@@ -1,4 +1,5 @@
 #include "Layout.h"
+#include "Canvas.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,8 +25,12 @@ struct CachedStyleMetrics {
     bool fontSizeValid=false;
     bool lineHeightValid=false;
 };
+using StyleMetricsCache=FastMap<const void*,CachedStyleMetrics>;
+StyleMetricsCache& ThreadStyleMetricsCache(){
+    static thread_local StyleMetricsCache cache;return cache;
+}
 CachedStyleMetrics& StyleMetrics(const ComputedStyle& style){
-    static thread_local FastMap<const void*,CachedStyleMetrics> cache;
+    auto& cache=ThreadStyleMetricsCache();
     const auto key=static_cast<const void*>(style.values.get());
     auto found=cache.find(key);
     if(found!=cache.end()){
@@ -58,6 +63,16 @@ struct CachedEdges {
     std::weak_ptr<ComputedStyle::ValueMap> owner;
     Edges value;
 };
+using EdgeValuesCache=FastMap<EdgeCacheKey,CachedEdges,EdgeCacheHash>;
+EdgeValuesCache& ThreadEdgeValuesCache(){
+    static thread_local EdgeValuesCache cache;return cache;
+}
+void ClearOwnerBoundThreadCaches(){
+    // These caches use weak ownership to validate raw style pointers. Releasing
+    // them with the last layout engine avoids retaining weak control blocks for
+    // documents whose view has already been destroyed.
+    ThreadStyleMetricsCache().clear();ThreadEdgeValuesCache().clear();
+}
 struct CornerRadii { float x=0,y=0; };
 struct BoxShadow {
     float offsetX=0,offsetY=0,blur=0,spread=0;
@@ -591,7 +606,7 @@ std::vector<BoxShadow> BoxShadows(const ComputedStyle& style,float viewport) {
 }
 
 Edges EdgeValues(const ComputedStyle& style,const std::wstring& base,float reference,float viewport) {
-    static thread_local FastMap<EdgeCacheKey,CachedEdges,EdgeCacheHash> cache;
+    auto& cache=ThreadEdgeValuesCache();
     const EdgeCacheKey key{style.values.get(),reference,viewport,base==L"padding"};
     auto found=cache.find(key);
     if(found!=cache.end()){
@@ -648,6 +663,9 @@ float FontSize(const ComputedStyle& style){
 float LineHeight(const ComputedStyle& style){
     auto& cached=StyleMetrics(style);if(cached.lineHeightValid)return cached.lineHeight;
     const auto raw=style.Get(L"line-height");const float font=FontSize(style);
+    // Keep the CSS value in DIPs so the render target, rather than layout,
+    // applies the monitor scale. The engine's browser-compatible normal line
+    // box is four thirds of the computed font size.
     constexpr float normalLineHeight=4.0f/3.0f;
     if(raw.empty()||raw==L"normal")cached.lineHeight=font*normalLineHeight;
     else try{size_t used=0;const float multiple=std::stof(raw,&used);cached.lineHeight=used==raw.size()?font*multiple:StyleSheet::Length(raw,font,font,font*normalLineHeight);}
@@ -746,7 +764,7 @@ std::uint64_t StyleContextHash(const std::shared_ptr<Node>& node,std::uint64_t p
     std::uint64_t hash=parentHash;MixHash(hash,HashText(node->tag));MixHash(hash,static_cast<std::uint64_t>(node->type));if(node->type==NodeType::Text)return hash;
     std::uint64_t attributes=0;for(const auto& item:node->attributes)if(styleSheet.AttributeAffectsStyle(item.first)){std::uint64_t pair=HashText(item.first);MixHash(pair,HashText(item.second));attributes^=pair;}MixHash(hash,attributes);
     std::uint64_t inlineStyle=0;for(const auto& item:node->inlineStyle){std::uint64_t pair=HashText(item.first);MixHash(pair,HashText(item.second));inlineStyle^=pair;}MixHash(hash,inlineStyle);
-    MixHash(hash,(node->checked?1ull:0ull)|(node->disabled?2ull:0ull)|(node->hovered?4ull:0ull)|(node->focused?8ull:0ull)|(node->focusVisible?16ull:0ull)|(node->focusWithin?128ull:0ull));auto parent=node->parent.lock();if(parent){bool first=false,last=false;std::uint64_t childIndex=0;std::shared_ptr<Node> previous;if(knownIndex){childIndex=knownIndex;first=knownIndex==1;last=knownIndex==knownCount;previous=knownPrevious;}else{std::uint64_t currentIndex=0;for(const auto& sibling:parent->children)if(sibling->type==NodeType::Element){++currentIndex;if(sibling==node){first=currentIndex==1;childIndex=currentIndex;break;}previous=sibling;}for(auto it=parent->children.rbegin();it!=parent->children.rend();++it)if((*it)->type==NodeType::Element){last=*it==node;break;}}MixHash(hash,(first?32ull:0ull)|(last?64ull:0ull));if(styleSheet.UsesNthChildFor(node))MixHash(hash,childIndex);if(previous){MixHash(hash,HashText(previous->tag));MixHash(hash,(previous->checked?1ull:0ull)|(previous->disabled?2ull:0ull)|(previous->focused?4ull:0ull)|(previous->focusVisible?8ull:0ull));std::uint64_t siblingAttributes=0;for(const auto& item:previous->attributes)if(styleSheet.AttributeAffectsStyle(item.first)){std::uint64_t pair=HashText(item.first);MixHash(pair,HashText(item.second));siblingAttributes^=pair;}MixHash(hash,siblingAttributes);}}return hash;
+    MixHash(hash,(node->checked?1ull:0ull)|(node->disabled?2ull:0ull)|(node->hovered?4ull:0ull)|(node->focused?8ull:0ull)|(node->focusVisible?16ull:0ull)|(node->focusWithin?128ull:0ull)|(node->indeterminate?256ull:0ull));auto parent=node->parent.lock();if(parent){bool first=false,last=false;std::uint64_t childIndex=0;std::shared_ptr<Node> previous;if(knownIndex){childIndex=knownIndex;first=knownIndex==1;last=knownIndex==knownCount;previous=knownPrevious;}else{std::uint64_t currentIndex=0;for(const auto& sibling:parent->children)if(sibling->type==NodeType::Element){++currentIndex;if(sibling==node){first=currentIndex==1;childIndex=currentIndex;break;}previous=sibling;}for(auto it=parent->children.rbegin();it!=parent->children.rend();++it)if((*it)->type==NodeType::Element){last=*it==node;break;}}MixHash(hash,(first?32ull:0ull)|(last?64ull:0ull));if(styleSheet.UsesNthChildFor(node))MixHash(hash,childIndex);if(previous){MixHash(hash,HashText(previous->tag));MixHash(hash,(previous->checked?1ull:0ull)|(previous->disabled?2ull:0ull)|(previous->focused?4ull:0ull)|(previous->focusVisible?8ull:0ull)|(previous->indeterminate?16ull:0ull));std::uint64_t siblingAttributes=0;for(const auto& item:previous->attributes)if(styleSheet.AttributeAffectsStyle(item.first)){std::uint64_t pair=HashText(item.first);MixHash(pair,HashText(item.second));siblingAttributes^=pair;}MixHash(hash,siblingAttributes);}}return hash;
 }
 
 std::wstring FontFamily(const ComputedStyle& style) {
@@ -755,6 +773,23 @@ std::wstring FontFamily(const ComputedStyle& style) {
     family.erase(std::remove(family.begin(),family.end(),L'\''),family.end());
     family.erase(std::remove(family.begin(),family.end(),L'"'),family.end());
     return family;
+}
+
+std::wstring ExplicitKoreanFontFamily(const std::wstring& source){
+    size_t start=0;
+    while(start<source.size()){
+        const auto comma=source.find(L',',start);auto family=Trim(source.substr(start,
+            comma==std::wstring::npos?std::wstring::npos:comma-start));
+        if(family.size()>1&&((family.front()==L'\''&&family.back()==L'\'')||
+                            (family.front()==L'"'&&family.back()==L'"')))
+            family=family.substr(1,family.size()-2);
+        const auto lower=ToLower(family);
+        if(lower.find(L"noto sans kr")!=std::wstring::npos||
+           lower.find(L"malgun gothic")!=std::wstring::npos||
+           lower.find(L"yu gothic")!=std::wstring::npos||family==L"\ub9d1\uc740 \uace0\ub515")return family;
+        if(comma==std::wstring::npos)break;start=comma+1;
+    }
+    return {};
 }
 
 bool IsHangul(wchar_t c) {
@@ -901,24 +936,27 @@ void ApplyFontFallback(IDWriteFactory* factory,IDWriteTextLayout* layout,
     const auto primaryFamily=ToLower(FontFamily(style));
     const bool primaryProvidesKorean=primaryFamily.find(L"noto sans kr")!=std::wstring::npos||
         primaryFamily.find(L"malgun gothic")!=std::wstring::npos||
-        primaryFamily.find(L"yu gothic")!=std::wstring::npos;
+        primaryFamily.find(L"yu gothic")!=std::wstring::npos||FontFamily(style)==L"\ub9d1\uc740 \uace0\ub515";
     if(!controlMetrics&&!primaryProvidesKorean&&ContainsHangul(text)){
         // A CSS family such as Segoe UI or Arial does not contain Hangul.
         // Chromium resolves the Korean runs through the installed UI fallback
         // face while DirectWrite's implicit fallback can choose a wider legacy
         // face. Pin only those missing-glyph runs to the available Korean UI
         // font so layout measurement and painting use the browser fallback.
+        const auto authoredFallback=ExplicitKoreanFontFamily(style.Get(L"font-family"));
         static const bool hasKoreanUiFont=[factory] {
             Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
             UINT32 index=0;BOOL exists=FALSE;
             return SUCCEEDED(factory->GetSystemFontCollection(&collection))&&
                    SUCCEEDED(collection->FindFamilyName(L"Noto Sans KR",&index,&exists))&&exists;
         }();
-        if(hasKoreanUiFont)for(size_t start=0;start<text.size();){
+        const auto fallbackFamily=!authoredFallback.empty()?authoredFallback:
+            (hasKoreanUiFont?L"Noto Sans KR":L"");
+        if(!fallbackFamily.empty())for(size_t start=0;start<text.size();){
             if(!IsHangul(text[start])){++start;continue;}
             size_t end=start+1;
             while(end<text.size()&&IsHangul(text[end]))++end;
-            layout->SetFontFamilyName(L"Noto Sans KR",
+            layout->SetFontFamilyName(fallbackFamily.c_str(),
                 DWRITE_TEXT_RANGE{static_cast<UINT32>(start),static_cast<UINT32>(end-start)});
             start=end;
         }
@@ -1447,6 +1485,8 @@ float NaturalWidth(const LayoutBox& box){
         // disclosure-button area in addition to the widest option.
         value=optionWidth+20.0f;
     }
+    else if(box.node->tag==L"canvas")
+        value=StyleSheet::Length(box.node->Attribute(L"width"),500,500,300);
     else if(box.node->tag==L"svg"){
         const auto viewBox=SvgNumbers(box.node->Attribute(L"viewbox"));
         const auto height=box.style.Get(L"height",box.node->Attribute(L"height"));
@@ -1552,8 +1592,18 @@ std::vector<float> ResolveTableColumns(const LayoutBox& table,const TableGridMod
             distributeDeficit(explicitWidths,cell,
                 StyleSheet::Length(raw,availableWidth,viewportWidth,0),nullptr);
     }
-    if(!fixed)for(const auto& cell:model.cells)
-        distributeDeficit(preferredWidths,cell,NaturalWidth(*cell.box),&explicitWidths);
+    const bool collapsedBorders=table.style.Is(L"border-collapse",L"collapse");
+    if(!fixed)for(const auto& cell:model.cells){
+        float preferred=NaturalWidth(*cell.box);
+        if(collapsedBorders){
+            const auto borders=BorderValues(cell.box->style);
+            // Adjacent collapsed borders share one CSS edge. Intrinsic sizing
+            // therefore includes half of each cell edge instead of charging
+            // both complete borders to every column.
+            preferred=std::max(0.0f,preferred-(borders.left+borders.right)/2.0f);
+        }
+        distributeDeficit(preferredWidths,cell,preferred,&explicitWidths);
+    }
 
     std::vector<float> result=explicitWidths;
     float assigned=0,preferred=0;size_t automatic=0;
@@ -1640,6 +1690,8 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
         const auto text=box.node->tag==L"button"?box.node->InnerText():(box.node->tag==L"select"?SelectedOptionText(box.node):box.node->Attribute(L"value"));
         value=ControlLineHeight(text,box.style)+padding.top+padding.bottom+border.top+border.bottom;
     }
+    else if(box.node->tag==L"canvas")
+        value=StyleSheet::Length(box.node->Attribute(L"height"),availableWidth,availableWidth,150);
     else if(box.node->tag==L"svg"){
         const auto viewBox=SvgNumbers(box.node->Attribute(L"viewbox"));
         if(viewBox.size()==4&&viewBox[2]>0)value=availableWidth*viewBox[3]/viewBox[2];
@@ -1763,13 +1815,27 @@ std::vector<float> ResolveTableRows(const TableGridModel& model,
         for(size_t column=cell.column;column<end;++column)width+=columns[column];
         return width;
     };
+    auto cellHeight=[&](const TableCellEntry& cell){
+        float height=NaturalHeight(*cell.box,cellWidth(cell));
+        bool collapsed=false;
+        for(auto* ancestor=cell.box->parent;ancestor;ancestor=ancestor->parent)
+            if(HasTableDisplay(*ancestor,L"table")){
+                collapsed=ancestor->style.Is(L"border-collapse",L"collapse");
+                break;
+            }
+        if(collapsed){
+            const auto borders=BorderValues(cell.box->style);
+            height=std::max(0.0f,height-(borders.top+borders.bottom)/2.0f);
+        }
+        return height;
+    };
     for(const auto& cell:model.cells)if(cell.rowSpan==1&&cell.row<rows.size())
-        rows[cell.row]=std::max(rows[cell.row],NaturalHeight(*cell.box,cellWidth(cell)));
+        rows[cell.row]=std::max(rows[cell.row],cellHeight(cell));
     for(const auto& cell:model.cells)if(cell.rowSpan>1&&cell.row<rows.size()){
         const size_t end=std::min(rows.size(),cell.row+cell.rowSpan);
         float current=0;
         for(size_t row=cell.row;row<end;++row)current+=rows[row];
-        const float deficit=NaturalHeight(*cell.box,cellWidth(cell))-current;
+        const float deficit=cellHeight(cell)-current;
         if(deficit<=0||end<=cell.row)continue;
         const float share=deficit/static_cast<float>(end-cell.row);
         for(size_t row=cell.row;row<end;++row)rows[row]+=share;
@@ -2387,11 +2453,14 @@ unsigned int BorderColor(const ComputedStyle& style,const std::wstring& side){
 
 bool IsPaintOnlyProperty(const std::wstring& name){
     return name==L"background"||name==L"background-color"||name==L"color"||
+           name==L"background-image"||name==L"background-position"||
+           name==L"background-size"||name==L"background-repeat"||
            name==L"border-color"||name==L"border-top-color"||name==L"border-right-color"||
            name==L"border-bottom-color"||name==L"border-left-color"||name==L"box-shadow"||
            name==L"opacity"||name==L"cursor"||name==L"outline"||name==L"outline-color"||
            name==L"text-decoration"||name==L"text-decoration-line"||
            name==L"text-decoration-color"||name==L"accent-color"||
+           name==L"appearance"||name==L"-webkit-appearance"||
            name==L"caret-color"||name==L"fill"||name==L"stroke";
 }
 
@@ -2883,6 +2952,347 @@ void PaintSvg(ID2D1RenderTarget* target,const LayoutBox& box,StyleSheet& styleSh
     target->SetTransform(old);
 }
 
+int HexDigit(wchar_t value){
+    if(value>=L'0'&&value<=L'9')return value-L'0';
+    value=static_cast<wchar_t>(std::towlower(value));
+    return value>=L'a'&&value<=L'f'?value-L'a'+10:-1;
+}
+
+std::wstring DecodeSvgDataUrl(const std::wstring& cssUrl){
+    auto value=Trim(cssUrl);const auto lowered=ToLower(value);
+    if(lowered.rfind(L"url(",0)!=0||value.size()<5||value.back()!=L')')return {};
+    value=Trim(value.substr(4,value.size()-5));
+    if(value.size()>=2&&((value.front()==L'"'&&value.back()==L'"')||
+                         (value.front()==L'\''&&value.back()==L'\'')))
+        value=value.substr(1,value.size()-2);
+    const auto comma=value.find(L',');if(comma==std::wstring::npos)return {};
+    const auto header=ToLower(value.substr(0,comma));
+    if(header.rfind(L"data:image/svg+xml",0)!=0||header.find(L";base64")!=std::wstring::npos)
+        return {};
+    std::string bytes;
+    for(size_t index=comma+1;index<value.size();++index){
+        if(value[index]==L'%'&&index+2<value.size()){
+            const int high=HexDigit(value[index+1]),low=HexDigit(value[index+2]);
+            if(high>=0&&low>=0){bytes.push_back(static_cast<char>((high<<4)|low));index+=2;continue;}
+        }
+        if(value[index]<=0x7f)bytes.push_back(static_cast<char>(value[index]));
+        else{
+            char encoded[4]{};const wchar_t character=value[index];
+            const int count=WideCharToMultiByte(CP_UTF8,0,&character,1,encoded,
+                                                 static_cast<int>(std::size(encoded)),nullptr,nullptr);
+            if(count>0)bytes.append(encoded,encoded+count);
+        }
+    }
+    if(bytes.empty())return {};
+    const int length=MultiByteToWideChar(CP_UTF8,0,bytes.data(),static_cast<int>(bytes.size()),nullptr,0);
+    if(length<=0)return {};
+    std::wstring decoded(static_cast<size_t>(length),L'\0');
+    MultiByteToWideChar(CP_UTF8,0,bytes.data(),static_cast<int>(bytes.size()),decoded.data(),length);
+    return decoded;
+}
+
+float BackgroundPosition(const std::wstring& token,float freeSpace,float viewport){
+    const auto value=ToLower(Trim(token));
+    if(value==L"right"||value==L"bottom")return freeSpace;
+    if(value==L"center")return freeSpace/2.0f;
+    if(value==L"left"||value==L"top"||value.empty())return 0;
+    return StyleSheet::Length(value,freeSpace,viewport,0);
+}
+
+void PaintSvgBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& style,
+                         const LayoutRect& box,const CornerRadii& radius,float viewport,
+                         Document& document,StyleSheet& styleSheet,
+                         FastMap<std::wstring,std::shared_ptr<Node>>& imageCache,
+                         FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1PathGeometry>>& geometryCache){
+    const auto images=CommaSeparated(style.Get(L"background-image"));
+    if(images.empty())return;
+    const auto positions=CommaSeparated(style.Get(L"background-position",L"0% 0%"));
+    const auto sizes=CommaSeparated(style.Get(L"background-size",L"auto"));
+    const auto repeats=CommaSeparated(style.Get(L"background-repeat",L"repeat"));
+    auto layerValue=[](const std::vector<std::wstring>& values,size_t index,const wchar_t* fallback){
+        if(values.empty())return std::wstring(fallback);
+        return values[std::min(index,values.size()-1)];
+    };
+
+    Microsoft::WRL::ComPtr<ID2D1Layer> clipLayer;
+    Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry> clipGeometry;
+    bool roundedClip=false;
+    if(radius.x>0&&radius.y>0){
+        Microsoft::WRL::ComPtr<ID2D1Factory> factory;target->GetFactory(&factory);
+        if(factory&&SUCCEEDED(factory->CreateRoundedRectangleGeometry(
+                D2D1::RoundedRect(PixelAlignedRect(box),radius.x,radius.y),&clipGeometry))&&
+           SUCCEEDED(target->CreateLayer(nullptr,&clipLayer))){
+            target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),clipGeometry.Get()),clipLayer.Get());
+            roundedClip=true;
+        }
+    }
+    if(!roundedClip)target->PushAxisAlignedClip(PixelAlignedRect(box),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    for(size_t reversed=images.size();reversed>0;--reversed){
+        const size_t index=reversed-1;const auto source=DecodeSvgDataUrl(images[index]);
+        if(source.empty())continue;
+        auto found=imageCache.find(source);
+        if(found==imageCache.end()){
+            std::shared_ptr<Node> svg;
+            for(const auto& node:document.ParseFragment(source))if(node&&node->tag==L"svg"){svg=node;break;}
+            if(imageCache.size()>=128)imageCache.clear();
+            found=imageCache.emplace(source,std::move(svg)).first;
+        }
+        const auto& svg=found->second;if(!svg)continue;
+        const auto viewBox=SvgNumbers(svg->Attribute(L"viewbox"));
+        float intrinsicWidth=viewBox.size()==4?viewBox[2]:
+            StyleSheet::Length(svg->Attribute(L"width"),box.width,viewport,box.width);
+        float intrinsicHeight=viewBox.size()==4?viewBox[3]:
+            StyleSheet::Length(svg->Attribute(L"height"),box.height,viewport,box.height);
+        if(intrinsicWidth<=0||intrinsicHeight<=0)continue;
+
+        const auto sizeValue=ToLower(Trim(layerValue(sizes,index,L"auto")));
+        float width=intrinsicWidth,height=intrinsicHeight;
+        if(sizeValue==L"contain"||sizeValue==L"cover"||sizeValue==L"auto"){
+            const float fit=sizeValue==L"cover"?
+                std::max(box.width/intrinsicWidth,box.height/intrinsicHeight):
+                std::min(box.width/intrinsicWidth,box.height/intrinsicHeight);
+            width=intrinsicWidth*fit;height=intrinsicHeight*fit;
+        }else{
+            const auto words=Words(sizeValue);
+            if(!words.empty()&&words[0]!=L"auto")width=StyleSheet::Length(words[0],box.width,viewport,width);
+            if(words.size()>1&&words[1]!=L"auto")height=StyleSheet::Length(words[1],box.height,viewport,height);
+            else if(intrinsicWidth>0)height=width*intrinsicHeight/intrinsicWidth;
+        }
+        if(width<=0||height<=0)continue;
+
+        const auto positionWords=Words(ToLower(layerValue(positions,index,L"0% 0%")));
+        std::wstring horizontal=L"0%",vertical=L"0%";
+        if(positionWords.size()==1){
+            if(positionWords[0]==L"top"||positionWords[0]==L"bottom"){
+                horizontal=L"center";vertical=positionWords[0];
+            }else{horizontal=positionWords[0];vertical=L"center";}
+        }else if(positionWords.size()>=2){horizontal=positionWords[0];vertical=positionWords[1];}
+        const float left=box.x+BackgroundPosition(horizontal,box.width-width,viewport);
+        const float top=box.y+BackgroundPosition(vertical,box.height-height,viewport);
+        const auto repeat=ToLower(Trim(layerValue(repeats,index,L"repeat")));
+        const bool repeatX=repeat==L"repeat"||repeat==L"repeat-x";
+        const bool repeatY=repeat==L"repeat"||repeat==L"repeat-y";
+        float firstX=left,firstY=top;
+        if(repeatX)while(firstX>box.x)firstX-=width;
+        if(repeatY)while(firstY>box.y)firstY-=height;
+        size_t painted=0;
+        for(float y=firstY;y<box.y+box.height&&painted<4096;y+=repeatY?height:box.height+height){
+            for(float x=firstX;x<box.x+box.width&&painted<4096;x+=repeatX?width:box.width+width){
+                LayoutBox image;image.node=svg;image.style=style;
+                image.rect=image.content={x,y,width,height};
+                PaintSvg(target,image,styleSheet,geometryCache);++painted;
+                if(!repeatX)break;
+            }
+            if(!repeatY)break;
+        }
+    }
+    if(roundedClip)target->PopLayer();else target->PopAxisAlignedClip();
+}
+
+D2D1_MATRIX_3X2_F CanvasMatrix(const CanvasTransform& transform){
+    return D2D1::Matrix3x2F(transform.a,transform.b,transform.c,transform.d,
+                           transform.e,transform.f);
+}
+
+Microsoft::WRL::ComPtr<ID2D1Brush> CanvasBrush(ID2D1RenderTarget* target,
+                                                const CanvasPaint& paint){
+    Microsoft::WRL::ComPtr<ID2D1Brush> result;
+    if(paint.gradient&&!paint.gradient->stops.empty()){
+        std::vector<D2D1_GRADIENT_STOP> stops;stops.reserve(paint.gradient->stops.size()+2);
+        for(const auto& stop:paint.gradient->stops)
+            stops.push_back({std::max(0.0f,std::min(1.0f,stop.offset)),
+                D2DColor(StyleSheet::Color(stop.color,0xff000000))});
+        if(stops.size()==1)stops.push_back({1.0f,stops.front().color});
+        Microsoft::WRL::ComPtr<ID2D1GradientStopCollection> collection;
+        Microsoft::WRL::ComPtr<ID2D1LinearGradientBrush> brush;
+        if(SUCCEEDED(target->CreateGradientStopCollection(stops.data(),
+                static_cast<UINT32>(stops.size()),&collection))&&
+           SUCCEEDED(target->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(
+                    D2D1::Point2F(paint.gradient->x0,paint.gradient->y0),
+                    D2D1::Point2F(paint.gradient->x1,paint.gradient->y1)),
+                collection.Get(),&brush)))
+            brush.As(&result);
+    }
+    if(!result){
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+        if(SUCCEEDED(target->CreateSolidColorBrush(
+                D2DColor(StyleSheet::Color(paint.color,0xff000000)),&brush)))
+            brush.As(&result);
+    }
+    return result;
+}
+
+Microsoft::WRL::ComPtr<ID2D1PathGeometry> CanvasGeometry(
+        ID2D1RenderTarget* target,const std::vector<CanvasPathSegment>& path){
+    Microsoft::WRL::ComPtr<ID2D1Factory> factory;target->GetFactory(&factory);
+    Microsoft::WRL::ComPtr<ID2D1PathGeometry> geometry;
+    Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+    if(!factory||FAILED(factory->CreatePathGeometry(&geometry))||FAILED(geometry->Open(&sink)))return {};
+    sink->SetFillMode(D2D1_FILL_MODE_WINDING);bool open=false;CanvasPoint current{},start{};
+    auto endOpen=[&]{if(open){sink->EndFigure(D2D1_FIGURE_END_OPEN);open=false;}};
+    auto begin=[&](CanvasPoint point){endOpen();sink->BeginFigure(D2D1::Point2F(point.x,point.y),D2D1_FIGURE_BEGIN_FILLED);open=true;current=start=point;};
+    constexpr float pi=3.14159265358979323846f;
+    for(const auto& segment:path){
+        if(segment.verb==CanvasPathVerb::MoveTo){begin(segment.point);continue;}
+        if(segment.verb==CanvasPathVerb::LineTo){
+            if(!open)begin(segment.point);else{sink->AddLine(D2D1::Point2F(segment.point.x,segment.point.y));current=segment.point;}
+            continue;
+        }
+        if(segment.verb==CanvasPathVerb::Close){
+            if(open){sink->EndFigure(D2D1_FIGURE_END_CLOSED);open=false;current=start;}continue;
+        }
+        if(segment.radius<=0)continue;
+        const auto pointAt=[&](float angle){return TransformCanvasPoint(segment.transform,
+            segment.centerX+std::cos(angle)*segment.radius,
+            segment.centerY+std::sin(angle)*segment.radius);};
+        const auto arcStart=pointAt(segment.startAngle);
+        if(!open)begin(arcStart);
+        else if(std::abs(current.x-arcStart.x)>0.001f||std::abs(current.y-arcStart.y)>0.001f){
+            sink->AddLine(D2D1::Point2F(arcStart.x,arcStart.y));current=arcStart;
+        }
+        float delta=segment.endAngle-segment.startAngle;
+        if(!segment.counterClockwise){
+            if(std::abs(delta)>=2*pi)delta=2*pi;else while(delta<0)delta+=2*pi;
+        }else{
+            if(std::abs(delta)>=2*pi)delta=-2*pi;else while(delta>0)delta-=2*pi;
+        }
+        if(std::abs(delta)<0.000001f)continue;
+        const float radiusX=segment.radius*std::hypot(segment.transform.a,segment.transform.b);
+        const float radiusY=segment.radius*std::hypot(segment.transform.c,segment.transform.d);
+        const float rotation=std::atan2(segment.transform.b,segment.transform.a)*180.0f/pi;
+        const float determinant=segment.transform.a*segment.transform.d-segment.transform.b*segment.transform.c;
+        const bool clockwise=delta*(determinant<0?-1.0f:1.0f)>0;
+        const int pieces=std::max(1,static_cast<int>(std::ceil(std::abs(delta)/pi)));
+        for(int piece=1;piece<=pieces;++piece){
+            const float angle=segment.startAngle+delta*piece/pieces;const auto end=pointAt(angle);
+            sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(end.x,end.y),
+                D2D1::SizeF(radiusX,radiusY),rotation,
+                D2D1_SWEEP_DIRECTION(clockwise?D2D1_SWEEP_DIRECTION_CLOCKWISE:D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE),
+                D2D1_ARC_SIZE_SMALL));current=end;
+        }
+    }
+    endOpen();if(FAILED(sink->Close()))return {};return geometry;
+}
+
+struct CanvasFont {
+    std::wstring family=L"Arial";
+    std::wstring koreanFamily;
+    float size=10.0f;
+    DWRITE_FONT_WEIGHT weight=DWRITE_FONT_WEIGHT_NORMAL;
+};
+
+CanvasFont ParseCanvasFont(const std::wstring& source){
+    CanvasFont result;const auto lower=ToLower(source);const auto px=lower.find(L"px");
+    if(px==std::wstring::npos)return result;size_t begin=px;
+    while(begin>0&&(std::iswdigit(source[begin-1])||source[begin-1]==L'.'))--begin;
+    try{result.size=std::max(0.1f,std::stof(source.substr(begin,px-begin)));}catch(...){ }
+    auto familyList=Trim(source.substr(px+2));const auto comma=familyList.find(L',');
+    auto family=Trim(familyList.substr(0,comma));
+    if(family.size()>1&&((family.front()==L'\''&&family.back()==L'\'')||
+                        (family.front()==L'"'&&family.back()==L'"')))
+        family=family.substr(1,family.size()-2);
+    if(!family.empty()&&ToLower(family)!=L"sans-serif")result.family=family;
+    result.koreanFamily=ExplicitKoreanFontFamily(familyList);
+    if(lower.find(L"bold")!=std::wstring::npos)result.weight=DWRITE_FONT_WEIGHT_BOLD;
+    return result;
+}
+
+void PaintCanvas(ID2D1RenderTarget* target,IDWriteFactory* factory,const LayoutBox& box){
+    const auto surface=box.node?box.node->canvas:nullptr;
+    if(!surface||surface->width==0||surface->height==0||
+       box.content.width<=0||box.content.height<=0)return;
+    // A browser rasterizes into the canvas's intrinsic backing store first and
+    // then composites that bitmap into the CSS box. Replaying vector commands
+    // directly into the page would make a 960x630 canvas scaled to 640x420
+    // noticeably sharper and would change stroke/point pixels. Keeping this
+    // intermediate bitmap also makes the result independent of monitor DPI.
+    const auto intrinsicSize=D2D1::SizeF(static_cast<float>(surface->width),
+                                         static_cast<float>(surface->height));
+    const auto pixelSize=D2D1::SizeU(surface->width,surface->height);
+    Microsoft::WRL::ComPtr<ID2D1BitmapRenderTarget> bitmapTarget;
+    if(FAILED(target->CreateCompatibleRenderTarget(&intrinsicSize,&pixelSize,nullptr,
+            D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,&bitmapTarget)))return;
+    bitmapTarget->SetDpi(USER_DEFAULT_SCREEN_DPI,USER_DEFAULT_SCREEN_DPI);
+    auto* drawingTarget=static_cast<ID2D1RenderTarget*>(bitmapTarget.Get());
+    drawingTarget->BeginDraw();drawingTarget->SetTransform(D2D1::IdentityMatrix());
+    drawingTarget->Clear(D2D1::ColorF(0,0.0f));
+    for(const auto& command:surface->commands){
+        const bool pathCommand=command.kind==CanvasCommandKind::FillPath||
+                               command.kind==CanvasCommandKind::StrokePath;
+        drawingTarget->SetTransform(pathCommand?D2D1::IdentityMatrix():CanvasMatrix(command.state.transform));
+        if(command.kind==CanvasCommandKind::ClearRect){
+            const float left=std::min(command.x,command.x+command.width);
+            const float top=std::min(command.y,command.y+command.height);
+            const float right=std::max(command.x,command.x+command.width);
+            const float bottom=std::max(command.y,command.y+command.height);
+            drawingTarget->PushAxisAlignedClip(D2D1::RectF(left,top,right,bottom),
+                D2D1_ANTIALIAS_MODE_ALIASED);
+            drawingTarget->Clear(D2D1::ColorF(0,0.0f));
+            drawingTarget->PopAxisAlignedClip();
+        }else if(command.kind==CanvasCommandKind::FillRect){
+            const float left=std::min(command.x,command.x+command.width);
+            const float top=std::min(command.y,command.y+command.height);
+            const float right=std::max(command.x,command.x+command.width);
+            const float bottom=std::max(command.y,command.y+command.height);
+            const auto brush=CanvasBrush(drawingTarget,command.state.fillStyle);
+            if(brush)drawingTarget->FillRectangle(D2D1::RectF(left,top,right,bottom),brush.Get());
+        }else if(pathCommand){
+            const auto geometry=CanvasGeometry(drawingTarget,command.path);
+            const auto brush=CanvasBrush(drawingTarget,command.kind==CanvasCommandKind::FillPath?
+                command.state.fillStyle:command.state.strokeStyle);
+            if(geometry&&brush){
+                if(command.kind==CanvasCommandKind::FillPath)drawingTarget->FillGeometry(geometry.Get(),brush.Get());
+                else drawingTarget->DrawGeometry(geometry.Get(),brush.Get(),command.state.lineWidth);
+            }
+        }else if(command.kind==CanvasCommandKind::FillText&&!command.text.empty()){
+            const auto parsed=ParseCanvasFont(command.state.font);
+            Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+            Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+            if(SUCCEEDED(factory->CreateTextFormat(parsed.family.c_str(),nullptr,parsed.weight,
+                    DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,parsed.size,L"",&format))&&
+               SUCCEEDED(factory->CreateTextLayout(command.text.c_str(),
+                    static_cast<UINT32>(command.text.size()),format.Get(),100000,100000,&layout))){
+                if(!parsed.koreanFamily.empty()&&ContainsHangul(command.text))
+                    for(size_t start=0;start<command.text.size();){
+                        if(!IsHangul(command.text[start])){++start;continue;}
+                        size_t end=start+1;while(end<command.text.size()&&IsHangul(command.text[end]))++end;
+                        layout->SetFontFamilyName(parsed.koreanFamily.c_str(),DWRITE_TEXT_RANGE{
+                            static_cast<UINT32>(start),static_cast<UINT32>(end-start)});start=end;
+                    }
+                DWRITE_TEXT_METRICS metrics{};layout->GetMetrics(&metrics);
+                float left=command.x,top=command.y;const auto align=ToLower(command.state.textAlign);
+                if(align==L"center")left-=metrics.widthIncludingTrailingWhitespace/2;
+                else if(align==L"right"||align==L"end")left-=metrics.widthIncludingTrailingWhitespace;
+                const auto baseline=ToLower(command.state.textBaseline);
+                // Canvas's top baseline is the top text bearing, whereas a
+                // DirectWrite layout origin includes the face's leading area.
+                // Account for the ordinary Latin and full-em Hangul bearings
+                // in font-relative units so this remains stable at any canvas
+                // backing-store size and monitor DPI.
+                if(baseline==L"top"||baseline==L"hanging")
+                    top-=parsed.size*(ContainsHangul(command.text)?0.30f:0.10f);
+                else if(baseline==L"middle")top-=metrics.height/2;
+                else if(baseline==L"bottom"||baseline==L"ideographic")top-=metrics.height;
+                else if(baseline==L"alphabetic")top-=parsed.size*0.8f;
+                const auto brush=CanvasBrush(drawingTarget,command.state.fillStyle);
+                if(brush)drawingTarget->DrawTextLayout(D2D1::Point2F(left,top),layout.Get(),brush.Get());
+            }
+        }
+    }
+    drawingTarget->SetTransform(D2D1::IdentityMatrix());
+    if(FAILED(drawingTarget->EndDraw()))return;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;if(FAILED(bitmapTarget->GetBitmap(&bitmap)))return;
+    target->PushAxisAlignedClip(D2D1::RectF(box.content.x,box.content.y,
+        box.content.x+box.content.width,box.content.y+box.content.height),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    target->DrawBitmap(bitmap.Get(),D2D1::RectF(box.content.x,box.content.y,
+        box.content.x+box.content.width,box.content.y+box.content.height),1.0f,
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+        D2D1::RectF(0,0,static_cast<float>(surface->width),static_cast<float>(surface->height)));
+    target->PopAxisAlignedClip();
+}
+
 std::wstring GeneratedContentText(const std::wstring& source,
                                   const std::shared_ptr<Node>& origin){
     std::wstring result;size_t position=0;
@@ -2919,6 +3329,7 @@ std::wstring GeneratedContentText(const std::wstring& source,
 } // namespace
 
 LayoutEngine::LayoutEngine(Document& document,StyleSheet& styleSheet):document_(document),styleSheet_(styleSheet){}
+LayoutEngine::~LayoutEngine(){ClearOwnerBoundThreadCaches();}
 
 std::unique_ptr<LayoutBox> LayoutEngine::Build(const std::shared_ptr<Node>& node,const ComputedStyle* parentStyle,std::uint64_t parentContext,size_t siblingIndex,size_t siblingCount,const std::shared_ptr<Node>& previousElement){
     if(!node)return {};auto box=std::make_unique<LayoutBox>();box->node=node;boxIndex_[node.get()]=box.get();const auto cacheKey=StyleContextHash(node,parentContext,styleSheet_,siblingIndex,siblingCount,previousElement);auto cached=styleCache_.find(cacheKey);if(cached!=styleCache_.end())box->style=cached->second;else{box->style=styleSheet_.Compute(node,parentStyle);styleCache_.emplace(cacheKey,box->style);}box->style.deviceScale=deviceScale_;box->visible=!box->style.Is(L"display",L"none");
@@ -3371,6 +3782,33 @@ void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
         return;
     }
     float cursorY=box.content.y;float lineX=box.content.x;float lineHeight=0;
+    // The root body and its first in-flow block share their adjoining top
+    // margin when neither establishes a separating border, padding, or scroll
+    // container. The body margin has already positioned this root box, so
+    // remove only the double-counted portion before placing its first child.
+    if(!box.parent&&box.node&&box.node->tag==L"body"){
+        const auto padding=EdgeValues(box.style,L"padding",box.rect.width,viewportWidth_);
+        const auto border=BorderValues(box.style);
+        const auto overflow=box.style.Get(L"overflow",L"visible");
+        if(padding.top<=0&&border.top<=0&&overflow==L"visible"){
+            for(const auto& child:box.children){
+                if(!child->visible||child->style.Is(L"position",L"absolute")||
+                   child->style.Is(L"position",L"fixed"))continue;
+                if(!IsInlineLevel(child->style.Get(L"display"))){
+                    const auto bodyMargin=EdgeValues(box.style,L"margin",box.rect.width,viewportWidth_);
+                    const auto childMargin=EdgeValues(child->style,L"margin",flowWidth,viewportWidth_);
+                    const auto collapse=[](float first,float second){
+                        if(first>=0&&second>=0)return std::max(first,second);
+                        if(first<=0&&second<=0)return std::min(first,second);
+                        return first+second;
+                    };
+                    cursorY-=bodyMargin.top+childMargin.top-
+                        collapse(bodyMargin.top,childMargin.top);
+                }
+                break;
+            }
+        }
+    }
     for(auto& child:box.children){if(!child->visible)continue;
         const bool absolute=child->style.Is(L"position",L"absolute")||child->style.Is(L"position",L"fixed");
         if(absolute){
@@ -3917,20 +4355,40 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     PaintOuterBoxShadows(target,box.style,box.rect,radius,viewportWidth_);
     if((background>>24)!=0){brush=SolidBrush(target,background);auto rect=PixelAlignedRect(box.rect);if(radius.x>0&&radius.y>0)target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius.x,radius.y),brush);else target->FillRectangle(rect,brush);}
     PaintGradientBackgrounds(target,box.style,box.rect,radius,viewportWidth_);
+    PaintSvgBackgrounds(target,box.style,box.rect,radius,viewportWidth_,document_,styleSheet_,
+                        svgBackgroundCache_,svgGeometryCache_);
     PaintInsetBoxShadows(target,box.style,box.rect,viewportWidth_);
     const auto borders=BorderValues(box.style);const bool uniform=borders.top==borders.right&&borders.top==borders.bottom&&borders.top==borders.left;
-    bool collapsedTableCell=false;
-    if(HasTableDisplay(box,L"table-cell"))for(auto* ancestor=box.parent;ancestor;ancestor=ancestor->parent)if(HasTableDisplay(*ancestor,L"table")){collapsedTableCell=ancestor->style.Is(L"border-collapse",L"collapse");break;}
-    if(uniform&&borders.top>0){auto color=BorderColor(box.style,L"top");brush=SolidBrush(target,color);const float inset=borders.top/2;auto rect=D2D1::RectF(std::round(box.rect.x)+inset,std::round(box.rect.y)+inset,std::round(box.rect.x+box.rect.width)-inset,std::round(box.rect.y+box.rect.height)-inset);if(radius.x>0&&radius.y>0){const float strokeRadiusX=std::max(0.0f,radius.x-inset),strokeRadiusY=std::max(0.0f,radius.y-inset);target->DrawRoundedRectangle(D2D1::RoundedRect(rect,strokeRadiusX,strokeRadiusY),brush,borders.top);}else target->DrawRectangle(rect,brush,borders.top);}
+    const LayoutBox* collapsedTable=nullptr;
+    if(HasTableDisplay(box,L"table-cell"))
+        for(auto* ancestor=box.parent;ancestor;ancestor=ancestor->parent)
+            if(HasTableDisplay(*ancestor,L"table")){
+                if(ancestor->style.Is(L"border-collapse",L"collapse"))collapsedTable=ancestor;
+                break;
+            }
+    const bool collapsedTableCell=collapsedTable!=nullptr;
+    if(uniform&&borders.top>0&&!collapsedTableCell){auto color=BorderColor(box.style,L"top");brush=SolidBrush(target,color);const float inset=borders.top/2;auto rect=D2D1::RectF(std::round(box.rect.x)+inset,std::round(box.rect.y)+inset,std::round(box.rect.x+box.rect.width)-inset,std::round(box.rect.y+box.rect.height)-inset);if(radius.x>0&&radius.y>0){const float strokeRadiusX=std::max(0.0f,radius.x-inset),strokeRadiusY=std::max(0.0f,radius.y-inset);target->DrawRoundedRectangle(D2D1::RoundedRect(rect,strokeRadiusX,strokeRadiusY),brush,borders.top);}else target->DrawRectangle(rect,brush,borders.top);}
     else{
         FLOAT dpiX=USER_DEFAULT_SCREEN_DPI,dpiY=USER_DEFAULT_SCREEN_DPI;target->GetDpi(&dpiX,&dpiY);
         const auto pixelCenter=[](float value,float dpi){const float scale=dpi/USER_DEFAULT_SCREEN_DPI;return scale>0?(std::round(value*scale-0.5f)+0.5f)/scale:value;};
-        if(borders.top>0){brush=SolidBrush(target,BorderColor(box.style,L"top"));const float y=pixelCenter(std::round(box.rect.y)+borders.top/2,dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.top);}
-        if(borders.right>0){brush=SolidBrush(target,BorderColor(box.style,L"right"));const float x=pixelCenter(std::round(box.rect.x+box.rect.width)-borders.right/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.right);}
+        // Collapsed table edges are shared, so paint each join once. Cells on
+        // the right own vertical joins and cells above own horizontal joins;
+        // only the outer top/right edges need an additional stroke.
+        const float epsilon=0.51f/std::max(0.01f,box.style.deviceScale);
+        const bool tableTop=!collapsedTableCell||
+            std::abs(box.rect.y-collapsedTable->content.y)<=epsilon;
+        const bool tableRight=!collapsedTableCell||
+            std::abs(box.rect.x+box.rect.width-
+                     (collapsedTable->content.x+collapsedTable->content.width))<=epsilon;
+        if(borders.top>0&&tableTop){brush=SolidBrush(target,BorderColor(box.style,L"top"));const float y=pixelCenter(std::round(box.rect.y)+borders.top/2,dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.top);}
+        if(borders.right>0&&tableRight){brush=SolidBrush(target,BorderColor(box.style,L"right"));const float x=pixelCenter(std::round(box.rect.x+box.rect.width)+(collapsedTableCell?borders.right/2:-borders.right/2),dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.right);}
         if(borders.bottom>0){brush=SolidBrush(target,BorderColor(box.style,L"bottom"));const float y=pixelCenter(std::round(box.rect.y+box.rect.height)+(collapsedTableCell?borders.bottom/2:-borders.bottom/2),dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.bottom);}
         if(borders.left>0){brush=SolidBrush(target,BorderColor(box.style,L"left"));const float x=pixelCenter(std::round(box.rect.x)+borders.left/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.left);}
     }
-    if(box.node->tag==L"input"&&(box.node->Attribute(L"type")==L"checkbox"||box.node->Attribute(L"type")==L"radio")){
+    const auto appearance=ToLower(Trim(box.style.Get(L"appearance",
+        box.style.Get(L"-webkit-appearance",L"auto"))));
+    if(appearance!=L"none"&&box.node->tag==L"input"&&
+       (box.node->Attribute(L"type")==L"checkbox"||box.node->Attribute(L"type")==L"radio")){
         const auto type=box.node->Attribute(L"type");
         const float size=std::max(1.0f,std::min(box.rect.width,box.rect.height));
         const float left=std::round(box.rect.x),top=std::round(box.rect.y+(box.rect.height-size)/2);
@@ -3942,7 +4400,13 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
             if(box.node->checked){brush=SolidBrush(target,accent);target->FillEllipse(D2D1::Ellipse(D2D1::Point2F((r.left+r.right)/2,(r.top+r.bottom)/2),4,4),brush);}
         }else{
             const float controlRadius=std::max(1.5f,size*0.15f);
-            if(box.node->checked){
+            if(box.node->indeterminate){
+                brush=SolidBrush(target,accent);
+                target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush);
+                brush=SolidBrush(target,0xffffffff);const float inset=size*0.25f;
+                target->FillRectangle(D2D1::RectF(r.left+inset,r.top+size*0.45f,
+                    r.right-inset,r.top+size*0.55f),brush);
+            }else if(box.node->checked){
                 brush=SolidBrush(target,accent);
                 target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush);
                 brush=SolidBrush(target,0xffffffff);
@@ -3960,6 +4424,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         }
     }
     if(box.node->tag==L"svg")PaintSvg(target,box,styleSheet_,svgGeometryCache_);
+    if(box.node->tag==L"canvas")PaintCanvas(target,factory,box);
     bool placeholderText=false;std::wstring text=BoxText(box,&placeholderText);
     if(box.node->type==NodeType::Text&&!text.empty()){
         const auto* owner=box.parent;

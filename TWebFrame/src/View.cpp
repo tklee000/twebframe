@@ -344,6 +344,7 @@ struct View::Impl {
         RECT bounds{};GetClientRect(hwnd,&bounds);const float scale=DpiScale();
         javascript.SetViewportSize(static_cast<double>(std::max(1L,bounds.right-bounds.left))/scale,
                                    static_cast<double>(std::max(1L,bounds.bottom-bounds.top))/scale);
+        javascript.SetDevicePixelRatio(scale);
     }
 
     static LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam){
@@ -383,6 +384,9 @@ struct View::Impl {
         });
         javascript.SetResourceLoader([this](const std::wstring& resource,std::wstring& content){
             return LoadTextResource(resource,content);
+        });
+        javascript.SetDialogSink([this](const std::wstring& message){
+            MessageBoxW(hwnd,message.c_str(),L"",MB_OK|MB_ICONINFORMATION);
         });
         javascript.SetFrameMessageSink([this](const std::shared_ptr<Node>& node,const std::wstring& data){
             for(auto& frame:childFrames)if(frame.node==node){
@@ -620,7 +624,7 @@ struct View::Impl {
         info.helpText=node->Attribute(L"aria-description");if(info.helpText.empty())info.helpText=node->Attribute(L"title");
         info.ariaRole=ToLower(node->Attribute(L"role"));const auto role=info.ariaRole;
         const auto checked=ToLower(node->Attribute(L"aria-checked"));
-        info.mixed=checked==L"mixed";info.checked=node->checked||checked==L"true";
+        info.mixed=node->indeterminate||checked==L"mixed";info.checked=node->checked||checked==L"true";
         info.expanded=IsDatalistInput(node)?openSelectPopup==node:ToLower(node->Attribute(L"aria-expanded"))==L"true";
         const auto live=ToLower(node->Attribute(L"aria-live"));info.liveSetting=live==L"assertive"?Assertive:live==L"polite"?Polite:Off;
         std::vector<std::wstring> aria;
@@ -1535,11 +1539,18 @@ struct View::Impl {
         layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);
     }
     void Activate(const std::shared_ptr<Node>& node,float clickX,float clickY,bool keyboardFocusVisible=false){if(node&&(node->disabled||ToLower(node->Attribute(L"aria-disabled"))==L"true"))return;SetFocusedNode(node,keyboardFocusVisible,false);if(!node){layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return;}const auto focusTarget=FocusTarget(node);auto type=ToLower(node->Attribute(L"type"));const auto role=ToLower(node->Attribute(L"role"));bool changed=false;
-        if(node->tag==L"input"&&type==L"checkbox"&&!node->disabled){node->checked=!node->checked;changed=true;}
+        if(node->tag==L"input"&&type==L"checkbox"&&!node->disabled){node->indeterminate=false;node->checked=!node->checked;changed=true;}
         else if(node->tag==L"input"&&type==L"radio"&&!node->disabled){auto name=node->Attribute(L"name");for(auto& other:document.GetElementsByName(name))other->checked=(other==node);changed=true;}
         else if(role==L"checkbox"||role==L"switch"){const auto value=ToLower(node->Attribute(L"aria-checked"));node->SetAttribute(L"aria-checked",value==L"true"?L"false":L"true");changed=true;}
         else if(role==L"radio"){node->SetAttribute(L"aria-checked",L"true");changed=true;}
-        javascript.DispatchNodeEvent(node,L"click");if(changed)javascript.DispatchNodeEvent(node,L"change");
+        const bool clickCanceled=javascript.DispatchNodeEvent(node,L"click");
+        if(changed)javascript.DispatchNodeEvent(node,L"change");
+        if(!clickCanceled){
+            const auto anchor=node->Closest(L"a[href]");
+            if(anchor){const auto href=Trim(anchor->Attribute(L"href"));
+                if(!href.empty()&&href.front()==L'#')javascript.NavigateToFragment(href);
+            }
+        }
         layoutDirty=true;
         if(IsTextControl(focusTarget)||IsContentEditable(focusTarget)){
             BeginEditingAt(node,clickX,clickY);
@@ -1884,7 +1895,13 @@ struct View::Impl {
 };
 
 View::View(std::unique_ptr<Impl> impl):impl_(std::move(impl)){}
-View::~View(){if(impl_&&impl_->hwnd&&IsWindow(impl_->hwnd))DestroyWindow(impl_->hwnd);}
+View::~View(){
+    // Disconnect UI Automation before DestroyWindow begins its synchronous
+    // message teardown. UiaDisconnectProvider cannot make the required COM
+    // call while handling a SendMessage-delivered WM_DESTROY.
+    if(impl_&&impl_->accessibility)impl_->accessibility->Disconnect();
+    if(impl_&&impl_->hwnd&&IsWindow(impl_->hwnd))DestroyWindow(impl_->hwnd);
+}
 std::unique_ptr<View> View::Create(HWND parent,const RECT& bounds){auto impl=std::make_unique<Impl>();if(!impl->Initialize(parent,bounds))return {};return std::unique_ptr<View>(new View(std::move(impl)));}
 HWND View::Window()const noexcept{return impl_->hwnd;}
 void View::SetBounds(const RECT& bounds){MoveWindow(impl_->hwnd,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,TRUE);}

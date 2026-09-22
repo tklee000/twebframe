@@ -79,6 +79,7 @@ struct StyleTransition {
 class LayoutEngine {
 public:
     LayoutEngine(Document& document, StyleSheet& styleSheet);
+    ~LayoutEngine();
     void Layout(float width, float height, float deviceScale = 1.0f);
     // Reuse the current style/layout tree for viewport-only changes. A media
     // query boundary crossing automatically falls back to a full rebuild.
@@ -164,6 +165,7 @@ private:
     Microsoft::WRL::ComPtr<ID2D1PathGeometry> verticalArrowGeometry_;
     Microsoft::WRL::ComPtr<ID2D1PathGeometry> horizontalArrowGeometry_;
     FastMap<std::wstring, Microsoft::WRL::ComPtr<ID2D1PathGeometry>> svgGeometryCache_;
+    FastMap<std::wstring, std::shared_ptr<Node>> svgBackgroundCache_;
 };
 
 } // namespace TWebFrame::Internal
