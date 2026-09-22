@@ -2,13 +2,17 @@
 
 #include "FastMap.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace TWebFrame::Internal {
 
 enum class NodeType { Document, Element, Text };
+
+class Document;
 
 struct Node : std::enable_shared_from_this<Node> {
     struct FileInfo {
@@ -25,6 +29,7 @@ struct Node : std::enable_shared_from_this<Node> {
     std::vector<std::shared_ptr<Node>> children;
     std::vector<FileInfo> files;
     std::weak_ptr<Node> parent;
+    Document* ownerDocument = nullptr;
     bool checked = false;
     bool disabled = false;
     bool hovered = false;
@@ -51,6 +56,11 @@ struct Node : std::enable_shared_from_this<Node> {
 class Document {
 public:
     Document();
+    ~Document();
+    Document(const Document&) = delete;
+    Document& operator=(const Document&) = delete;
+    Document(Document&&) = delete;
+    Document& operator=(Document&&) = delete;
     bool Parse(const std::wstring& html, std::wstring* error = nullptr);
     std::vector<std::shared_ptr<Node>> ParseFragment(const std::wstring& html,
                                                      std::wstring* error = nullptr);
@@ -69,6 +79,14 @@ public:
     std::wstring StyleText() const;
     std::wstring ScriptText() const;
     void Reindex();
+    bool UpdateElementId(const std::shared_ptr<Node>& node, const std::wstring& oldId,
+                         const std::wstring& newId);
+    void UpdateElementClass(const std::shared_ptr<Node>& node,
+                            const std::wstring& oldClass,
+                            const std::wstring& newClass);
+    bool IndexSubtree(const std::shared_ptr<Node>& node);
+    bool UnindexSubtree(const std::shared_ptr<Node>& node);
+    std::uint64_t FullReindexCount() const noexcept { return fullReindexCount_; }
 
     static bool MatchesSelector(const std::shared_ptr<Node>& node,
                                 const std::wstring& selector);
@@ -78,7 +96,13 @@ public:
 
 private:
     std::shared_ptr<Node> root_;
+    using NodeIndexBucket = std::unordered_map<const Node*, std::weak_ptr<Node>>;
     FastMap<std::wstring, std::weak_ptr<Node>> ids_;
+    FastMap<std::wstring, size_t> idCounts_;
+    FastMap<std::wstring, NodeIndexBucket> tags_;
+    FastMap<std::wstring, NodeIndexBucket> classes_;
+    NodeIndexBucket ownedNodes_;
+    std::uint64_t fullReindexCount_ = 0;
 };
 
 std::wstring ToLower(std::wstring value);

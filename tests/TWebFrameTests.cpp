@@ -14,8 +14,14 @@
 #include <wrl/client.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <functional>
+#include <iomanip>
 #include <iostream>
+#include <numeric>
+#include <vector>
 
 using namespace TWebFrame::Internal;
 
@@ -46,11 +52,112 @@ const LayoutBox* FindPseudo(const LayoutBox* box, const std::wstring& pseudo) {
         if (const auto* found=FindPseudo(child.get(),pseudo)) return found;
     return nullptr;
 }
+
+struct FrameStats {
+    double mean=0;
+    double p50=0;
+    double p95=0;
+    double p99=0;
+    double maximum=0;
+};
+
+FrameStats SummarizeFrames(std::vector<double> samples) {
+    FrameStats result;
+    if(samples.empty())return result;
+    std::sort(samples.begin(),samples.end());
+    const auto percentile=[&](double value){
+        const size_t index=std::min(samples.size()-1,
+            static_cast<size_t>(std::ceil(value*static_cast<double>(samples.size())))-1);
+        return samples[index];
+    };
+    result.mean=std::accumulate(samples.begin(),samples.end(),0.0)/samples.size();
+    result.p50=percentile(0.50);result.p95=percentile(0.95);result.p99=percentile(0.99);
+    result.maximum=samples.back();return result;
 }
 
-int wmain() {
+bool MeasureFrames(HWND window,size_t sampleCount,
+                   const std::function<bool(size_t)>& action,FrameStats& result) {
+    using Clock=std::chrono::steady_clock;
+    constexpr size_t warmupCount=8;
+    for(size_t index=0;index<warmupCount;++index){
+        if(!action(index))return false;
+        UpdateWindow(window);
+    }
+    std::vector<double> samples;samples.reserve(sampleCount);
+    for(size_t index=0;index<sampleCount;++index){
+        const auto start=Clock::now();
+        if(!action(index+warmupCount))return false;
+        UpdateWindow(window);
+        samples.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+    }
+    result=SummarizeFrames(std::move(samples));return true;
+}
+
+int RunFrameBenchmark() {
+    using Clock=std::chrono::steady_clock;
+    constexpr size_t nodeCount=10000;
+    constexpr size_t sampleCount=120;
+    HWND host=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"",WS_POPUP|WS_VISIBLE,
+        -10000,-10000,1280,720,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    if(!host){std::wcerr<<L"benchmark host creation failed\n";return 1;}
+    RECT bounds{0,0,1280,720};auto view=TWebFrame::View::Create(host,bounds);
+    if(!view){DestroyWindow(host);std::wcerr<<L"benchmark view creation failed\n";return 1;}
+    std::wstring html;
+    html.reserve(nodeCount*72);
+    html+=LR"HTML(<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:14px Segoe UI}#viewport{height:680px;overflow:auto}.item{height:22px;padding:2px 8px;border-bottom:1px solid #eee;color:#222}.item:hover,.item.hot{color:#b91c1c;background:#fef2f2}</style><div id="viewport">)HTML";
+    for(size_t index=0;index<nodeCount;++index)
+        html+=L"<div class='item' id='row-"+std::to_wstring(index)+L"'>Row "+
+            std::to_wstring(index)+L"</div>";
+    html+=L"</div>";
+    const auto loadStart=Clock::now();
+    if(!view->NavigateToString(html)){std::wcerr<<view->LastError()<<L'\n';view.reset();DestroyWindow(host);return 1;}
+    UpdateWindow(view->Window());
+    const double initialLoad=std::chrono::duration<double,std::milli>(Clock::now()-loadStart).count();
+
+    FrameStats hover,style,scroll;
+    const bool hoverOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const int y=11+static_cast<int>(index%28)*22;
+        SendMessageW(view->Window(),WM_MOUSEMOVE,0,MAKELPARAM(80,y));return true;
+    },hover);
+    SendMessageW(view->Window(),WM_MOUSELEAVE,0,0);UpdateWindow(view->Window());
+    std::wstring error;
+    const bool styleOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const auto id=std::to_wstring(index%nodeCount);
+        return view->ExecuteScript(L"document.getElementById('row-"+id+L"').classList.toggle('hot');",
+                                   nullptr,&error);
+    },style);
+    view->ExecuteScript(L"document.getElementById('viewport').scrollTop=0;",nullptr,&error);
+    UpdateWindow(view->Window());
+    POINT wheelPoint{100,100};ClientToScreen(view->Window(),&wheelPoint);
+    const bool scrollOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const short delta=index%2?WHEEL_DELTA:-WHEEL_DELTA;
+        SendMessageW(view->Window(),WM_MOUSEWHEEL,MAKEWPARAM(0,delta),
+            MAKELPARAM(wheelPoint.x,wheelPoint.y));return true;
+    },scroll);
+
+    std::wcout<<std::fixed<<std::setprecision(3)
+        <<L"TWebFrame 10k-node frame benchmark (milliseconds)\n"
+        <<L"initial_load_and_paint="<<initialLoad<<L"\n"
+        <<L"scenario,samples,mean,p50,p95,p99,max\n";
+    const auto print=[&](const wchar_t* name,const FrameStats& value){
+        std::wcout<<name<<L','<<sampleCount<<L','<<value.mean<<L','<<value.p50<<L','
+                  <<value.p95<<L','<<value.p99<<L','<<value.maximum<<L'\n';
+    };
+    print(L"hover",hover);print(L"style_toggle",style);print(L"wheel_scroll",scroll);
+    view.reset();DestroyWindow(host);
+    if(!hoverOk||!styleOk||!scrollOk){
+        std::wcerr<<L"benchmark action failed: "<<error<<L'\n';return 1;
+    }
+    return 0;
+}
+}
+
+int wmain(int argc,wchar_t** argv) {
     const HRESULT comInitialization=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     const bool uninitializeCom=SUCCEEDED(comInitialization);
+    if(argc>1&&_wcsicmp(argv[1],L"--benchmark")==0){
+        const int result=RunFrameBenchmark();if(uninitializeCom)CoUninitialize();return result;
+    }
     FastMap<int, std::wstring, ConstantHash> fastMap;
     for (int i = 0; i < 64; ++i) fastMap[i] = std::to_wstring(i);
     fastMap[17] = L"updated";
@@ -62,6 +169,118 @@ int wmain() {
           L"custom map can reuse cleared buckets");
 
     std::wstring error;
+    Document queryDoc;
+    Check(queryDoc.Parse(L"<body><section id='scope'><span class='first'></span><div><span class='deep'></span></div></section><span class='outside'></span></body>"),
+          L"query optimization fixture parses");
+    const auto queryScope=queryDoc.GetElementById(L"scope");
+    Check(queryDoc.QuerySelector(L".first,.deep",queryScope)==queryScope->children.front(),
+          L"querySelector preserves document-order early exit for selector groups");
+    Check(queryDoc.QuerySelectorAll(L":scope > .first,.deep",queryScope).size()==2,
+          L"compiled scoped selector groups preserve querySelectorAll behavior");
+    queryScope->SetAttribute(L"DATA-MIXED",L"value");
+    Check(queryScope->Attribute(L"data-mixed")==L"value"&&
+          queryScope->Attribute(L"DATA-MIXED")==L"value",
+          L"attribute fast path preserves case-insensitive lookup");
+    queryScope->SetAttribute(L"class",L"alpha\tbeta  gamma");
+    Check(queryScope->HasClass(L"beta")&&!queryScope->HasClass(L"bet"),
+          L"class token scan handles whitespace without stream allocation");
+    Check(queryDoc.QuerySelector(L"section.alpha")==queryScope,
+          L"direct native class mutation updates the owning document candidate index");
+    std::shared_ptr<Node> retainedAfterDocument;
+    {
+        Document ownerDoc;
+        Check(ownerDoc.Parse(L"<body><div id='retained'></div></body>"),
+              L"owner-document lifecycle fixture parses");
+        retainedAfterDocument=ownerDoc.GetElementById(L"retained");
+        Check(retainedAfterDocument&&retainedAfterDocument->ownerDocument==&ownerDoc,
+              L"indexed nodes retain their owning document while connected");
+    }
+    Check(retainedAfterDocument&&retainedAfterDocument->ownerDocument==nullptr,
+          L"document destruction disconnects retained nodes from candidate indexes");
+    retainedAfterDocument->AddClass(L"safe-after-document");
+
+    Document mutationDoc;
+    Check(mutationDoc.Parse(L"<body><div id='scroll'><span></span></div></body>"),
+          L"mutation classification fixture parses");
+    JavaScriptRuntime mutationJs(mutationDoc);
+    JavaScriptRuntime::Mutation lastMutation;int mutationNotifications=0;
+    mutationJs.SetMutationSink([&](const JavaScriptRuntime::Mutation& mutation){
+        lastMutation=mutation;++mutationNotifications;
+    });
+    Check(mutationJs.Execute(L"document.getElementById('scroll').scrollTop=5;",nullptr,&error)&&
+          mutationNotifications==1&&lastMutation.kind==JavaScriptRuntime::MutationKind::Paint&&
+          lastMutation.targets.size()==1&&lastMutation.targets.front()==mutationDoc.GetElementById(L"scroll"),
+          L"scroll mutations remain paint-only and retain their target");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(L"const node=document.getElementById('scroll');node.scrollTop=8;node.style.color='red';",nullptr,&error)&&
+          mutationNotifications==1&&lastMutation.kind==JavaScriptRuntime::MutationKind::Style,
+          L"batched mutations retain the strongest invalidation level");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(L"document.getElementById('scroll').setAttribute('width','240');",nullptr,&error)&&
+          mutationNotifications==1&&lastMutation.kind==JavaScriptRuntime::MutationKind::Layout,
+          L"geometry-affecting attributes request layout without a tree mutation");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(L"const child=document.createElement('b');document.getElementById('scroll').appendChild(child);",nullptr,&error)&&
+          mutationNotifications==1&&lastMutation.kind==JavaScriptRuntime::MutationKind::Tree,
+          L"tree mutations request a layout-tree rebuild");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(L"document.getElementById('scroll').setAttribute('ARIA-LIVE','polite');",nullptr,&error)&&
+          mutationNotifications==1&&lastMutation.liveRegionMembershipChanged,
+          L"aria-live membership changes are identified without a document-wide scan");
+    const auto incrementalIndexStart=mutationDoc.FullReindexCount();
+    Check(mutationJs.Execute(L"const indexedChild=document.createElement('i');indexedChild.id='incremental-id';document.getElementById('scroll').appendChild(indexedChild);",nullptr,&error)&&
+          mutationDoc.GetElementById(L"incremental-id")!=nullptr&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"unique subtree insertion updates the ID index without a full document walk");
+    Check(mutationJs.Execute(L"indexedChild.id='renamed-id';",nullptr,&error)&&
+          !mutationDoc.GetElementById(L"incremental-id")&&mutationDoc.GetElementById(L"renamed-id")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"unique ID replacement updates the index incrementally");
+    Check(mutationJs.Execute(L"indexedChild.remove();",nullptr,&error)&&
+          !mutationDoc.GetElementById(L"renamed-id")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"unique subtree removal updates the ID index incrementally");
+    Check(mutationJs.Execute(L"const candidateChild=document.createElement('article');candidateChild.className='candidate-old';document.getElementById('scroll').appendChild(candidateChild);",nullptr,&error)&&
+          mutationDoc.QuerySelector(L"article.candidate-old")==mutationDoc.QuerySelector(L".candidate-old")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"subtree insertion updates tag and class candidate indexes incrementally");
+    Check(mutationJs.Execute(L"candidateChild.classList.remove('candidate-old');candidateChild.classList.add('candidate-new');",nullptr,&error)&&
+          !mutationDoc.QuerySelector(L".candidate-old")&&
+          mutationDoc.QuerySelector(L"article.candidate-new")!=nullptr&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"classList mutations update class candidates without a full reindex");
+    Check(mutationJs.Execute(L"candidateChild.setAttribute('class','candidate-set');",nullptr,&error)&&
+          !mutationDoc.QuerySelector(L".candidate-new")&&mutationDoc.QuerySelector(L".candidate-set")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"class attribute replacement updates class candidates incrementally");
+    Check(mutationJs.Execute(L"candidateChild.remove();",nullptr,&error)&&
+          !mutationDoc.QuerySelector(L"article.candidate-set")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart,
+          L"subtree removal clears tag and class candidate indexes incrementally");
+    Check(mutationJs.Execute(L"const duplicateA=document.createElement('b');const duplicateB=document.createElement('b');duplicateA.id='duplicate-id';duplicateB.id='duplicate-id';document.getElementById('scroll').append(duplicateA,duplicateB);",nullptr,&error)&&
+          mutationDoc.GetElementById(L"duplicate-id")&&
+          mutationDoc.FullReindexCount()==incrementalIndexStart+1,
+          L"duplicate IDs conservatively fall back to one full reindex");
+    const auto duplicateMatches=mutationDoc.QuerySelectorAll(L"#duplicate-id");
+    Check(duplicateMatches.size()==2&&mutationDoc.QuerySelector(L"#duplicate-id")==duplicateMatches.front(),
+          L"duplicate-ID candidate fallback preserves first-in-document query order");
+
+    Document scrollSyncDoc;
+    Check(scrollSyncDoc.Parse(L"<body><div id='scroller'><div id='scroll-content'></div></div></body>"),
+          L"paint-only scroll fixture parses");
+    StyleSheet scrollSyncCss;
+    Check(scrollSyncCss.Parse(L"#scroller{width:160px;height:40px;overflow:auto}#scroll-content{height:200px}"),
+          L"paint-only scroll styles parse");
+    LayoutEngine scrollSyncLayout(scrollSyncDoc,scrollSyncCss);scrollSyncLayout.Layout(240,120);
+    const auto scroller=scrollSyncDoc.GetElementById(L"scroller");
+    const auto scrollContent=scrollSyncDoc.GetElementById(L"scroll-content");
+    const float initialContentY=scrollSyncLayout.BoxFor(scrollContent)->rect.y;
+    scroller->scrollTop=30;
+    Check(scrollSyncLayout.SyncScroll(scroller)&&
+          std::abs(scrollSyncLayout.BoxFor(scrollContent)->rect.y-(initialContentY-30))<0.01f&&
+          !scrollSyncLayout.SyncScroll(scroller),
+          L"paint-only DOM scrolling translates existing layout boxes exactly once");
+
     Document switchDoc;Check(switchDoc.Parse(L"<body></body>",&error),L"switch JavaScript fixture parses");
     JavaScriptRuntime switchJs(switchDoc);std::wstring switchResult;
     Check(switchJs.Load(L"function choose(value){let result='';switch(value){case 'a':result+='a';break;default:result+='d';case 'b':result+='b';}return result;}",&error),error.c_str());

@@ -46,6 +46,8 @@ struct LayoutBox {
     float stickyFlowY = 0.0f;
     float scrollWidth = 0.0f;
     float scrollHeight = 0.0f;
+    float appliedScrollLeft = 0.0f;
+    float appliedScrollTop = 0.0f;
     // Synthetic line fragments retain their offset in the originating DOM
     // text node so pointer/caret geometry maps back to DOM offsets.
     size_t textSourceOffset = 0;
@@ -81,10 +83,12 @@ public:
     // Reuse the current style/layout tree for viewport-only changes. A media
     // query boundary crossing automatically falls back to a full rebuild.
     void Relayout(float width, float height, float deviceScale = 1.0f);
-    void Paint(ID2D1RenderTarget* target, IDWriteFactory* writeFactory);
+    void Paint(ID2D1RenderTarget* target, IDWriteFactory* writeFactory,
+               const LayoutRect* dirtyBounds = nullptr);
     bool ScrollAt(float x, float y, float wheelDelta,
                   std::shared_ptr<Node>* scrolledNode = nullptr,
                   bool horizontal = false);
+    bool SyncScroll(const std::shared_ptr<Node>& node);
     bool BeginScrollbarInteraction(float x, float y, std::shared_ptr<Node>& dragNode,
                                    float& dragOffset, bool& horizontal);
     bool BeginScrollbarInteraction(float x, float y, std::shared_ptr<Node>& dragNode,
@@ -101,6 +105,7 @@ public:
     std::wstring DumpJson() const;
     const LayoutBox* Root() const { return root_.get(); }
     const LayoutBox* BoxFor(const std::shared_ptr<Node>& node) const;
+    bool VisualBounds(const std::shared_ptr<Node>& node, LayoutRect& bounds) const;
     bool HasActiveTransitions() const;
     bool AdvanceTransitions(float milliseconds);
     void ClearTransitions();
@@ -137,6 +142,9 @@ private:
     void ApplyTransitions(LayoutBox& box);
     void RefreshTransitionFrame(LayoutBox& box);
     void InvalidateMeasurements(LayoutBox& box);
+    ID2D1SolidColorBrush* SolidBrush(ID2D1RenderTarget* target, unsigned int color);
+    ID2D1SolidColorBrush* SolidBrush(ID2D1RenderTarget* target, const D2D1_COLOR_F& color);
+    void EnsureGeometryResources(ID2D1RenderTarget* target);
 
     Document& document_;
     StyleSheet& styleSheet_;
@@ -149,6 +157,13 @@ private:
     float viewportWidth_ = 0;
     float viewportHeight_ = 0;
     float deviceScale_ = 1.0f;
+    ID2D1RenderTarget* brushCacheTarget_ = nullptr;
+    FastMap<unsigned int, Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>> brushCache_;
+    ID2D1Factory* geometryFactory_ = nullptr;
+    Microsoft::WRL::ComPtr<ID2D1PathGeometry> selectArrowGeometry_;
+    Microsoft::WRL::ComPtr<ID2D1PathGeometry> verticalArrowGeometry_;
+    Microsoft::WRL::ComPtr<ID2D1PathGeometry> horizontalArrowGeometry_;
+    FastMap<std::wstring, Microsoft::WRL::ComPtr<ID2D1PathGeometry>> svgGeometryCache_;
 };
 
 } // namespace TWebFrame::Internal

@@ -69,6 +69,7 @@ public:
     bool HasPseudoRulesFor(const std::shared_ptr<Node>& node,std::wstring_view pseudo) const;
     bool HoverStateAffects(const std::shared_ptr<Node>& node) const;
     bool HoverRequiresBroadInvalidation() const noexcept { return hoverRequiresBroadInvalidation_; }
+    bool MutationRequiresBroadInvalidation() const noexcept { return mutationRequiresBroadInvalidation_; }
     std::uint64_t Version() const noexcept { return version_; }
 
     static float Length(const std::wstring& value, float reference, float viewport,
@@ -90,6 +91,7 @@ private:
     std::vector<std::wstring> pseudoRules_;
     std::vector<size_t> hoverRuleIndexes_;
     bool hoverRequiresBroadInvalidation_ = false;
+    bool mutationRequiresBroadInvalidation_ = false;
     bool usesNthChild_ = false;
     bool usesViewportFontSize_ = false;
     float viewportWidth_ = std::numeric_limits<float>::infinity();

@@ -4,12 +4,24 @@
 #include <cwctype>
 #include <functional>
 #include <sstream>
+#include <unordered_set>
 
 namespace TWebFrame::Internal {
 
 namespace {
 
 bool IsSpace(wchar_t c) { return std::iswspace(c) != 0; }
+
+template<typename Callback>
+void ForEachClassToken(const std::wstring& value, Callback&& callback) {
+    size_t position = 0;
+    while (position < value.size()) {
+        while (position < value.size() && IsSpace(value[position])) ++position;
+        const size_t start = position;
+        while (position < value.size() && !IsSpace(value[position])) ++position;
+        if (start != position) callback(value.substr(start, position - start));
+    }
+}
 
 bool IsVoidTag(const std::wstring& tag) {
     static const wchar_t* tags[] = {
@@ -237,6 +249,120 @@ void Walk(const std::shared_ptr<Node>& node,
     for (const auto& child : node->children) Walk(child, fn);
 }
 
+bool WalkUntil(const std::shared_ptr<Node>& node,
+               const std::function<bool(const std::shared_ptr<Node>&)>& fn) {
+    if (!node) return false;
+    if (fn(node)) return true;
+    for (const auto& child : node->children)
+        if (WalkUntil(child, fn)) return true;
+    return false;
+}
+
+struct CompiledQuerySelector {
+    enum class ScopeMode { None, ScopeOnly, DirectChild, Descendant };
+    enum class IndexKind { None, Id, Class, Tag };
+    ScopeMode scopeMode = ScopeMode::None;
+    IndexKind indexKind = IndexKind::None;
+    std::wstring indexKey;
+    std::vector<std::wstring> parts;
+};
+
+void CompileQueryIndexKey(CompiledQuerySelector& selector) {
+    if (selector.parts.empty()) return;
+    const auto& simple = selector.parts.back();
+    std::wstring firstClass;
+    int brackets = 0, parentheses = 0;
+    for (size_t index = 0; index < simple.size();) {
+        const wchar_t character = simple[index];
+        if (character == L'[') { ++brackets; ++index; continue; }
+        if (character == L']') { brackets = std::max(0, brackets - 1); ++index; continue; }
+        if (character == L'(') { ++parentheses; ++index; continue; }
+        if (character == L')') { parentheses = std::max(0, parentheses - 1); ++index; continue; }
+        if ((character == L'#' || character == L'.') && brackets == 0 && parentheses == 0) {
+            const wchar_t kind = character;
+            const size_t start = ++index;
+            while (index < simple.size() && (std::iswalnum(simple[index]) ||
+                   simple[index] == L'-' || simple[index] == L'_')) ++index;
+            if (start == index) continue;
+            const auto key = simple.substr(start, index - start);
+            if (kind == L'#') {
+                selector.indexKind = CompiledQuerySelector::IndexKind::Id;
+                selector.indexKey = key;
+                return;
+            }
+            if (firstClass.empty()) firstClass = key;
+            continue;
+        }
+        ++index;
+    }
+    if (!firstClass.empty()) {
+        selector.indexKind = CompiledQuerySelector::IndexKind::Class;
+        selector.indexKey = std::move(firstClass);
+        return;
+    }
+    size_t end = 0;
+    if (!simple.empty() && (std::iswalpha(simple.front()) || simple.front() == L'_')) {
+        end = 1;
+        while (end < simple.size() && (std::iswalnum(simple[end]) ||
+               simple[end] == L'-' || simple[end] == L'_')) ++end;
+    }
+    if (end) {
+        selector.indexKind = CompiledQuerySelector::IndexKind::Tag;
+        selector.indexKey = ToLower(simple.substr(0, end));
+    }
+}
+
+std::vector<CompiledQuerySelector> CompileQuerySelectors(const std::wstring& selector,
+                                                         bool hasScope) {
+    std::vector<CompiledQuerySelector> result;
+    int nesting = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= selector.size(); ++i) {
+        const wchar_t c = i < selector.size() ? selector[i] : L',';
+        if (c == L'[' || c == L'(') ++nesting;
+        if (c == L']' || c == L')') --nesting;
+        if (c != L',' || nesting != 0) continue;
+        auto item = Trim(selector.substr(start, i - start));
+        start = i + 1;
+        CompiledQuerySelector compiled;
+        if (hasScope && item.rfind(L":scope", 0) == 0) {
+            auto remainder = Trim(item.substr(6));
+            if (remainder.empty()) compiled.scopeMode = CompiledQuerySelector::ScopeMode::ScopeOnly;
+            else if (remainder.front() == L'>') {
+                compiled.scopeMode = CompiledQuerySelector::ScopeMode::DirectChild;
+                remainder = Trim(remainder.substr(1));
+                compiled.parts = SplitSelector(remainder);
+            } else {
+                compiled.scopeMode = CompiledQuerySelector::ScopeMode::Descendant;
+                compiled.parts = SplitSelector(remainder);
+            }
+        } else {
+            compiled.parts = SplitSelector(item);
+        }
+        CompileQueryIndexKey(compiled);
+        result.push_back(std::move(compiled));
+    }
+    return result;
+}
+
+bool MatchesQuerySelector(const std::shared_ptr<Node>& node,
+                          const std::shared_ptr<Node>& scope,
+                          const CompiledQuerySelector& selector) {
+    using ScopeMode = CompiledQuerySelector::ScopeMode;
+    if (selector.scopeMode == ScopeMode::ScopeOnly) return node == scope;
+    if (selector.scopeMode == ScopeMode::DirectChild)
+        return node->parent.lock() == scope && Document::MatchesSelector(node, selector.parts);
+    if (selector.scopeMode == ScopeMode::Descendant)
+        return node != scope && Document::MatchesSelector(node, selector.parts);
+    return Document::MatchesSelector(node, selector.parts);
+}
+
+void AppendInnerText(const Node& node, std::wstring& output) {
+    if (node.type == NodeType::Text) { output += node.text; return; }
+    if (node.tag == L"br") { output += L'\n'; return; }
+    for (const auto& child : node.children) AppendInnerText(*child, output);
+}
+
 class HtmlParser {
 public:
     explicit HtmlParser(const std::wstring& html) : html_(html) {}
@@ -407,45 +533,87 @@ std::wstring DecodeEntities(const std::wstring& value) {
 }
 
 std::wstring Node::Attribute(const std::wstring& name) const {
-    const auto it = attributes.find(ToLower(name));
-    return it == attributes.end() ? L"" : it->second;
+    // Parsed and DOM-authored attribute keys are stored lowercase. The common
+    // path uses lowercase literals, so avoid allocating a temporary string for
+    // every lookup and only normalize genuinely mixed-case input.
+    const auto direct = attributes.find(name);
+    if (direct != attributes.end()) return direct->second;
+    if (std::none_of(name.begin(), name.end(), [](wchar_t character) {
+            return std::iswupper(character) != 0;
+        })) return L"";
+    const auto normalized = attributes.find(ToLower(name));
+    return normalized == attributes.end() ? L"" : normalized->second;
 }
 
 void Node::SetAttribute(const std::wstring& name, const std::wstring& value) {
     const auto key = ToLower(name);
+    const auto oldClass = key == L"class" ? Attribute(L"class") : L"";
     attributes[key] = value;
     if (key == L"checked") checked = true;
     if (key == L"disabled") disabled = true;
     if (key == L"style") { inlineStyle.clear(); ParseStyleAttribute(value, inlineStyle); }
+    if (key == L"class" && ownerDocument)
+        ownerDocument->UpdateElementClass(shared_from_this(), oldClass, value);
 }
 
 void Node::RemoveAttribute(const std::wstring& name) {
     const auto key = ToLower(name);
+    const auto oldClass = key == L"class" ? Attribute(L"class") : L"";
     attributes.erase(key);
     if (key == L"checked") checked = false;
     if (key == L"disabled") disabled = false;
     if (key == L"style") inlineStyle.clear();
+    if (key == L"class" && ownerDocument)
+        ownerDocument->UpdateElementClass(shared_from_this(), oldClass, L"");
 }
 
 bool Node::HasClass(const std::wstring& name) const {
-    std::wistringstream in(Attribute(L"class"));
-    std::wstring item;
-    while (in >> item) if (item == name) return true;
+    const auto found = attributes.find(L"class");
+    if (found == attributes.end()) return false;
+    const auto& value = found->second;
+    size_t position = 0;
+    while (position < value.size()) {
+        while (position < value.size() && IsSpace(value[position])) ++position;
+        const size_t start = position;
+        while (position < value.size() && !IsSpace(value[position])) ++position;
+        if (position - start == name.size() && value.compare(start, name.size(), name) == 0)
+            return true;
+    }
     return false;
 }
 
 void Node::AddClass(const std::wstring& name) {
     if (HasClass(name)) return;
     auto value = Attribute(L"class");
+    const auto oldClass = value;
     if (!value.empty()) value += L' ';
     attributes[L"class"] = value + name;
+    if (ownerDocument)
+        ownerDocument->UpdateElementClass(shared_from_this(), oldClass, attributes[L"class"]);
 }
 
 void Node::RemoveClass(const std::wstring& name) {
-    std::wistringstream in(Attribute(L"class"));
-    std::wstring item, value;
-    while (in >> item) if (item != name) { if (!value.empty()) value += L' '; value += item; }
-    attributes[L"class"] = value;
+    const auto found = attributes.find(L"class");
+    if (found == attributes.end()) return;
+    const auto& source = found->second;
+    if (!HasClass(name)) return;
+    const auto oldClass = source;
+    std::wstring value;
+    value.reserve(source.size());
+    size_t position = 0;
+    while (position < source.size()) {
+        while (position < source.size() && IsSpace(source[position])) ++position;
+        const size_t start = position;
+        while (position < source.size() && !IsSpace(source[position])) ++position;
+        if (start == position ||
+            (position - start == name.size() && source.compare(start, name.size(), name) == 0))
+            continue;
+        if (!value.empty()) value += L' ';
+        value.append(source, start, position - start);
+    }
+    attributes[L"class"] = std::move(value);
+    if (ownerDocument)
+        ownerDocument->UpdateElementClass(shared_from_this(), oldClass, attributes[L"class"]);
 }
 
 void Node::ToggleClass(const std::wstring& name, bool force, bool hasForce) {
@@ -454,14 +622,17 @@ void Node::ToggleClass(const std::wstring& name, bool force, bool hasForce) {
 }
 
 std::wstring Node::InnerText() const {
-    if (type == NodeType::Text) return text;
-    if (tag == L"br") return L"\n";
     std::wstring result;
-    for (const auto& child : children) result += child->InnerText();
+    AppendInnerText(*this, result);
     return result;
 }
 
 void Node::SetInnerText(const std::wstring& value) {
+    std::function<void(const std::shared_ptr<Node>&)> disconnect = [&](const auto& node) {
+        node->ownerDocument = nullptr;
+        for (const auto& child : node->children) disconnect(child);
+    };
+    for (auto& child : children) { disconnect(child); child->parent.reset(); }
     children.clear();
     auto child = std::make_shared<Node>();
     child->type = NodeType::Text; child->tag = L"#text"; child->text = value;
@@ -481,6 +652,14 @@ std::shared_ptr<Node> Node::Closest(const std::wstring& selector) {
 Document::Document() {
     root_ = std::make_shared<Node>();
     root_->type = NodeType::Document; root_->tag = L"#document";
+    root_->ownerDocument = this;
+    ownedNodes_[root_.get()] = root_;
+}
+
+Document::~Document() {
+    for (const auto& entry : ownedNodes_)
+        if (const auto node = entry.second.lock(); node && node->ownerDocument == this)
+            node->ownerDocument = nullptr;
 }
 
 bool Document::Parse(const std::wstring& html, std::wstring* error) {
@@ -553,32 +732,81 @@ bool Document::MatchesSelector(const std::shared_ptr<Node>& node,
 
 std::shared_ptr<Node> Document::QuerySelector(const std::wstring& selector,
                                                const std::shared_ptr<Node>& scope) const {
-    auto all = QuerySelectorAll(selector, scope);
-    return all.empty() ? nullptr : all.front();
+    const auto selectors = CompileQuerySelectors(selector, scope != nullptr);
+    std::unordered_set<const Node*> candidates;
+    bool filterCandidates = !selectors.empty();
+    for (const auto& item : selectors) {
+        if (item.scopeMode == CompiledQuerySelector::ScopeMode::ScopeOnly) {
+            if (scope) candidates.insert(scope.get());
+            continue;
+        }
+        if (item.indexKind == CompiledQuerySelector::IndexKind::Id) {
+            const auto count = idCounts_.find(item.indexKey);
+            const auto indexed = ids_.find(item.indexKey);
+            if (count == idCounts_.end() || count->second != 1 || indexed == ids_.end()) {
+                if (count != idCounts_.end() && count->second > 1) filterCandidates = false;
+                continue;
+            }
+            if (const auto node = indexed->second.lock()) candidates.insert(node.get());
+        } else if (item.indexKind == CompiledQuerySelector::IndexKind::Class ||
+                   item.indexKind == CompiledQuerySelector::IndexKind::Tag) {
+            const auto& index = item.indexKind == CompiledQuerySelector::IndexKind::Class ? classes_ : tags_;
+            const auto found = index.find(item.indexKey);
+            if (found == index.end()) continue;
+            for (const auto& entry : found->second)
+                if (entry.second.lock()) candidates.insert(entry.first);
+        } else {
+            filterCandidates = false;
+        }
+    }
+    if (filterCandidates && candidates.empty()) return {};
+    std::shared_ptr<Node> result;
+    WalkUntil(scope ? scope : root_, [&](const auto& node) {
+        if (filterCandidates && candidates.count(node.get()) == 0) return false;
+        for (const auto& item : selectors) {
+            if (MatchesQuerySelector(node, scope, item)) { result = node; return true; }
+        }
+        return false;
+    });
+    return result;
 }
 
 std::vector<std::shared_ptr<Node>> Document::QuerySelectorAll(
     const std::wstring& selector, const std::shared_ptr<Node>& scope) const {
     std::vector<std::shared_ptr<Node>> result;
-    // Comma-separated selectors are supported outside attribute/pseudo brackets.
-    std::vector<std::wstring> selectors;
-    int nesting = 0; size_t start = 0;
-    for (size_t i = 0; i <= selector.size(); ++i) {
-        const wchar_t c = i < selector.size() ? selector[i] : L',';
-        if (c == L'[' || c == L'(') ++nesting;
-        if (c == L']' || c == L')') --nesting;
-        if (c == L',' && nesting == 0) { selectors.push_back(Trim(selector.substr(start, i - start))); start = i + 1; }
+    // Parse selector groups once instead of once for every visited node.
+    const auto selectors = CompileQuerySelectors(selector, scope != nullptr);
+    std::unordered_set<const Node*> candidates;
+    bool filterCandidates = !selectors.empty();
+    for (const auto& item : selectors) {
+        if (item.scopeMode == CompiledQuerySelector::ScopeMode::ScopeOnly) {
+            if (scope) candidates.insert(scope.get());
+            continue;
+        }
+        if (item.indexKind == CompiledQuerySelector::IndexKind::Id) {
+            const auto count = idCounts_.find(item.indexKey);
+            const auto indexed = ids_.find(item.indexKey);
+            if (count == idCounts_.end() || count->second != 1 || indexed == ids_.end()) {
+                if (count != idCounts_.end() && count->second > 1) filterCandidates = false;
+                continue;
+            }
+            if (const auto node = indexed->second.lock()) candidates.insert(node.get());
+        } else if (item.indexKind == CompiledQuerySelector::IndexKind::Class ||
+                   item.indexKind == CompiledQuerySelector::IndexKind::Tag) {
+            const auto& index = item.indexKind == CompiledQuerySelector::IndexKind::Class ? classes_ : tags_;
+            const auto found = index.find(item.indexKey);
+            if (found == index.end()) continue;
+            for (const auto& entry : found->second)
+                if (entry.second.lock()) candidates.insert(entry.first);
+        } else {
+            filterCandidates = false;
+        }
     }
+    if (filterCandidates && candidates.empty()) return result;
     Walk(scope ? scope : root_, [&](const auto& node) {
+        if (filterCandidates && candidates.count(node.get()) == 0) return;
         for (const auto& item : selectors) {
-            bool matched=false;
-            if(scope&&item.rfind(L":scope",0)==0){
-                auto remainder=Trim(item.substr(6));
-                if(remainder.empty())matched=node==scope;
-                else if(remainder[0]==L'>')matched=node->parent.lock()==scope&&MatchesSelector(node,Trim(remainder.substr(1)));
-                else matched=node!=scope&&MatchesSelector(node,remainder);
-            }else matched=MatchesSelector(node,item);
-            if(matched){result.push_back(node);break;}
+            if (MatchesQuerySelector(node, scope, item)) { result.push_back(node); break; }
         }
     });
     return result;
@@ -595,6 +823,11 @@ void Document::SetInnerHtml(const std::shared_ptr<Node>& node, const std::wstrin
     if (!node) return;
     auto children = ParseFragment(html);
     for (auto& child : children) child->parent = node;
+    std::function<void(const std::shared_ptr<Node>&)> disconnect = [&](const auto& current) {
+        current->ownerDocument = nullptr;
+        for (const auto& child : current->children) disconnect(child);
+    };
+    for (auto& child : node->children) { disconnect(child); child->parent.reset(); }
     node->children = std::move(children);
     if (reindex) Reindex();
 }
@@ -612,11 +845,126 @@ std::wstring Document::ScriptText() const {
 }
 
 void Document::Reindex() {
-    ids_.clear();
+    ++fullReindexCount_;
+    for (const auto& entry : ownedNodes_)
+        if (const auto node = entry.second.lock(); node && node->ownerDocument == this)
+            node->ownerDocument = nullptr;
+    ownedNodes_.clear();
+    ids_.clear();idCounts_.clear();tags_.clear();classes_.clear();
     Walk(root_, [&](const auto& node) {
+        node->ownerDocument = this;
+        ownedNodes_[node.get()] = node;
+        if (node->type == NodeType::Element) {
+            tags_[node->tag][node.get()] = node;
+            const auto classes = node->attributes.find(L"class");
+            if (classes != node->attributes.end())
+                ForEachClassToken(classes->second, [&](const auto& token) {
+                    classes_[token][node.get()] = node;
+                });
+        }
         const auto id = node->Attribute(L"id");
-        if (!id.empty()) ids_[id] = node;
+        if (!id.empty()) { ids_[id] = node; ++idCounts_[id]; }
     });
+}
+
+bool Document::UpdateElementId(const std::shared_ptr<Node>& node,
+                               const std::wstring& oldId,
+                               const std::wstring& newId) {
+    if(!node||oldId==newId)return true;
+    auto root=node;while(auto parent=root->parent.lock())root=std::move(parent);
+    if(root!=root_)return true;
+    if(!oldId.empty()){
+        const auto count=idCounts_.find(oldId);
+        const auto indexed=ids_.find(oldId);
+        if(count==idCounts_.end()||count->second!=1||indexed==ids_.end()||
+           indexed->second.lock()!=node)return false;
+    }
+    if(!newId.empty()){
+        const auto count=idCounts_.find(newId);
+        if(count!=idCounts_.end()&&count->second!=0)return false;
+    }
+    if(!oldId.empty()){ids_.erase(oldId);idCounts_.erase(oldId);}
+    if(!newId.empty()){ids_[newId]=node;idCounts_[newId]=1;}
+    return true;
+}
+
+void Document::UpdateElementClass(const std::shared_ptr<Node>& node,
+                                  const std::wstring& oldClass,
+                                  const std::wstring& newClass) {
+    if (!node || oldClass == newClass) return;
+    auto root = node;
+    while (auto parent = root->parent.lock()) root = std::move(parent);
+    if (root != root_) return;
+    std::unordered_set<std::wstring> oldTokens, newTokens;
+    ForEachClassToken(oldClass, [&](const auto& token) { oldTokens.insert(token); });
+    ForEachClassToken(newClass, [&](const auto& token) { newTokens.insert(token); });
+    for (const auto& token : oldTokens) if (newTokens.count(token) == 0) {
+        const auto found = classes_.find(token);
+        if (found != classes_.end()) found->second.erase(node.get());
+    }
+    for (const auto& token : newTokens) if (oldTokens.count(token) == 0)
+        classes_[token][node.get()] = node;
+}
+
+bool Document::IndexSubtree(const std::shared_ptr<Node>& node) {
+    if(!node)return true;
+    auto root=node;while(auto parent=root->parent.lock())root=std::move(parent);
+    if(root!=root_)return true;
+    std::vector<std::pair<std::wstring,std::shared_ptr<Node>>> entries;
+    FastMap<std::wstring,size_t> pending;
+    Walk(node,[&](const auto& current){
+        const auto id=current->Attribute(L"id");
+        if(!id.empty()){entries.emplace_back(id,current);++pending[id];}
+    });
+    for(const auto& item:pending){
+        if(item.second!=1)return false;
+        const auto existing=idCounts_.find(item.first);
+        if(existing!=idCounts_.end()&&existing->second!=0)return false;
+    }
+    Walk(node,[&](const auto& current){
+        current->ownerDocument=this;
+        ownedNodes_[current.get()]=current;
+        if(current->type!=NodeType::Element)return;
+        tags_[current->tag][current.get()]=current;
+        const auto classes=current->attributes.find(L"class");
+        if(classes!=current->attributes.end())ForEachClassToken(classes->second,[&](const auto& token){
+            classes_[token][current.get()]=current;
+        });
+    });
+    for(const auto& item:entries){ids_[item.first]=item.second;idCounts_[item.first]=1;}
+    return true;
+}
+
+bool Document::UnindexSubtree(const std::shared_ptr<Node>& node) {
+    if(!node)return true;
+    auto root=node;while(auto parent=root->parent.lock())root=std::move(parent);
+    if(root!=root_)return true;
+    std::vector<std::pair<std::wstring,std::shared_ptr<Node>>> entries;
+    FastMap<std::wstring,size_t> pending;
+    FastMap<std::wstring,std::shared_ptr<Node>> pendingNodes;
+    Walk(node,[&](const auto& current){
+        const auto id=current->Attribute(L"id");
+        if(!id.empty()){entries.emplace_back(id,current);++pending[id];pendingNodes[id]=current;}
+    });
+    for(const auto& item:pending){
+        if(item.second!=1)return false;
+        const auto count=idCounts_.find(item.first);
+        const auto indexed=ids_.find(item.first);
+        if(count==idCounts_.end()||count->second!=1||indexed==ids_.end()||
+           indexed->second.lock()!=pendingNodes.find(item.first)->second)return false;
+    }
+    Walk(node,[&](const auto& current){
+        if(current->ownerDocument==this)current->ownerDocument=nullptr;
+        ownedNodes_.erase(current.get());
+        if(current->type!=NodeType::Element)return;
+        const auto tag=tags_.find(current->tag);if(tag!=tags_.end())tag->second.erase(current.get());
+        const auto classes=current->attributes.find(L"class");
+        if(classes!=current->attributes.end())ForEachClassToken(classes->second,[&](const auto& token){
+            const auto found=classes_.find(token);if(found!=classes_.end())found->second.erase(current.get());
+        });
+    });
+    for(const auto& item:entries){ids_.erase(item.first);idCounts_.erase(item.first);}
+    return true;
 }
 
 } // namespace TWebFrame::Internal

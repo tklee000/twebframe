@@ -5,6 +5,7 @@
 #include <cwctype>
 #include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <limits>
 #include <sstream>
 #include <wrl/client.h>
@@ -2645,8 +2646,10 @@ void ApplySticky(LayoutBox& box,float clipTop,float viewportHeight){
 
 void ApplyScrollOffset(LayoutBox& box,float oldScrollLeft,float oldScrollTop,float viewportHeight){
     const float dx=oldScrollLeft-box.node->scrollLeft,dy=oldScrollTop-box.node->scrollTop;
-    if(std::abs(dx)<0.001f&&std::abs(dy)<0.001f)return;
-    for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,dx,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
+    if(std::abs(dx)>=0.001f||std::abs(dy)>=0.001f)
+        for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,dx,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
+    box.appliedScrollLeft=box.node->scrollLeft;
+    box.appliedScrollTop=box.node->scrollTop;
 }
 
 std::vector<float> SvgNumbers(const std::wstring& source){
@@ -2753,7 +2756,9 @@ std::shared_ptr<Node> SvgUseTarget(const std::shared_ptr<Node>& use){
 
 void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& styleSheet,
                    const std::shared_ptr<Node>& node,const ComputedStyle* parentStyle,
-                   float parentOpacity,unsigned int inheritedColor,int referenceDepth=0){
+                   float parentOpacity,unsigned int inheritedColor,
+                   FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1PathGeometry>>& geometryCache,
+                   int referenceDepth=0){
     if(!node||referenceDepth>16)return;
     const auto style=styleSheet.Compute(node,parentStyle);
     const auto currentColor=StyleSheet::Color(style.Get(L"color"),inheritedColor);
@@ -2766,15 +2771,15 @@ void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& s
     opacity=std::max(0.0f,std::min(1.0f,opacity));
     if(node->tag==L"g"||node->tag==L"symbol"){
         for(const auto& child:node->children)
-            PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,referenceDepth);
+            PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,geometryCache,referenceDepth);
         return;
     }
     if(node->tag==L"use"){
         if(const auto referenced=SvgUseTarget(node)){
             if(referenced->tag==L"symbol"||referenced->tag==L"g")
                 for(const auto& child:referenced->children)
-                    PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,referenceDepth+1);
-            else PaintSvgShape(target,factory,styleSheet,referenced,&style,opacity,currentColor,referenceDepth+1);
+                    PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,geometryCache,referenceDepth+1);
+            else PaintSvgShape(target,factory,styleSheet,referenced,&style,opacity,currentColor,geometryCache,referenceDepth+1);
         }
         return;
     }
@@ -2803,23 +2808,34 @@ void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& s
         if(strokeBrush)target->DrawGeometry(geometry,strokeBrush.Get(),strokeWidth,strokeStyle.Get());
     };
     if(node->tag==L"path"){
-        auto geometry=SvgPath(factory,node->Attribute(L"d"));
-        paintGeometry(geometry.Get());
+        const auto data=node->Attribute(L"d"),key=L"path\x1f"+data;
+        auto found=geometryCache.find(key);
+        if(found==geometryCache.end()){
+            if(geometryCache.size()>=256)geometryCache.clear();
+            found=geometryCache.emplace(key,SvgPath(factory,data)).first;
+        }
+        paintGeometry(found->second.Get());
     }else if(node->tag==L"polygon"||node->tag==L"polyline"){
-        const auto points=numbers(L"points");
-        if(points.size()>=4){
+        const auto source=node->Attribute(L"points"),key=node->tag+
+            (fillBrush?L"\x001f" L"f" L"\x001f":L"\x001f" L"h" L"\x001f")+source;
+        auto found=geometryCache.find(key);
+        if(found==geometryCache.end()){
+            const auto points=SvgNumbers(source);
             Microsoft::WRL::ComPtr<ID2D1PathGeometry> geometry;
             Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-            if(SUCCEEDED(factory->CreatePathGeometry(&geometry))&&
+            if(points.size()>=4&&SUCCEEDED(factory->CreatePathGeometry(&geometry))&&
                SUCCEEDED(geometry->Open(&sink))){
                 sink->BeginFigure(D2D1::Point2F(points[0],points[1]),
                     fillBrush?D2D1_FIGURE_BEGIN_FILLED:D2D1_FIGURE_BEGIN_HOLLOW);
                 for(size_t index=2;index+1<points.size();index+=2)
                     sink->AddLine(D2D1::Point2F(points[index],points[index+1]));
                 sink->EndFigure(node->tag==L"polygon"?D2D1_FIGURE_END_CLOSED:D2D1_FIGURE_END_OPEN);
-                if(SUCCEEDED(sink->Close()))paintGeometry(geometry.Get());
+                if(FAILED(sink->Close()))geometry.Reset();
             }
+            if(geometryCache.size()>=256)geometryCache.clear();
+            found=geometryCache.emplace(key,std::move(geometry)).first;
         }
+        paintGeometry(found->second.Get());
     }else if(node->tag==L"rect"){
         const float x=StyleSheet::Length(node->Attribute(L"x"),24,24,0),y=StyleSheet::Length(node->Attribute(L"y"),24,24,0);
         const float width=StyleSheet::Length(node->Attribute(L"width"),24,24,0),height=StyleSheet::Length(node->Attribute(L"height"),24,24,0);
@@ -2840,10 +2856,11 @@ void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& s
         if(strokeBrush)target->DrawLine(D2D1::Point2F(x1,y1),D2D1::Point2F(x2,y2),strokeBrush.Get(),strokeWidth,strokeStyle.Get());
     }
     for(const auto& child:node->children)
-        PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,referenceDepth);
+        PaintSvgShape(target,factory,styleSheet,child,&style,opacity,currentColor,geometryCache,referenceDepth);
 }
 
-void PaintSvg(ID2D1RenderTarget* target,const LayoutBox& box,StyleSheet& styleSheet){
+void PaintSvg(ID2D1RenderTarget* target,const LayoutBox& box,StyleSheet& styleSheet,
+              FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1PathGeometry>>& geometryCache){
     auto viewport=SvgNumbers(box.node->Attribute(L"viewbox"));
     if(viewport.empty())for(const auto& child:box.node->children)if(child->tag==L"use"){
         if(const auto referenced=SvgUseTarget(child))viewport=SvgNumbers(referenced->Attribute(L"viewbox"));
@@ -2862,7 +2879,7 @@ void PaintSvg(ID2D1RenderTarget* target,const LayoutBox& box,StyleSheet& styleSh
     Microsoft::WRL::ComPtr<ID2D1Factory> factory;target->GetFactory(&factory);
     const auto currentColor=StyleSheet::Color(box.style.Get(L"color",L"#000"),0xff000000);
     for(const auto& child:box.node->children)
-        PaintSvgShape(target,factory.Get(),styleSheet,child,&box.style,1,currentColor);
+        PaintSvgShape(target,factory.Get(),styleSheet,child,&box.style,1,currentColor,geometryCache);
     target->SetTransform(old);
 }
 
@@ -3239,7 +3256,7 @@ void LayoutEngine::FinalizeScroll(LayoutBox& box){
     box.scrollWidth=box.content.width;box.scrollHeight=box.content.height;
     const auto scrollable=[](const std::wstring& overflow){return overflow==L"auto"||overflow==L"scroll"||overflow==L"hidden";};
     const bool scrollX=scrollable(overflowX),scrollY=scrollable(overflowY);
-    if(!scrollX&&!scrollY){box.node->scrollLeft=0;box.node->scrollTop=0;return;}
+    if(!scrollX&&!scrollY){box.node->scrollLeft=0;box.node->scrollTop=0;box.appliedScrollLeft=0;box.appliedScrollTop=0;return;}
     if(box.node->tag==L"textarea"){
         const auto padding=EdgeValues(box.style,L"padding",box.rect.width,viewportWidth_);
         if(scrollY)box.scrollHeight=std::max(box.content.height,
@@ -3248,6 +3265,7 @@ void LayoutEngine::FinalizeScroll(LayoutBox& box){
             TextWidth(box.node->Attribute(L"value"),box.style)+padding.right);
         box.node->scrollLeft=std::max(0.0f,std::min(std::max(0.0f,box.scrollWidth-box.content.width),box.node->scrollLeft));
         box.node->scrollTop=std::max(0.0f,std::min(std::max(0.0f,box.scrollHeight-box.content.height),box.node->scrollTop));
+        box.appliedScrollLeft=box.node->scrollLeft;box.appliedScrollTop=box.node->scrollTop;
         return;
     }
     struct ScrollExtent { float right=0,bottom=0; };
@@ -3282,6 +3300,7 @@ void LayoutEngine::FinalizeScroll(LayoutBox& box){
         for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed"))TranslateBox(*child,-box.node->scrollLeft,-box.node->scrollTop);
         for(auto& child:box.children)ApplySticky(*child,box.content.y,viewportHeight_);
     }
+    box.appliedScrollLeft=box.node->scrollLeft;box.appliedScrollTop=box.node->scrollTop;
 }
 
 void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
@@ -3822,7 +3841,59 @@ void LayoutEngine::LayoutTable(LayoutBox& box){
     LayoutRect ignored;for(auto& child:box.children)fitGroups(*child,ignored);
 }
 
-void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory){if(!root_||!target||!factory)return;PaintStackingContext(target,factory,*root_,{0,0,viewportWidth_,viewportHeight_});}
+ID2D1SolidColorBrush* LayoutEngine::SolidBrush(ID2D1RenderTarget* target,unsigned int color){
+    if(!target)return nullptr;
+    if(brushCacheTarget_!=target){brushCache_.clear();brushCacheTarget_=target;}
+    const auto found=brushCache_.find(color);
+    if(found!=brushCache_.end())return found->second.Get();
+    if(brushCache_.size()>=512)brushCache_.clear();
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+    if(FAILED(target->CreateSolidColorBrush(D2DColor(color),&brush)))return nullptr;
+    auto inserted=brushCache_.emplace(color,std::move(brush));
+    return inserted.first->second.Get();
+}
+
+ID2D1SolidColorBrush* LayoutEngine::SolidBrush(ID2D1RenderTarget* target,const D2D1_COLOR_F& color){
+    const auto channel=[](float value){return static_cast<unsigned int>(std::lround(std::max(0.0f,std::min(1.0f,value))*255.0f));};
+    return SolidBrush(target,(channel(color.a)<<24)|(channel(color.r)<<16)|(channel(color.g)<<8)|channel(color.b));
+}
+
+void LayoutEngine::EnsureGeometryResources(ID2D1RenderTarget* target){
+    if(!target)return;
+    Microsoft::WRL::ComPtr<ID2D1Factory> factory;target->GetFactory(&factory);
+    if(!factory)return;
+    if(geometryFactory_!=factory.Get()){
+        selectArrowGeometry_.Reset();verticalArrowGeometry_.Reset();horizontalArrowGeometry_.Reset();
+        svgGeometryCache_.clear();geometryFactory_=factory.Get();
+    }
+    auto create=[&](Microsoft::WRL::ComPtr<ID2D1PathGeometry>& geometry,
+                    std::initializer_list<D2D1_POINT_2F> points){
+        if(geometry||points.size()<3)return;
+        Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+        if(FAILED(factory->CreatePathGeometry(&geometry))||FAILED(geometry->Open(&sink))){geometry.Reset();return;}
+        auto point=points.begin();sink->BeginFigure(*point++,D2D1_FIGURE_BEGIN_FILLED);
+        for(;point!=points.end();++point)sink->AddLine(*point);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        if(FAILED(sink->Close()))geometry.Reset();
+    };
+    create(selectArrowGeometry_,{D2D1::Point2F(-4,-2),D2D1::Point2F(5,-2),D2D1::Point2F(0,3)});
+    create(verticalArrowGeometry_,{D2D1::Point2F(0,0),D2D1::Point2F(-1,1),D2D1::Point2F(1,1)});
+    create(horizontalArrowGeometry_,{D2D1::Point2F(0,0),D2D1::Point2F(1,-1),D2D1::Point2F(1,1)});
+}
+
+void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory,const LayoutRect* dirtyBounds){
+    if(!root_||!target||!factory)return;
+    EnsureGeometryResources(target);
+    LayoutRect clip{0,0,viewportWidth_,viewportHeight_};
+    if(dirtyBounds){
+        const float right=std::min(viewportWidth_,dirtyBounds->x+dirtyBounds->width);
+        const float bottom=std::min(viewportHeight_,dirtyBounds->y+dirtyBounds->height);
+        clip.x=std::max(0.0f,dirtyBounds->x);clip.y=std::max(0.0f,dirtyBounds->y);
+        clip.width=std::max(0.0f,right-clip.x);clip.height=std::max(0.0f,bottom-clip.y);
+        if(clip.width<=0||clip.height<=0)return;
+    }
+    PaintStackingContext(target,factory,*root_,clip);
+}
 
 void LayoutEngine::PaintStackingContext(ID2D1RenderTarget* target,IDWriteFactory* factory,
                                         LayoutBox& box,const LayoutRect& clipBounds){
@@ -3841,23 +3912,23 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     if(!box.visible||box.rect.width<=0||box.rect.height<=0||!intersects)return;
     float opacity=1.0f;try{opacity=std::stof(box.style.Get(L"opacity",L"1"));}catch(...){}
     opacity=std::max(0.0f,std::min(1.0f,opacity));
-    if(box.style.Is(L"visibility",L"hidden")||opacity<=0.001f)return;D2D1_MATRIX_3X2_F previousTransform{};const bool transformed=ApplyPaintTransform(target,box,previousTransform);Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;if(opacity<0.999f&&SUCCEEDED(target->CreateLayer(nullptr,&opacityLayer)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),opacity),opacityLayer.Get());const auto background=BackgroundColor(box.style);Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+    if(box.style.Is(L"visibility",L"hidden")||opacity<=0.001f)return;D2D1_MATRIX_3X2_F previousTransform{};const bool transformed=ApplyPaintTransform(target,box,previousTransform);Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;if(opacity<0.999f&&SUCCEEDED(target->CreateLayer(nullptr,&opacityLayer)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),opacity),opacityLayer.Get());const auto background=BackgroundColor(box.style);ID2D1SolidColorBrush* brush=nullptr;
     const auto radius=UniformCornerRadii(box.style,box.rect.width,box.rect.height,viewportWidth_);
     PaintOuterBoxShadows(target,box.style,box.rect,radius,viewportWidth_);
-    if((background>>24)!=0){target->CreateSolidColorBrush(D2DColor(background),&brush);auto rect=PixelAlignedRect(box.rect);if(radius.x>0&&radius.y>0)target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius.x,radius.y),brush.Get());else target->FillRectangle(rect,brush.Get());}
+    if((background>>24)!=0){brush=SolidBrush(target,background);auto rect=PixelAlignedRect(box.rect);if(radius.x>0&&radius.y>0)target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius.x,radius.y),brush);else target->FillRectangle(rect,brush);}
     PaintGradientBackgrounds(target,box.style,box.rect,radius,viewportWidth_);
     PaintInsetBoxShadows(target,box.style,box.rect,viewportWidth_);
     const auto borders=BorderValues(box.style);const bool uniform=borders.top==borders.right&&borders.top==borders.bottom&&borders.top==borders.left;
     bool collapsedTableCell=false;
     if(HasTableDisplay(box,L"table-cell"))for(auto* ancestor=box.parent;ancestor;ancestor=ancestor->parent)if(HasTableDisplay(*ancestor,L"table")){collapsedTableCell=ancestor->style.Is(L"border-collapse",L"collapse");break;}
-    if(uniform&&borders.top>0){auto color=BorderColor(box.style,L"top");target->CreateSolidColorBrush(D2DColor(color),&brush);const float inset=borders.top/2;auto rect=D2D1::RectF(std::round(box.rect.x)+inset,std::round(box.rect.y)+inset,std::round(box.rect.x+box.rect.width)-inset,std::round(box.rect.y+box.rect.height)-inset);if(radius.x>0&&radius.y>0){const float strokeRadiusX=std::max(0.0f,radius.x-inset),strokeRadiusY=std::max(0.0f,radius.y-inset);target->DrawRoundedRectangle(D2D1::RoundedRect(rect,strokeRadiusX,strokeRadiusY),brush.Get(),borders.top);}else target->DrawRectangle(rect,brush.Get(),borders.top);}
+    if(uniform&&borders.top>0){auto color=BorderColor(box.style,L"top");brush=SolidBrush(target,color);const float inset=borders.top/2;auto rect=D2D1::RectF(std::round(box.rect.x)+inset,std::round(box.rect.y)+inset,std::round(box.rect.x+box.rect.width)-inset,std::round(box.rect.y+box.rect.height)-inset);if(radius.x>0&&radius.y>0){const float strokeRadiusX=std::max(0.0f,radius.x-inset),strokeRadiusY=std::max(0.0f,radius.y-inset);target->DrawRoundedRectangle(D2D1::RoundedRect(rect,strokeRadiusX,strokeRadiusY),brush,borders.top);}else target->DrawRectangle(rect,brush,borders.top);}
     else{
         FLOAT dpiX=USER_DEFAULT_SCREEN_DPI,dpiY=USER_DEFAULT_SCREEN_DPI;target->GetDpi(&dpiX,&dpiY);
         const auto pixelCenter=[](float value,float dpi){const float scale=dpi/USER_DEFAULT_SCREEN_DPI;return scale>0?(std::round(value*scale-0.5f)+0.5f)/scale:value;};
-        if(borders.top>0){target->CreateSolidColorBrush(D2DColor(BorderColor(box.style,L"top")),&brush);const float y=pixelCenter(std::round(box.rect.y)+borders.top/2,dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush.Get(),borders.top);}
-        if(borders.right>0){target->CreateSolidColorBrush(D2DColor(BorderColor(box.style,L"right")),&brush);const float x=pixelCenter(std::round(box.rect.x+box.rect.width)-borders.right/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush.Get(),borders.right);}
-        if(borders.bottom>0){target->CreateSolidColorBrush(D2DColor(BorderColor(box.style,L"bottom")),&brush);const float y=pixelCenter(std::round(box.rect.y+box.rect.height)+(collapsedTableCell?borders.bottom/2:-borders.bottom/2),dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush.Get(),borders.bottom);}
-        if(borders.left>0){target->CreateSolidColorBrush(D2DColor(BorderColor(box.style,L"left")),&brush);const float x=pixelCenter(std::round(box.rect.x)+borders.left/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush.Get(),borders.left);}
+        if(borders.top>0){brush=SolidBrush(target,BorderColor(box.style,L"top"));const float y=pixelCenter(std::round(box.rect.y)+borders.top/2,dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.top);}
+        if(borders.right>0){brush=SolidBrush(target,BorderColor(box.style,L"right"));const float x=pixelCenter(std::round(box.rect.x+box.rect.width)-borders.right/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.right);}
+        if(borders.bottom>0){brush=SolidBrush(target,BorderColor(box.style,L"bottom"));const float y=pixelCenter(std::round(box.rect.y+box.rect.height)+(collapsedTableCell?borders.bottom/2:-borders.bottom/2),dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.bottom);}
+        if(borders.left>0){brush=SolidBrush(target,BorderColor(box.style,L"left"));const float x=pixelCenter(std::round(box.rect.x)+borders.left/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.left);}
     }
     if(box.node->tag==L"input"&&(box.node->Attribute(L"type")==L"checkbox"||box.node->Attribute(L"type")==L"radio")){
         const auto type=box.node->Attribute(L"type");
@@ -3866,29 +3937,29 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         const auto r=D2D1::RectF(left,top,left+size,top+size);
         const auto accent=box.node->disabled?0xff9ca3af:StyleSheet::Color(box.style.Get(L"accent-color",L"#0d73d8"),0xff0d73d8);
         if(type==L"radio"){
-            target->CreateSolidColorBrush(D2DColor(0xff6b7280),&brush);
-            target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F((r.left+r.right)/2,(r.top+r.bottom)/2),size/2-1,size/2-1),brush.Get(),1);
-            if(box.node->checked){target->CreateSolidColorBrush(D2DColor(accent),&brush);target->FillEllipse(D2D1::Ellipse(D2D1::Point2F((r.left+r.right)/2,(r.top+r.bottom)/2),4,4),brush.Get());}
+            brush=SolidBrush(target,0xff6b7280);
+            target->DrawEllipse(D2D1::Ellipse(D2D1::Point2F((r.left+r.right)/2,(r.top+r.bottom)/2),size/2-1,size/2-1),brush,1);
+            if(box.node->checked){brush=SolidBrush(target,accent);target->FillEllipse(D2D1::Ellipse(D2D1::Point2F((r.left+r.right)/2,(r.top+r.bottom)/2),4,4),brush);}
         }else{
             const float controlRadius=std::max(1.5f,size*0.15f);
             if(box.node->checked){
-                target->CreateSolidColorBrush(D2DColor(accent),&brush);
-                target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush.Get());
-                target->CreateSolidColorBrush(D2DColor(0xffffffff),&brush);
+                brush=SolidBrush(target,accent);
+                target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush);
+                brush=SolidBrush(target,0xffffffff);
                 const float scale=size/13.0f,stroke=std::max(1.5f,size*0.14f);
                 const auto middle=D2D1::Point2F(r.left+5.25f*scale,r.top+9.25f*scale);
-                target->DrawLine(D2D1::Point2F(r.left+2.5f*scale,r.top+6.5f*scale),middle,brush.Get(),stroke);
-                target->DrawLine(middle,D2D1::Point2F(r.left+10.5f*scale,r.top+3.5f*scale),brush.Get(),stroke);
+                target->DrawLine(D2D1::Point2F(r.left+2.5f*scale,r.top+6.5f*scale),middle,brush,stroke);
+                target->DrawLine(middle,D2D1::Point2F(r.left+10.5f*scale,r.top+3.5f*scale),brush,stroke);
             }else{
-                target->CreateSolidColorBrush(D2DColor(box.node->disabled?0xffb8bec6:0xff6b7280),&brush);
-                target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush.Get());
+                brush=SolidBrush(target,box.node->disabled?0xffb8bec6:0xff6b7280);
+                target->FillRoundedRectangle(D2D1::RoundedRect(r,controlRadius,controlRadius),brush);
                 const auto inner=D2D1::RectF(r.left+1,r.top+1,r.right-1,r.bottom-1);
-                target->CreateSolidColorBrush(D2DColor(box.node->disabled?0xfff3f4f6:0xffffffff),&brush);
-                target->FillRoundedRectangle(D2D1::RoundedRect(inner,std::max(0.5f,controlRadius-1),std::max(0.5f,controlRadius-1)),brush.Get());
+                brush=SolidBrush(target,box.node->disabled?0xfff3f4f6:0xffffffff);
+                target->FillRoundedRectangle(D2D1::RoundedRect(inner,std::max(0.5f,controlRadius-1),std::max(0.5f,controlRadius-1)),brush);
             }
         }
     }
-    if(box.node->tag==L"svg")PaintSvg(target,box,styleSheet_);
+    if(box.node->tag==L"svg")PaintSvg(target,box,styleSheet_,svgGeometryCache_);
     bool placeholderText=false;std::wstring text=BoxText(box,&placeholderText);
     if(box.node->type==NodeType::Text&&!text.empty()){
         const auto* owner=box.parent;
@@ -3925,7 +3996,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
                 textOpacity=std::max(0.0f,std::min(1.0f,textOpacity));
             }
             auto resolvedTextColor=D2DColor(textColor);resolvedTextColor.a*=textOpacity;
-            target->CreateSolidColorBrush(resolvedTextColor,&brush);
+            brush=SolidBrush(target,resolvedTextColor);
             const auto rect=D2D1::RectF(box.content.x,box.content.y,box.content.x+box.content.width,box.content.y+box.content.height);
             // A glyph's ink may extend beyond its advance, especially with
             // negative character spacing. Only CSS overflow clips text ink.
@@ -3956,23 +4027,17 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
                     textTop=pixelTop*USER_DEFAULT_SCREEN_DPI/dpiY;
                 }
             }
-            target->DrawTextLayout(D2D1::Point2F(textLeft,textTop),box.textLayout.Get(),brush.Get());
+            target->DrawTextLayout(D2D1::Point2F(textLeft,textTop),box.textLayout.Get(),brush);
             target->PopAxisAlignedClip();
         }
     }
     if(box.node->tag==L"select"){
         const float centerX=box.rect.x+box.rect.width-9.5f,centerY=box.rect.y+box.rect.height/2.0f;
-        target->CreateSolidColorBrush(D2DColor(StyleSheet::Color(box.style.Get(L"color",L"#000"),0xff000000)),&brush);
-        Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;target->GetFactory(&d2dFactory);
-        Microsoft::WRL::ComPtr<ID2D1PathGeometry> arrow;
-        if(d2dFactory&&SUCCEEDED(d2dFactory->CreatePathGeometry(&arrow))){
-            Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-            if(SUCCEEDED(arrow->Open(&sink))){
-                sink->BeginFigure(D2D1::Point2F(centerX-4,centerY-2),D2D1_FIGURE_BEGIN_FILLED);
-                sink->AddLine(D2D1::Point2F(centerX+5,centerY-2));
-                sink->AddLine(D2D1::Point2F(centerX,centerY+3));
-                sink->EndFigure(D2D1_FIGURE_END_CLOSED);sink->Close();target->FillGeometry(arrow.Get(),brush.Get());
-            }
+        brush=SolidBrush(target,StyleSheet::Color(box.style.Get(L"color",L"#000"),0xff000000));
+        if(selectArrowGeometry_){
+            D2D1_MATRIX_3X2_F current{};target->GetTransform(&current);
+            target->SetTransform(D2D1::Matrix3x2F::Translation(centerX,centerY)*current);
+            target->FillGeometry(selectArrowGeometry_.Get(),brush);target->SetTransform(current);
         }
     }
     const auto overflow=box.style.Get(L"overflow",L"visible"),overflowX=box.style.Get(L"overflow-x",L"visible"),overflowY=box.style.Get(L"overflow-y",L"visible");const bool clip=overflow==L"hidden"||overflow==L"clip"||overflow==L"auto"||overflow==L"scroll"||overflowX==L"hidden"||overflowX==L"clip"||overflowX==L"auto"||overflowX==L"scroll"||overflowY==L"hidden"||overflowY==L"clip"||overflowY==L"auto"||overflowY==L"scroll";LayoutRect childClip=clipBounds;if(clip){const float left=std::max(clipBounds.x,box.content.x),top=std::max(clipBounds.y,box.content.y),right=std::min(clipBounds.x+clipBounds.width,box.content.x+box.content.width),bottom=std::min(clipBounds.y+clipBounds.height,box.content.y+box.content.height);childClip={left,top,std::max(0.0f,right-left),std::max(0.0f,bottom-top)};target->PushAxisAlignedClip(PixelAlignedRect(box.content),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);}
@@ -4005,29 +4070,21 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         const auto thumbBackground=thumbStyle.Get(L"background-color",thumbStyle.Get(L"background"));
         if(!scrollbar.standardStyling&&!thumbBackground.empty())thumbColor=StyleSheet::Color(thumbBackground,thumbColor);
         const float trackBottom=scrollbar.track.y+scrollbar.track.height;
-        if((trackColor>>24)!=0){target->CreateSolidColorBrush(D2DColor(trackColor),&brush);target->FillRectangle(D2D1::RectF(scrollbar.track.x,scrollbar.track.y,scrollbar.track.x+scrollbar.track.width,trackBottom),brush.Get());}
-        target->CreateSolidColorBrush(D2DColor(thumbColor),&brush);const auto thumbRadii=UniformCornerRadii(thumbStyle,scrollbar.thumb.width,scrollbar.thumb.height,viewportWidth_);const float thumbRadius=scrollbar.standardStyling?std::min(scrollbar.thumb.width,scrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(scrollbar.thumb.width,scrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(scrollbar.thumb.x,scrollbar.thumb.y,scrollbar.thumb.x+scrollbar.thumb.width,scrollbar.thumb.y+scrollbar.thumb.height),thumbRadius,thumbRadius),brush.Get());
-        if(scrollbar.arrowHeight>0){
+        if((trackColor>>24)!=0){brush=SolidBrush(target,trackColor);target->FillRectangle(D2D1::RectF(scrollbar.track.x,scrollbar.track.y,scrollbar.track.x+scrollbar.track.width,trackBottom),brush);}
+        brush=SolidBrush(target,thumbColor);const auto thumbRadii=UniformCornerRadii(thumbStyle,scrollbar.thumb.width,scrollbar.thumb.height,viewportWidth_);const float thumbRadius=scrollbar.standardStyling?std::min(scrollbar.thumb.width,scrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(scrollbar.thumb.width,scrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(scrollbar.thumb.x,scrollbar.thumb.y,scrollbar.thumb.x+scrollbar.thumb.width,scrollbar.thumb.y+scrollbar.thumb.height),thumbRadius,thumbRadius),brush);
+        if(scrollbar.arrowHeight>0&&verticalArrowGeometry_){
             const float center=scrollbar.track.x+scrollbar.track.width/2;
-            {
-                Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;target->GetFactory(&d2dFactory);
-                Microsoft::WRL::ComPtr<ID2D1PathGeometry> arrows;
-                Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-                if(d2dFactory&&SUCCEEDED(d2dFactory->CreatePathGeometry(&arrows))&&SUCCEEDED(arrows->Open(&sink))){
-                    const float halfWidth=scrollbar.thumb.width/2.0f;
-                    const float arrowFigureHeight=scrollbar.arrowHeight/3.0f;
-                    const float arrowPadding=(scrollbar.arrowHeight-arrowFigureHeight)/2.0f;
-                    const float topApex=scrollbar.track.y+arrowPadding;
-                    const float topBase=topApex+arrowFigureHeight;
-                    const float bottomBase=trackBottom-arrowPadding-arrowFigureHeight;
-                    const float bottomApex=trackBottom-arrowPadding;
-                    sink->BeginFigure(D2D1::Point2F(center,topApex),D2D1_FIGURE_BEGIN_FILLED);
-                    sink->AddLine(D2D1::Point2F(center-halfWidth,topBase));sink->AddLine(D2D1::Point2F(center+halfWidth,topBase));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink->BeginFigure(D2D1::Point2F(center-halfWidth,bottomBase),D2D1_FIGURE_BEGIN_FILLED);
-                    sink->AddLine(D2D1::Point2F(center+halfWidth,bottomBase));sink->AddLine(D2D1::Point2F(center,bottomApex));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                    sink->Close();target->FillGeometry(arrows.Get(),brush.Get());
-                }
-            }
+            const float halfWidth=scrollbar.thumb.width/2.0f;
+            const float figureHeight=scrollbar.arrowHeight/3.0f;
+            const float padding=(scrollbar.arrowHeight-figureHeight)/2.0f;
+            const float topApex=scrollbar.track.y+padding,bottomApex=trackBottom-padding;
+            D2D1_MATRIX_3X2_F current{};target->GetTransform(&current);
+            target->SetTransform(D2D1::Matrix3x2F::Scale(halfWidth,figureHeight)*
+                D2D1::Matrix3x2F::Translation(center,topApex)*current);
+            target->FillGeometry(verticalArrowGeometry_.Get(),brush);
+            target->SetTransform(D2D1::Matrix3x2F::Scale(halfWidth,-figureHeight)*
+                D2D1::Matrix3x2F::Translation(center,bottomApex)*current);
+            target->FillGeometry(verticalArrowGeometry_.Get(),brush);target->SetTransform(current);
         }
     }
     HorizontalScrollbarGeometry horizontalScrollbar;if(HorizontalScrollbarFor(box,styleSheet_,horizontalScrollbar)){
@@ -4044,24 +4101,21 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         const auto thumbBackground=thumbStyle.Get(L"background-color",thumbStyle.Get(L"background"));
         if(!horizontalScrollbar.standardStyling&&!thumbBackground.empty())thumbColor=StyleSheet::Color(thumbBackground,thumbColor);
         const float trackRight=horizontalScrollbar.track.x+horizontalScrollbar.track.width;
-        if((trackColor>>24)!=0){target->CreateSolidColorBrush(D2DColor(trackColor),&brush);target->FillRectangle(D2D1::RectF(horizontalScrollbar.track.x,horizontalScrollbar.track.y,trackRight,horizontalScrollbar.track.y+horizontalScrollbar.track.height),brush.Get());}
-        target->CreateSolidColorBrush(D2DColor(thumbColor),&brush);const auto thumbRadii=UniformCornerRadii(thumbStyle,horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height,viewportWidth_);const float thumbRadius=horizontalScrollbar.standardStyling?std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(horizontalScrollbar.thumb.x,horizontalScrollbar.thumb.y,horizontalScrollbar.thumb.x+horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.y+horizontalScrollbar.thumb.height),thumbRadius,thumbRadius),brush.Get());
-        if(horizontalScrollbar.arrowWidth>0){
-            Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;target->GetFactory(&d2dFactory);
-            Microsoft::WRL::ComPtr<ID2D1PathGeometry> arrows;Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-            if(d2dFactory&&SUCCEEDED(d2dFactory->CreatePathGeometry(&arrows))&&SUCCEEDED(arrows->Open(&sink))){
-                const float center=horizontalScrollbar.track.y+horizontalScrollbar.track.height/2.0f;
-                const float halfHeight=horizontalScrollbar.thumb.height/2.0f;
-                const float figureWidth=horizontalScrollbar.arrowWidth/3.0f;
-                const float padding=(horizontalScrollbar.arrowWidth-figureWidth)/2.0f;
-                const float leftApex=horizontalScrollbar.track.x+padding,leftBase=leftApex+figureWidth;
-                const float rightBase=trackRight-padding-figureWidth,rightApex=trackRight-padding;
-                sink->BeginFigure(D2D1::Point2F(leftApex,center),D2D1_FIGURE_BEGIN_FILLED);
-                sink->AddLine(D2D1::Point2F(leftBase,center-halfHeight));sink->AddLine(D2D1::Point2F(leftBase,center+halfHeight));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                sink->BeginFigure(D2D1::Point2F(rightBase,center-halfHeight),D2D1_FIGURE_BEGIN_FILLED);
-                sink->AddLine(D2D1::Point2F(rightApex,center));sink->AddLine(D2D1::Point2F(rightBase,center+halfHeight));sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                sink->Close();target->FillGeometry(arrows.Get(),brush.Get());
-            }
+        if((trackColor>>24)!=0){brush=SolidBrush(target,trackColor);target->FillRectangle(D2D1::RectF(horizontalScrollbar.track.x,horizontalScrollbar.track.y,trackRight,horizontalScrollbar.track.y+horizontalScrollbar.track.height),brush);}
+        brush=SolidBrush(target,thumbColor);const auto thumbRadii=UniformCornerRadii(thumbStyle,horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height,viewportWidth_);const float thumbRadius=horizontalScrollbar.standardStyling?std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(horizontalScrollbar.thumb.x,horizontalScrollbar.thumb.y,horizontalScrollbar.thumb.x+horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.y+horizontalScrollbar.thumb.height),thumbRadius,thumbRadius),brush);
+        if(horizontalScrollbar.arrowWidth>0&&horizontalArrowGeometry_){
+            const float center=horizontalScrollbar.track.y+horizontalScrollbar.track.height/2.0f;
+            const float halfHeight=horizontalScrollbar.thumb.height/2.0f;
+            const float figureWidth=horizontalScrollbar.arrowWidth/3.0f;
+            const float padding=(horizontalScrollbar.arrowWidth-figureWidth)/2.0f;
+            const float leftApex=horizontalScrollbar.track.x+padding,rightApex=trackRight-padding;
+            D2D1_MATRIX_3X2_F current{};target->GetTransform(&current);
+            target->SetTransform(D2D1::Matrix3x2F::Scale(figureWidth,halfHeight)*
+                D2D1::Matrix3x2F::Translation(leftApex,center)*current);
+            target->FillGeometry(horizontalArrowGeometry_.Get(),brush);
+            target->SetTransform(D2D1::Matrix3x2F::Scale(-figureWidth,halfHeight)*
+                D2D1::Matrix3x2F::Translation(rightApex,center)*current);
+            target->FillGeometry(horizontalArrowGeometry_.Get(),brush);target->SetTransform(current);
         }
     }
     if(opacityLayer)target->PopLayer();
@@ -4214,8 +4268,49 @@ std::shared_ptr<Node> LayoutEngine::HitTestBox(const LayoutBox& box,float x,floa
     return box.node&&box.node->type==NodeType::Element?box.node:box.node->parent.lock();
 }
 const LayoutBox* LayoutEngine::BoxFor(const std::shared_ptr<Node>& node)const{if(!root_||!node)return nullptr;const auto found=boxIndex_.find(node.get());return found==boxIndex_.end()?nullptr:found->second;}
+bool LayoutEngine::VisualBounds(const std::shared_ptr<Node>& node,LayoutRect& bounds)const{
+    if(!root_||!node)return false;
+    const auto found=boxIndex_.find(node.get());if(found==boxIndex_.end())return false;
+    bool initialized=false,safe=true;
+    const auto include=[&](const LayoutRect& rect){
+        if(rect.width<=0||rect.height<=0)return;
+        if(!initialized){bounds=rect;initialized=true;return;}
+        const float left=std::min(bounds.x,rect.x),top=std::min(bounds.y,rect.y);
+        const float right=std::max(bounds.x+bounds.width,rect.x+rect.width);
+        const float bottom=std::max(bounds.y+bounds.height,rect.y+rect.height);
+        bounds={left,top,right-left,bottom-top};
+    };
+    std::function<void(const LayoutBox&)> visit=[&](const LayoutBox& box){
+        if(!box.visible)return;
+        const auto transform=ToLower(Trim(box.style.Get(L"transform")));
+        if(!transform.empty()&&transform!=L"none")safe=false;
+        LayoutRect painted{box.rect.x-2,box.rect.y-2,box.rect.width+4,box.rect.height+4};
+        const float stroke=std::max(0.0f,StyleSheet::Length(box.style.Get(L"stroke-width"),
+            std::max(box.rect.width,box.rect.height),viewportWidth_,0));
+        if(stroke>0){painted.x-=stroke/2;painted.y-=stroke/2;painted.width+=stroke;painted.height+=stroke;}
+        include(painted);
+        for(const auto& shadow:BoxShadows(box.style,viewportWidth_))if(!shadow.inset&&(shadow.color>>24)!=0){
+            const float expansion=std::max(0.0f,shadow.spread+shadow.blur);
+            include({box.rect.x+shadow.offsetX-expansion,box.rect.y+shadow.offsetY-expansion,
+                     box.rect.width+expansion*2,box.rect.height+expansion*2});
+        }
+        for(const auto& child:box.children)visit(*child);
+    };
+    visit(*found->second);return safe&&initialized;
+}
 bool LayoutEngine::Restyle(const std::shared_ptr<Node>& node){if(!root_||!node)return false;const auto found=boxIndex_.find(node.get());if(found==boxIndex_.end())return true;auto* box=found->second;const ComputedStyle* parentStyle=nullptr;if(auto parent=node->parent.lock()){const auto parentBox=boxIndex_.find(parent.get());if(parentBox!=boxIndex_.end())parentStyle=&parentBox->second->style;}return RestyleBox(*box,parentStyle);}
 bool LayoutEngine::RestyleBox(LayoutBox& box,const ComputedStyle* parentStyle){auto updated=box.generatedFrom?styleSheet_.Compute(box.generatedFrom,parentStyle,box.pseudo):styleSheet_.Compute(box.node,parentStyle);updated.deviceScale=deviceScale_;bool layoutChanged=HasLayoutStyleChange(box.style,updated);box.style=updated;for(auto& child:box.children)layoutChanged=RestyleBox(*child,&box.style)||layoutChanged;return layoutChanged;}
+bool LayoutEngine::SyncScroll(const std::shared_ptr<Node>& node){
+    if(!root_||!node)return false;
+    const auto found=boxIndex_.find(node.get());if(found==boxIndex_.end())return false;
+    auto& box=*found->second;
+    node->scrollLeft=std::max(0.0f,std::min(std::max(0.0f,box.scrollWidth-box.content.width),node->scrollLeft));
+    node->scrollTop=std::max(0.0f,std::min(std::max(0.0f,box.scrollHeight-box.content.height),node->scrollTop));
+    const bool changed=std::abs(node->scrollLeft-box.appliedScrollLeft)>=0.001f||
+        std::abs(node->scrollTop-box.appliedScrollTop)>=0.001f;
+    ApplyScrollOffset(box,box.appliedScrollLeft,box.appliedScrollTop,viewportHeight_);
+    return changed;
+}
 bool LayoutEngine::ScrollAt(float x,float y,float wheelDelta,std::shared_ptr<Node>* scrolledNode,bool horizontal){
     if(scrolledNode)scrolledNode->reset();
     if(!root_)return false;

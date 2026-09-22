@@ -1102,6 +1102,12 @@ std::wstring NumberString(double number) {
 
 std::wstring CamelToKebab(const std::wstring& value){std::wstring out;for(wchar_t c:value){if(std::iswupper(c)){out+=L'-';out+=std::towlower(c);}else out+=c;}return out;}
 std::wstring DatasetAttributeName(const std::wstring& value){return L"data-"+CamelToKebab(value);}
+bool AttributeRequiresLayout(const std::wstring& name){
+    return name==L"value"||name==L"placeholder"||name==L"type"||name==L"rows"||
+           name==L"cols"||name==L"size"||name==L"multiple"||name==L"colspan"||
+           name==L"rowspan"||name==L"span"||name==L"width"||name==L"height"||
+           name==L"lang";
+}
 
 struct RuntimeCore {
     struct EventListener {
@@ -1147,6 +1153,7 @@ struct RuntimeCore {
         std::vector<Chunk> expressions;
     };
     FastMap<std::wstring,std::shared_ptr<TemplateProgram>> templatePrograms;
+    FastMap<std::wstring,Value> inlineHandlerCache;
     std::vector<std::pair<unsigned,Value>> frameCallbacks;
     struct TimerEntry { unsigned id=0;Value callback;std::chrono::steady_clock::time_point due;unsigned interval=0; };
     std::vector<TimerEntry> timers;
@@ -1162,6 +1169,9 @@ struct RuntimeCore {
     std::wstring lastError;
     int mutationBatchDepth=0;
     bool mutationPending=false;
+    JavaScriptRuntime::MutationKind mutationKind=JavaScriptRuntime::MutationKind::Paint;
+    std::vector<std::shared_ptr<Node>> mutationTargets;
+    bool liveRegionMembershipChanged=false;
     bool indexDirty=false;
     double viewportWidth=0;
     double viewportHeight=0;
@@ -1438,13 +1448,30 @@ struct RuntimeCore {
     void BeginMutationBatch(){++mutationBatchDepth;}
     void FlushMutations(){
         if(indexDirty){document.Reindex();indexDirty=false;}
-        if(mutationPending&&mutationSink)mutationSink();
-        mutationPending=false;
+        if(mutationPending&&mutationSink){
+            JavaScriptRuntime::Mutation mutation;
+            mutation.kind=mutationKind;
+            mutation.targets=std::move(mutationTargets);
+            mutation.liveRegionMembershipChanged=liveRegionMembershipChanged;
+            mutationPending=false;mutationKind=JavaScriptRuntime::MutationKind::Paint;
+            liveRegionMembershipChanged=false;
+            mutationSink(mutation);
+        }else{
+            mutationPending=false;mutationTargets.clear();
+            mutationKind=JavaScriptRuntime::MutationKind::Paint;
+            liveRegionMembershipChanged=false;
+        }
     }
     void EndMutationBatch(){if(mutationBatchDepth>0&&--mutationBatchDepth==0)FlushMutations();}
     void EnsureIndex(){if(indexDirty){document.Reindex();indexDirty=false;}}
-    void Mutated(bool requiresIndex=false){
-        mutationPending=true;indexDirty=indexDirty||requiresIndex;
+    void Mutated(const std::shared_ptr<Node>& target,JavaScriptRuntime::MutationKind kind,
+                 bool requiresIndex=false,bool liveRegionMembership=false){
+        mutationPending=true;
+        if(static_cast<int>(kind)>static_cast<int>(mutationKind))mutationKind=kind;
+        if(target&&std::none_of(mutationTargets.begin(),mutationTargets.end(),
+            [&](const auto& candidate){return candidate==target;}))mutationTargets.push_back(target);
+        indexDirty=indexDirty||requiresIndex;
+        liveRegionMembershipChanged=liveRegionMembershipChanged||liveRegionMembership;
         if(mutationBatchDepth==0)FlushMutations();
     }
     unsigned ScheduleAnimationFrame(const Value& callback){
@@ -1827,7 +1854,7 @@ struct RuntimeCore {
             }
             if(key==L"getElementById")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();return r.NodeValue(r.document.GetElementById(a.empty()?L"":r.String(a[0])));});
             if(key==L"getElementsByName")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){std::vector<Value> out;for(auto& n:r.document.GetElementsByName(a.empty()?L"":r.String(a[0])))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
-            if(key==L"querySelector"||key==L"querySelectorAll")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
+            if(key==L"querySelector"||key==L"querySelectorAll")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"createElement")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(r.document.CreateElement(a.empty()?L"div":r.String(a[0])));});
             if(key==L"createTextNode")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";node->text=a.empty()?L"":r.String(a[0]);return r.NodeValue(node);});
             if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.documentListeners,a);return Value::Undefined();});
@@ -1892,26 +1919,77 @@ struct RuntimeCore {
             if(key==L"nextElementSibling"){
                 auto parent=node->parent.lock();if(!parent)return Value::Null();bool found=false;for(const auto& sibling:parent->children){if(sibling==node){found=true;continue;}if(found&&sibling->type==NodeType::Element)return NodeValue(sibling);}return Value::Null();
             }
-            if(key==L"appendChild")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty()){auto v=r.Deref(a[0]);if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Node&&v.object->node){v.object->node->parent=node;node->children.push_back(v.object->node);r.Mutated(true);return v;}}return Value::Null();});
+            if(key==L"appendChild")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Null();auto value=r.Deref(a[0]);
+                if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node||!value.object->node)return Value::Null();
+                auto child=value.object->node;auto old=child->parent.lock();
+                bool indexOk=r.document.UnindexSubtree(child);
+                if(old){
+                    old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());
+                }
+                child->parent=node;node->children.push_back(child);
+                indexOk=r.document.IndexSubtree(child)&&indexOk;
+                if(old)r.Mutated(old,JavaScriptRuntime::MutationKind::Tree,!indexOk);
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,!indexOk);return value;
+            });
             if(key==L"insertBefore")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 if(a.empty())return Value::Null();auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node||!value.object->node)return Value::Null();
-                auto child=value.object->node;if(auto old=child->parent.lock())old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());
+                auto child=value.object->node;auto old=child->parent.lock();bool indexOk=r.document.UnindexSubtree(child);
+                if(old)old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());
                 auto position=node->children.end();if(a.size()>1){auto before=r.Deref(a[1]);if(before.type==Value::Type::Object&&before.object&&before.object->kind==ObjectKind::Node)position=std::find(node->children.begin(),node->children.end(),before.object->node);}
-                child->parent=node;node->children.insert(position,child);r.Mutated(true);return value;
+                child->parent=node;node->children.insert(position,child);indexOk=r.document.IndexSubtree(child)&&indexOk;
+                if(old)r.Mutated(old,JavaScriptRuntime::MutationKind::Tree,!indexOk);
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,!indexOk);return value;
             });
-            if(key==L"append"||key==L"replaceChildren")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"replaceChildren")node->children.clear();for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> child;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)child=value.object->node;else{child=std::make_shared<Node>();child->type=NodeType::Text;child->tag=L"#text";child->text=r.String(value);}if(child){if(auto old=child->parent.lock()){old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());}child->parent=node;node->children.push_back(child);}}r.Mutated(true);return Value::Undefined();});
-            if(key==L"setAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.size()>1){const auto name=r.String(a[0]);node->SetAttribute(name,r.String(a[1]));r.Mutated(name==L"id");}return Value::Undefined();});
+            if(key==L"append"||key==L"replaceChildren")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                bool indexOk=true;
+                if(key==L"replaceChildren"){
+                    for(auto& child:node->children)indexOk=r.document.UnindexSubtree(child)&&indexOk;
+                    for(auto& child:node->children)child->parent.reset();node->children.clear();
+                }
+                for(const auto& input:a){
+                    auto value=r.Deref(input);std::shared_ptr<Node> child;
+                    if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)child=value.object->node;
+                    else{child=std::make_shared<Node>();child->type=NodeType::Text;child->tag=L"#text";child->text=r.String(value);}
+                    if(!child)continue;auto old=child->parent.lock();indexOk=r.document.UnindexSubtree(child)&&indexOk;
+                    if(old){old->children.erase(std::remove(old->children.begin(),old->children.end(),child),old->children.end());r.Mutated(old,JavaScriptRuntime::MutationKind::Tree);}
+                    child->parent=node;node->children.push_back(child);indexOk=r.document.IndexSubtree(child)&&indexOk;
+                }
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,!indexOk);return Value::Undefined();
+            });
+            if(key==L"setAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.size()>1){
+                    const auto name=ToLower(r.String(a[0]));
+                    const auto oldId=name==L"id"?node->Attribute(L"id"):L"";
+                    node->SetAttribute(name,r.String(a[1]));
+                    const bool indexOk=name!=L"id"||
+                        r.document.UpdateElementId(node,oldId,node->Attribute(L"id"));
+                    const auto kind=AttributeRequiresLayout(name)?JavaScriptRuntime::MutationKind::Layout:JavaScriptRuntime::MutationKind::Style;
+                    r.Mutated(node,kind,!indexOk,name==L"aria-live");
+                }
+                return Value::Undefined();
+            });
             if(key==L"getAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::String(a.empty()?L"":node->Attribute(r.String(a[0])));});
             if(key==L"hasAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&node->attributes.count(ToLower(r.String(a[0])))!=0);});
-            if(key==L"removeAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty()){const auto name=r.String(a[0]);node->RemoveAttribute(name);r.Mutated(name==L"id");}return Value::Undefined();});
-            if(key==L"remove")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(auto parent=node->parent.lock()){parent->children.erase(std::remove(parent->children.begin(),parent->children.end(),node),parent->children.end());node->parent.reset();r.Mutated(true);}return Value::Undefined();});
+            if(key==L"removeAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(!a.empty()){
+                    const auto name=ToLower(r.String(a[0]));
+                    const auto oldId=name==L"id"?node->Attribute(L"id"):L"";
+                    node->RemoveAttribute(name);
+                    const bool indexOk=name!=L"id"||r.document.UpdateElementId(node,oldId,L"");
+                    const auto kind=AttributeRequiresLayout(name)?JavaScriptRuntime::MutationKind::Layout:JavaScriptRuntime::MutationKind::Style;
+                    r.Mutated(node,kind,!indexOk,name==L"aria-live");
+                }
+                return Value::Undefined();
+            });
+            if(key==L"remove")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(auto parent=node->parent.lock()){const bool indexOk=r.document.UnindexSubtree(node);parent->children.erase(std::remove(parent->children.begin(),parent->children.end(),node),parent->children.end());node->parent.reset();r.Mutated(parent,JavaScriptRuntime::MutationKind::Tree,!indexOk);}return Value::Undefined();});
             if(key==L"replaceWith")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 auto parent=node->parent.lock();if(!parent)return Value::Undefined();auto position=std::find(parent->children.begin(),parent->children.end(),node);if(position==parent->children.end())return Value::Undefined();
-                const auto offset=static_cast<size_t>(position-parent->children.begin());parent->children.erase(position);node->parent.reset();size_t insert=offset;
-                for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> replacement;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)replacement=value.object->node;else{replacement=std::make_shared<Node>();replacement->type=NodeType::Text;replacement->tag=L"#text";replacement->text=r.String(value);}if(auto old=replacement->parent.lock())old->children.erase(std::remove(old->children.begin(),old->children.end(),replacement),old->children.end());replacement->parent=parent;parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(insert++),replacement);}
-                r.Mutated(true);return Value::Undefined();
+                bool indexOk=r.document.UnindexSubtree(node);const auto offset=static_cast<size_t>(position-parent->children.begin());parent->children.erase(position);node->parent.reset();size_t insert=offset;
+                for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> replacement;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)replacement=value.object->node;else{replacement=std::make_shared<Node>();replacement->type=NodeType::Text;replacement->tag=L"#text";replacement->text=r.String(value);}auto old=replacement->parent.lock();indexOk=r.document.UnindexSubtree(replacement)&&indexOk;if(old){old->children.erase(std::remove(old->children.begin(),old->children.end(),replacement),old->children.end());r.Mutated(old,JavaScriptRuntime::MutationKind::Tree);}replacement->parent=parent;parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(insert++),replacement);indexOk=r.document.IndexSubtree(replacement)&&indexOk;}
+                r.Mutated(parent,JavaScriptRuntime::MutationKind::Tree,!indexOk);return Value::Undefined();
             });
-            if(key==L"focus")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink(node);else node->focused=true;r.Mutated();return Value::Undefined();});
+            if(key==L"focus")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink(node);else{node->focused=true;r.Mutated(node,JavaScriptRuntime::MutationKind::Style);}return Value::Undefined();});
             if(key==L"setSelectionRange")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 const auto length=node->Attribute(L"value").size();
                 const auto start=std::min(length,static_cast<size_t>(std::max(0.0,a.empty()?0:r.Number(a[0]))));
@@ -1919,8 +1997,8 @@ struct RuntimeCore {
                 node->selectionStart=start;node->selectionEnd=end;if(r.selectionSetter)r.selectionSetter(node,start,end);
                 return Value::Undefined();
             });
-            if((key==L"showModal"||key==L"show")&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){node->SetAttribute(L"open",L"");r.Mutated();return Value::Undefined();});
-            if(key==L"close"&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){node->RemoveAttribute(L"open");node->SetAttribute(L"returnvalue",a.empty()?L"":r.String(a[0]));r.Mutated();r.Dispatch(node,L"close");return Value::Undefined();});
+            if((key==L"showModal"||key==L"show")&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){node->SetAttribute(L"open",L"");r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Undefined();});
+            if(key==L"close"&&node->tag==L"dialog")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){node->RemoveAttribute(L"open");node->SetAttribute(L"returnvalue",a.empty()?L"":r.String(a[0]));r.Mutated(node,JavaScriptRuntime::MutationKind::Style);r.Dispatch(node,L"close");return Value::Undefined();});
             if(key==L"requestSubmit"&&node->tag==L"form")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){r.Dispatch(node,L"submit");return Value::Undefined();});
             if(key==L"scrollTo"||key==L"scroll"||key==L"scrollBy")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 const bool relative=key==L"scrollBy";double left=relative?0:node->scrollLeft,top=relative?0:node->scrollTop;
@@ -1933,24 +2011,32 @@ struct RuntimeCore {
                         left=r.Number(value);top=a.size()>1?r.Number(a[1]):0;
                     }
                 }
-                node->scrollLeft=std::max(0.0f,static_cast<float>((relative?node->scrollLeft:0)+left));node->scrollTop=std::max(0.0f,static_cast<float>((relative?node->scrollTop:0)+top));r.Mutated();return Value::Undefined();
+                node->scrollLeft=std::max(0.0f,static_cast<float>((relative?node->scrollLeft:0)+left));node->scrollTop=std::max(0.0f,static_cast<float>((relative?node->scrollTop:0)+top));r.Mutated(node,JavaScriptRuntime::MutationKind::Paint);return Value::Undefined();
             });
             if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node)return Value::Bool(false);for(auto current=value.object->node;current;current=current->parent.lock())if(current==node)return Value::Bool(true);return Value::Bool(false);});
             if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.listeners[node.get()],a);return Value::Undefined();});
             if(key==L"removeEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto found=r.listeners.find(node.get());if(found!=r.listeners.end())r.RemoveEventListener(found->second,a);return Value::Undefined();});
-            if(key==L"querySelector"||key==L"querySelectorAll")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector,node));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector,node))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
+            if(key==L"querySelector"||key==L"querySelectorAll")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector,node));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector,node))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"closest")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(node->Closest(a.empty()?L"":r.String(a[0])));});
             if(key==L"matches")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&Document::MatchesSelector(node,r.String(a[0])));});
         }
         if(object->kind==ObjectKind::ClassList){
             auto node=object->node;
-            if(key==L"add"||key==L"remove")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){for(auto& v:a)if(key==L"add")node->AddClass(r.String(v));else node->RemoveClass(r.String(v));r.Mutated();return Value::Undefined();});
-            if(key==L"toggle")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);bool has=a.size()>1;bool force=has?r.Truth(a[1]):false;node->ToggleClass(r.String(a[0]),force,has);r.Mutated();return Value::Bool(node->HasClass(r.String(a[0])));});
+            if(key==L"add"||key==L"remove")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                for(auto& v:a)if(key==L"add")node->AddClass(r.String(v));else node->RemoveClass(r.String(v));
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Undefined();
+            });
+            if(key==L"toggle")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Bool(false);const auto name=r.String(a[0]);
+                bool has=a.size()>1;
+                bool force=has?r.Truth(a[1]):false;node->ToggleClass(name,force,has);
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Bool(node->HasClass(name));
+            });
             if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&node->HasClass(r.String(a[0])));});
         }
         if(object->kind==ObjectKind::Style){
             if(key==L"setProperty")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
-                if(object->node&&a.size()>1){object->node->inlineStyle[ToLower(r.String(a[0]))]=r.String(a[1]);r.Mutated();}
+                if(object->node&&a.size()>1){object->node->inlineStyle[ToLower(r.String(a[0]))]=r.String(a[1]);r.Mutated(object->node,JavaScriptRuntime::MutationKind::Style);}
                 return Value::Undefined();
             });
             if(key==L"getPropertyValue")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
@@ -2059,8 +2145,8 @@ struct RuntimeCore {
     void SetProperty(const Value& input,const std::wstring& key,const Value& value){
         auto base=Deref(input);if(base.type!=Value::Type::Object||!base.object)return;auto object=base.object;auto v=Deref(value);
         if(object->kind==ObjectKind::Array){try{size_t used=0;size_t i=std::stoul(key,&used);if(used==key.size()){if(i>=object->items.size())object->items.resize(i+1);object->items[i]=v;return;}}catch(...){} }
-        if(object->kind==ObjectKind::Node&&object->node){auto n=object->node;
-            if(key==L"id")n->SetAttribute(L"id",String(v));else if(key==L"className")n->SetAttribute(L"class",String(v));else if(key==L"value"){
+        if(object->kind==ObjectKind::Node&&object->node){auto n=object->node;bool indexOk=true;
+            if(key==L"id"){const auto oldId=n->Attribute(L"id");n->SetAttribute(L"id",String(v));indexOk=document.UpdateElementId(n,oldId,n->Attribute(L"id"));}else if(key==L"className")n->SetAttribute(L"class",String(v));else if(key==L"value"){
                 const auto text=String(v);if(n->tag==L"input"&&ToLower(n->Attribute(L"type"))==L"file"&&text.empty())n->files.clear();
                 n->SetAttribute(L"value",text);n->selectionStart=std::min(n->selectionStart,text.size());n->selectionEnd=std::min(n->selectionEnd,text.size());
             }
@@ -2071,13 +2157,17 @@ struct RuntimeCore {
             }
             else if(key==L"title"||key==L"type"||key==L"lang"||key==L"colSpan"||key==L"rowSpan"||key==L"returnValue")n->SetAttribute(key==L"colSpan"?L"colspan":(key==L"rowSpan"?L"rowspan":ToLower(key)),String(v));
             else if(key==L"draggable")n->SetAttribute(L"draggable",Truth(v)?L"true":L"false");
-            else if(key==L"hidden"||key==L"open"){if(Truth(v))n->SetAttribute(key,L"");else n->RemoveAttribute(key);Mutated();return;}
-            else if(key==L"scrollTop"){n->scrollTop=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}
-            else if(key==L"scrollLeft"){n->scrollLeft=std::max(0.0f,static_cast<float>(Number(v)));Mutated();return;}
+            else if(key==L"hidden"||key==L"open"){if(Truth(v))n->SetAttribute(key,L"");else n->RemoveAttribute(key);Mutated(n,JavaScriptRuntime::MutationKind::Style);return;}
+            else if(key==L"scrollTop"){n->scrollTop=std::max(0.0f,static_cast<float>(Number(v)));Mutated(n,JavaScriptRuntime::MutationKind::Paint);return;}
+            else if(key==L"scrollLeft"){n->scrollLeft=std::max(0.0f,static_cast<float>(Number(v)));Mutated(n,JavaScriptRuntime::MutationKind::Paint);return;}
             else if(key==L"checked")n->checked=Truth(v);else if(key==L"disabled")n->disabled=Truth(v);
-            else if(key==L"innerText"||key==L"textContent"){n->SetInnerText(String(v));Mutated(true);return;}else if(key==L"innerHTML"){document.SetInnerHtml(n,String(v),false);Mutated(true);return;}else object->props[key]=v;Mutated(key==L"id");return;}
-        if(object->kind==ObjectKind::Style&&object->node){object->node->inlineStyle[CamelToKebab(key)]=String(v);Mutated();return;}
-        if(object->kind==ObjectKind::Dataset&&object->node){object->node->SetAttribute(DatasetAttributeName(key),String(v));Mutated();return;}
+            else if(key==L"innerText"||key==L"textContent"){for(const auto& child:n->children)indexOk=document.UnindexSubtree(child)&&indexOk;n->SetInnerText(String(v));Mutated(n,JavaScriptRuntime::MutationKind::Tree,!indexOk);return;}else if(key==L"innerHTML"){for(const auto& child:n->children)indexOk=document.UnindexSubtree(child)&&indexOk;document.SetInnerHtml(n,String(v),false);for(const auto& child:n->children)indexOk=document.IndexSubtree(child)&&indexOk;Mutated(n,JavaScriptRuntime::MutationKind::Tree,!indexOk);return;}else object->props[key]=v;
+            const bool requiresLayout=key==L"value"||key==L"type"||key==L"lang"||
+                key==L"colSpan"||key==L"rowSpan";
+            Mutated(n,requiresLayout?JavaScriptRuntime::MutationKind::Layout:
+                JavaScriptRuntime::MutationKind::Style,!indexOk);return;}
+        if(object->kind==ObjectKind::Style&&object->node){object->node->inlineStyle[CamelToKebab(key)]=String(v);Mutated(object->node,JavaScriptRuntime::MutationKind::Style);return;}
+        if(object->kind==ObjectKind::Dataset&&object->node){object->node->SetAttribute(DatasetAttributeName(key),String(v));Mutated(object->node,JavaScriptRuntime::MutationKind::Style);return;}
         object->props[key]=v;
     }
     void Assign(const Value& reference,const Value& value){
@@ -2088,7 +2178,7 @@ struct RuntimeCore {
         if(reference.type!=Value::Type::Reference)return true;const auto ref=reference.reference;
         if(ref->kind==Reference::Kind::Variable){if(ref->env){auto* env=ref->env->Find(ref->name);if(env)env->values.erase(ref->name);}return true;}
         auto base=Deref(ref->base);if(base.type!=Value::Type::Object||!base.object)return true;
-        if(base.object->kind==ObjectKind::Dataset&&base.object->node){base.object->node->RemoveAttribute(DatasetAttributeName(ref->name));Mutated();return true;}
+        if(base.object->kind==ObjectKind::Dataset&&base.object->node){base.object->node->RemoveAttribute(DatasetAttributeName(ref->name));Mutated(base.object->node,JavaScriptRuntime::MutationKind::Style);return true;}
         base.object->props.erase(ref->name);return true;
     }
     Value Call(const Value& callable,const Value& explicitThis,const std::vector<Value>& args){
@@ -2508,8 +2598,16 @@ struct RuntimeCore {
             // event argument are the element currently handling the event. Keep
             // this in the shared dispatcher so inline handlers and listeners see
             // the same target/currentTarget state during bubbling.
-            Compiler compiler(module,L"(function(event){\n"+source+L"\n})");
-            const auto callback=Run(compiler.CompileExpressionOnly(),global);
+            const auto cacheKey=ToLower(eventName)+L'\x1f'+source;
+            auto cached=inlineHandlerCache.find(cacheKey);
+            Value callback;
+            if(cached!=inlineHandlerCache.end())callback=cached->second;
+            else{
+                Compiler compiler(module,L"(function(event){\n"+source+L"\n})");
+                callback=Run(compiler.CompileExpressionOnly(),global);
+                if(inlineHandlerCache.size()>=256)inlineHandlerCache.clear();
+                inlineHandlerCache.emplace(cacheKey,callback);
+            }
             const auto result=Deref(Call(callback,NodeValue(current),{eventValue}));
             if(result.type==Value::Type::Boolean&&!result.boolean)
                 event->props[L"defaultPrevented"]=Value::Bool(true);
@@ -2646,6 +2744,6 @@ void JavaScriptRuntime::DispatchFileDrop(const std::shared_ptr<Node>& node,const
 bool JavaScriptRuntime::DispatchWebMessageAsJson(const std::wstring& json,std::wstring* error){return impl_->core.DispatchWebMessageJson(json,error);}
 void JavaScriptRuntime::DispatchWebMessageAsString(const std::wstring& message){impl_->core.DispatchWebMessageValue(Value::String(message));}
 bool JavaScriptRuntime::DispatchWindowMessageAsJson(const std::wstring& json,const std::shared_ptr<Node>& sourceFrame,std::wstring* error){return impl_->core.DispatchWindowMessageJson(json,sourceFrame,error);}
-void JavaScriptRuntime::Clear(){impl_->core.listeners.clear();impl_->core.documentListeners.clear();impl_->core.windowListeners.clear();impl_->core.webViewListeners.clear();impl_->core.nodeObjects.clear();impl_->core.frameWindows.clear();impl_->core.frameCallbacks.clear();impl_->core.frameScheduled=false;impl_->core.timers.clear();impl_->core.timerScheduled=false;impl_->core.microtasks.clear();impl_->core.possiblyUnhandledRejections.clear();if(impl_->core.timerScheduler)impl_->core.timerScheduler(0);impl_->core.module=std::make_shared<Module>();impl_->core.global=std::make_shared<Environment>();impl_->core.InstallGlobals();}
+void JavaScriptRuntime::Clear(){impl_->core.listeners.clear();impl_->core.documentListeners.clear();impl_->core.windowListeners.clear();impl_->core.webViewListeners.clear();impl_->core.nodeObjects.clear();impl_->core.frameWindows.clear();impl_->core.inlineHandlerCache.clear();impl_->core.frameCallbacks.clear();impl_->core.frameScheduled=false;impl_->core.timers.clear();impl_->core.timerScheduled=false;impl_->core.microtasks.clear();impl_->core.possiblyUnhandledRejections.clear();if(impl_->core.timerScheduler)impl_->core.timerScheduler(0);impl_->core.module=std::make_shared<Module>();impl_->core.global=std::make_shared<Environment>();impl_->core.InstallGlobals();}
 
 } // namespace TWebFrame::Internal

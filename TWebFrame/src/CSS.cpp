@@ -312,7 +312,8 @@ bool StyleSheet::Parse(const std::wstring& source, std::wstring* error) {
     rules_.clear(); ruleIndex_.clear(); universalRuleIndexes_.clear();
     selectorAttributes_.clear(); nthChildSubjects_.clear();hasUniversalNthChild_=false;
     rootVariables_.clear(); pseudoRules_.clear(); hoverRuleIndexes_.clear();
-    hoverRequiresBroadInvalidation_=false; usesNthChild_ = false;
+    hoverRequiresBroadInvalidation_=false; mutationRequiresBroadInvalidation_=false;
+    usesNthChild_ = false;
     usesViewportFontSize_ = false;
     const auto css = StripComments(source);
     int order = 0;
@@ -418,6 +419,10 @@ bool StyleSheet::Parse(const std::wstring& source, std::wstring* error) {
                         selector.find(L'~')!=std::wstring::npos||
                         selector.find(L":has(")!=std::wstring::npos;
                 }
+                mutationRequiresBroadInvalidation_=mutationRequiresBroadInvalidation_||
+                    selector.find(L'+')!=std::wstring::npos||
+                    selector.find(L'~')!=std::wstring::npos||
+                    selector.find(L":has(")!=std::wstring::npos;
                 if(subjectKey.empty())universalRuleIndexes_.push_back(ruleIndex);
                 else ruleIndex_[subjectKey].push_back(ruleIndex);
                 if(selector.find(L":nth-child(")!=std::wstring::npos)usesNthChild_=true;
@@ -452,8 +457,16 @@ std::vector<const CssRule*> StyleSheet::CandidateRules(const std::shared_ptr<Nod
     append(L"<"+node->tag);
     const auto id=node->Attribute(L"id");
     if(!id.empty())append(L"#"+id);
-    std::wistringstream classes(node->Attribute(L"class"));std::wstring className;
-    while(classes>>className)append(L"."+className);
+    const auto classes=node->attributes.find(L"class");
+    if(classes!=node->attributes.end()){
+        const auto& value=classes->second;size_t position=0;
+        while(position<value.size()){
+            while(position<value.size()&&std::iswspace(value[position]))++position;
+            const size_t start=position;
+            while(position<value.size()&&!std::iswspace(value[position]))++position;
+            if(position>start)append(L"."+value.substr(start,position-start));
+        }
+    }
     return result;
 }
 
@@ -470,8 +483,16 @@ bool StyleSheet::UsesNthChildFor(const std::shared_ptr<Node>& node) const {
     if(hasUniversalNthChild_||nthChildSubjects_.count(L"<"+node->tag))return true;
     const auto id=node->Attribute(L"id");
     if(!id.empty()&&nthChildSubjects_.count(L"#"+id))return true;
-    std::wistringstream classes(node->Attribute(L"class"));std::wstring className;
-    while(classes>>className)if(nthChildSubjects_.count(L"."+className))return true;
+    const auto classes=node->attributes.find(L"class");
+    if(classes!=node->attributes.end()){
+        const auto& value=classes->second;size_t position=0;
+        while(position<value.size()){
+            while(position<value.size()&&std::iswspace(value[position]))++position;
+            const size_t start=position;
+            while(position<value.size()&&!std::iswspace(value[position]))++position;
+            if(position>start&&nthChildSubjects_.count(L"."+value.substr(start,position-start)))return true;
+        }
+    }
     return false;
 }
 
@@ -600,12 +621,18 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
                 if(pair.first.rfind(L"--",0)==0)variables[pair.first]=pair.second;
     }
     const auto candidateRules=CandidateRules(node);
-    FastMap<std::wstring,Winner> customWinners;
+    std::vector<const CssRule*> matchedRules;
+    matchedRules.reserve(candidateRules.size());
     for(const auto* rulePointer:candidateRules){
         const auto& rule=*rulePointer;
-        if(!rule.hasCustomDeclarations||!ruleApplies(rule)||
-           (pseudo.empty()?!rule.pseudo.empty():rule.pseudo!=pseudo)||
-           !Document::MatchesSelector(node,rule.selectorParts))continue;
+        if(ruleApplies(rule)&&
+           (pseudo.empty()?rule.pseudo.empty():rule.pseudo==pseudo)&&
+           Document::MatchesSelector(node,rule.selectorParts))matchedRules.push_back(rulePointer);
+    }
+    FastMap<std::wstring,Winner> customWinners;
+    for(const auto* rulePointer:matchedRules){
+        const auto& rule=*rulePointer;
+        if(!rule.hasCustomDeclarations)continue;
         for(const auto& declaration:rule.declarations){
             if(declaration.name.rfind(L"--",0)!=0)continue;
             const Winner candidate{declaration.important,rule.specificity,rule.order};
@@ -804,11 +831,8 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
             }
         }
     };
-    for (const auto* rulePointer : candidateRules) {
+    for (const auto* rulePointer : matchedRules) {
         const auto& rule=*rulePointer;
-        if(!ruleApplies(rule)||
-           (pseudo.empty()?!rule.pseudo.empty():rule.pseudo!=pseudo)||
-           !Document::MatchesSelector(node,rule.selectorParts))continue;
         for (const auto& declaration : rule.declarations) {
             if (declaration.name.rfind(L"--", 0) == 0) continue;
             const Winner candidate{declaration.important, rule.specificity, rule.order};

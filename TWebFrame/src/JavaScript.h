@@ -10,8 +10,14 @@ namespace TWebFrame::Internal {
 
 class JavaScriptRuntime {
 public:
+    enum class MutationKind { Paint, Style, Layout, Tree };
+    struct Mutation {
+        MutationKind kind = MutationKind::Paint;
+        std::vector<std::shared_ptr<Node>> targets;
+        bool liveRegionMembershipChanged = false;
+    };
     using MessageSink = std::function<void(const std::wstring&)>;
-    using MutationSink = std::function<void()>;
+    using MutationSink = std::function<void(const Mutation&)>;
     using FrameScheduler = std::function<void()>;
     using TimerScheduler = std::function<void(unsigned)>;
     using ResourceLoader = std::function<bool(const std::wstring&, std::wstring&)>;

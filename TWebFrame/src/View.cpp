@@ -23,6 +23,7 @@
 #include <functional>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "d2d1.lib")
@@ -233,6 +234,7 @@ struct View::Impl {
     D2D1_SIZE_U backBufferPixelSize{};
     float backBufferDpi=0;
     std::shared_ptr<AccessibilityHost> accessibility;
+    std::vector<std::weak_ptr<Node>> liveRegions;
     std::unordered_map<const Node*,std::wstring> liveRegionText;
     struct AccessibilityPosition {
         std::weak_ptr<Node> parent;
@@ -321,6 +323,23 @@ struct View::Impl {
     }
     float PixelToDip(float value)const{return value/DpiScale();}
     LONG DipToPixel(float value)const{return static_cast<LONG>(std::lround(value*DpiScale()));}
+    static void IncludeBounds(LayoutRect& bounds,bool& initialized,const LayoutRect& item){
+        if(item.width<=0||item.height<=0)return;
+        if(!initialized){bounds=item;initialized=true;return;}
+        const float left=std::min(bounds.x,item.x),top=std::min(bounds.y,item.y);
+        const float right=std::max(bounds.x+bounds.width,item.x+item.width);
+        const float bottom=std::max(bounds.y+bounds.height,item.y+item.height);
+        bounds={left,top,right-left,bottom-top};
+    }
+    void InvalidateDipBounds(const LayoutRect& bounds){
+        const float scale=DpiScale();
+        RECT dirty{static_cast<LONG>(std::floor(bounds.x*scale)),
+            static_cast<LONG>(std::floor(bounds.y*scale)),
+            static_cast<LONG>(std::ceil((bounds.x+bounds.width)*scale)),
+            static_cast<LONG>(std::ceil((bounds.y+bounds.height)*scale))};
+        InflateRect(&dirty,1,1);RECT client{};GetClientRect(hwnd,&client);
+        RECT clipped{};if(IntersectRect(&clipped,&dirty,&client))InvalidateRect(hwnd,&clipped,FALSE);
+    }
     void UpdateJavaScriptViewport(){
         RECT bounds{};GetClientRect(hwnd,&bounds);const float scale=DpiScale();
         javascript.SetViewportSize(static_cast<double>(std::max(1L,bounds.right-bounds.left))/scale,
@@ -339,7 +358,7 @@ struct View::Impl {
         HRESULT hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,d2dFactory.ReleaseAndGetAddressOf());if(FAILED(hr)){lastError=L"D2D1CreateFactory failed";return false;}
         hr=DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf()));if(FAILED(hr)){lastError=L"DWriteCreateFactory failed";return false;}
         javascript.SetMessageSink([this](const std::wstring& msg){if(messageHandler)messageHandler(msg);});
-        javascript.SetMutationSink([this]{layoutDirty=true;viewportOnlyDirty=false;accessibilityTreeDirty=true;if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);NotifyAccessibilityMutation();});
+        javascript.SetMutationSink([this](const JavaScriptRuntime::Mutation& mutation){HandleMutation(mutation);});
         javascript.SetFocusSink([this](const std::shared_ptr<Node>& node){
             SetFocusedNode(node,true,true);
         });
@@ -678,13 +697,113 @@ struct View::Impl {
                 if(!node->attributes.count(L"aria-expanded"))return UIA_E_NOTSUPPORTED;const auto before=node->Attribute(L"aria-expanded");if(layoutDirty)Rebuild();const auto* box=layout.BoxFor(node);Activate(node,box?box->rect.x:0,box?box->rect.y:0);if(ToLower(node->Attribute(L"aria-expanded"))==ToLower(before))node->SetAttribute(L"aria-expanded",expand?L"true":L"false");layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return S_OK;
             });
     }
-    void NotifyAccessibilityMutation(){
-        if(!accessibility)return;std::unordered_map<const Node*,std::wstring> current;
-        for(const auto& node:document.QuerySelectorAll(L"[aria-live]")){
-            const auto text=Trim(node->InnerText());current[node.get()]=text;
-            const auto previous=liveRegionText.find(node.get());if(previous!=liveRegionText.end()&&previous->second!=text)accessibility->RaiseLiveRegionChanged(node);
+    static bool IsWithin(const std::shared_ptr<Node>& node,const std::shared_ptr<Node>& ancestor){
+        for(auto current=node;current;current=current->parent.lock())if(current==ancestor)return true;
+        return false;
+    }
+    bool IsConnectedToDocument(const std::shared_ptr<Node>& node)const{
+        if(!node)return false;
+        auto current=node;while(auto parent=current->parent.lock())current=std::move(parent);
+        return current==document.Root();
+    }
+    void RefreshLiveRegionIndex(const JavaScriptRuntime::Mutation& mutation,bool reset){
+        std::vector<std::shared_ptr<Node>> indexed;
+        auto add=[&](const std::shared_ptr<Node>& node){
+            if(!node||node->attributes.count(L"aria-live")==0)return;
+            if(std::find(indexed.begin(),indexed.end(),node)==indexed.end())indexed.push_back(node);
+        };
+        if(!reset){
+            for(const auto& weak:liveRegions)if(auto node=weak.lock())
+                if(IsConnectedToDocument(node)&&node->attributes.count(L"aria-live"))add(node);
         }
-        liveRegionText=std::move(current);
+        if(reset||mutation.targets.empty()){
+            indexed=document.QuerySelectorAll(L"[aria-live]");
+        }else if(mutation.kind==JavaScriptRuntime::MutationKind::Tree||
+                 mutation.liveRegionMembershipChanged){
+            for(const auto& target:mutation.targets)
+                for(const auto& node:document.QuerySelectorAll(L"[aria-live]",target))add(node);
+        }
+        liveRegions.clear();liveRegions.reserve(indexed.size());
+        for(const auto& node:indexed)liveRegions.push_back(node);
+    }
+    void NotifyAccessibilityMutation(const JavaScriptRuntime::Mutation& mutation,bool reset=false){
+        if(!accessibility)return;
+        if(reset||mutation.kind==JavaScriptRuntime::MutationKind::Tree||
+           mutation.liveRegionMembershipChanged)RefreshLiveRegionIndex(mutation,reset);
+        std::unordered_set<const Node*> active;
+        for(const auto& weak:liveRegions)if(auto node=weak.lock())active.insert(node.get());
+        for(auto item=liveRegionText.begin();item!=liveRegionText.end();)
+            if(active.count(item->first)==0)item=liveRegionText.erase(item);else ++item;
+        if(liveRegions.empty()||(!reset&&mutation.kind!=JavaScriptRuntime::MutationKind::Tree&&
+           !mutation.liveRegionMembershipChanged))return;
+        for(const auto& weak:liveRegions){
+            const auto node=weak.lock();if(!node)continue;
+            bool affected=reset||mutation.liveRegionMembershipChanged||mutation.targets.empty();
+            if(!affected)for(const auto& target:mutation.targets)
+                if(IsWithin(target,node)||IsWithin(node,target)){affected=true;break;}
+            if(!affected)continue;
+            const auto text=Trim(node->InnerText());
+            const auto previous=liveRegionText.find(node.get());
+            if(previous!=liveRegionText.end()&&previous->second!=text)
+                accessibility->RaiseLiveRegionChanged(node);
+            liveRegionText[node.get()]=text;
+        }
+    }
+    void HandleMutation(const JavaScriptRuntime::Mutation& mutation){
+        LayoutRect dirtyBounds{};bool hasDirtyBounds=false,canTarget=!layoutDirty&&
+            !mutation.targets.empty()&&(mutation.kind==JavaScriptRuntime::MutationKind::Paint||
+                                        mutation.kind==JavaScriptRuntime::MutationKind::Style);
+        if(canTarget&&mutation.kind==JavaScriptRuntime::MutationKind::Style&&
+           (styles.HasPseudoRules(L"before")||styles.HasPseudoRules(L"after")||
+            styles.MutationRequiresBroadInvalidation()))canTarget=false;
+        if(canTarget)for(const auto& target:mutation.targets){
+            if(mutation.kind==JavaScriptRuntime::MutationKind::Paint){
+                const auto* box=layout.BoxFor(target);if(!box){canTarget=false;break;}
+                IncludeBounds(dirtyBounds,hasDirtyBounds,box->rect);
+            }else{
+                LayoutRect visual{};if(!layout.VisualBounds(target,visual)){canTarget=false;break;}
+                IncludeBounds(dirtyBounds,hasDirtyBounds,visual);
+            }
+        }
+        if(mutation.kind==JavaScriptRuntime::MutationKind::Tree||
+           mutation.kind==JavaScriptRuntime::MutationKind::Layout){
+            layoutDirty=true;viewportOnlyDirty=false;
+        }else if(mutation.kind==JavaScriptRuntime::MutationKind::Style&&!layoutDirty){
+            bool layoutChanged=false;
+            // A selector change can add or remove generated boxes. Restyling
+            // updates existing boxes, so generated-content styles retain the
+            // conservative tree-rebuild path.
+            if(styles.HasPseudoRules(L"before")||styles.HasPseudoRules(L"after")){
+                layoutChanged=true;
+            }else if(styles.MutationRequiresBroadInvalidation()||mutation.targets.empty()){
+                const auto* root=layout.Root();
+                layoutChanged=!root||!root->node||layout.Restyle(root->node);
+            }else{
+                for(const auto& target:mutation.targets)
+                    layoutChanged=layout.Restyle(target)||layoutChanged;
+            }
+            layoutDirty=layoutChanged;
+            if(layoutDirty)viewportOnlyDirty=false;
+            else SyncCssTransitionTimer();
+        }
+        if(!layoutDirty&&(mutation.kind==JavaScriptRuntime::MutationKind::Paint||
+                          mutation.kind==JavaScriptRuntime::MutationKind::Style))
+            for(const auto& target:mutation.targets)layout.SyncScroll(target);
+        if(canTarget&&!layoutDirty&&mutation.kind==JavaScriptRuntime::MutationKind::Style)
+            for(const auto& target:mutation.targets){
+                LayoutRect visual{};if(!layout.VisualBounds(target,visual)){canTarget=false;break;}
+                IncludeBounds(dirtyBounds,hasDirtyBounds,visual);
+            }
+        accessibilityTreeDirty=true;if(accessibility)accessibility->Invalidate();
+        if(canTarget&&!layoutDirty&&hasDirtyBounds)InvalidateDipBounds(dirtyBounds);
+        else InvalidateRect(hwnd,nullptr,FALSE);
+        NotifyAccessibilityMutation(mutation);
+    }
+    void RestyleDocument(){
+        if(layoutDirty)return;
+        const auto* root=layout.Root();
+        layoutDirty=!root||!root->node||layout.Restyle(root->node);
+        if(layoutDirty)viewportOnlyDirty=false;else SyncCssTransitionTimer();
     }
     static std::wstring AccessibilityJsonEscape(const std::wstring& value){
         std::wstring out;for(const auto character:value){if(character==L'\\'||character==L'"')out+=L'\\';if(character==L'\n')out+=L"\\n";else if(character!=L'\r')out+=character;}return out;
@@ -705,10 +824,16 @@ struct View::Impl {
         };
         append({});return output+L"]";
     }
-    HRESULT RenderBackBuffer(){
+    HRESULT RenderBackBuffer(const LayoutRect& dirty){
         ID2D1RenderTarget* target=backBuffer.Get();
         if(!target)return E_INVALIDARG;target->BeginDraw();target->SetTransform(D2D1::IdentityMatrix());
-        target->Clear(D2D1::ColorF(0xf3f5f8));layout.Paint(target,writeFactory.Get());PaintTextEditing(target);PaintSelectPopup(target);
+        const auto dirtyRect=D2D1::RectF(dirty.x,dirty.y,dirty.x+dirty.width,dirty.y+dirty.height);
+        target->PushAxisAlignedClip(dirtyRect,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        ComPtr<ID2D1SolidColorBrush> background;
+        if(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0xf3f5f8),&background)))
+            target->FillRectangle(dirtyRect,background.Get());
+        layout.Paint(target,writeFactory.Get(),&dirty);PaintTextEditing(target);PaintSelectPopup(target);
+        target->PopAxisAlignedClip();
         return target->EndDraw();
     }
     void Paint(){
@@ -722,8 +847,17 @@ struct View::Impl {
                 static_cast<UINT32>(std::max(1L,client.right-client.left)),
                 static_cast<UINT32>(std::max(1L,client.bottom-client.top)));
             const float dpi=USER_DEFAULT_SCREEN_DPI*DpiScale();
+            auto* previousBackBuffer=backBuffer.Get();
             if(EnsureBackBuffer(pixelSize,dpi)){
-                const HRESULT rendered=RenderBackBuffer();
+                const float scale=DpiScale();LayoutRect dirty;
+                if(previousBackBuffer!=backBuffer.Get()||IsRectEmpty(&ps.rcPaint))
+                    dirty={0,0,pixelSize.width/scale,pixelSize.height/scale};
+                else{
+                    const float left=std::floor(ps.rcPaint.left/scale),top=std::floor(ps.rcPaint.top/scale);
+                    const float right=std::ceil(ps.rcPaint.right/scale),bottom=std::ceil(ps.rcPaint.bottom/scale);
+                    dirty={left,top,std::max(0.0f,right-left),std::max(0.0f,bottom-top)};
+                }
+                const HRESULT rendered=RenderBackBuffer(dirty);
                 if(SUCCEEDED(rendered)){
                     ComPtr<ID2D1Bitmap> bitmap;
                     if(SUCCEEDED(backBuffer->GetBitmap(&bitmap))){
@@ -731,11 +865,14 @@ struct View::Impl {
                         const HRESULT resized=currentSize.width==pixelSize.width&&currentSize.height==pixelSize.height?
                             S_OK:renderTarget->Resize(pixelSize);
                         if(SUCCEEDED(resized)){
-                            renderTarget->SetDpi(dpi,dpi);const float width=pixelSize.width*USER_DEFAULT_SCREEN_DPI/dpi;
-                            const float height=pixelSize.height*USER_DEFAULT_SCREEN_DPI/dpi;
-                            const auto bounds=D2D1::RectF(0,0,width,height);
+                            renderTarget->SetDpi(dpi,dpi);
+                            const auto dirtyBounds=D2D1::RectF(dirty.x,dirty.y,
+                                dirty.x+dirty.width,dirty.y+dirty.height);
                             renderTarget->BeginDraw();renderTarget->SetTransform(D2D1::IdentityMatrix());
-                            renderTarget->DrawBitmap(bitmap.Get(),bounds,1.0f,D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,bounds);
+                            renderTarget->PushAxisAlignedClip(dirtyBounds,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                            renderTarget->DrawBitmap(bitmap.Get(),dirtyBounds,1.0f,
+                                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,dirtyBounds);
+                            renderTarget->PopAxisAlignedClip();
                             const HRESULT result=renderTarget->EndDraw();
                             if(result==D2DERR_RECREATE_TARGET)ResetRenderTargets();
                         }else ResetRenderTargets();
@@ -852,6 +989,12 @@ struct View::Impl {
         return RECT{DipToPixel(caret.left),DipToPixel(caret.top),
                     DipToPixel(caret.right),DipToPixel(caret.bottom)};
     }
+    void InvalidateCaret(){
+        if(!hwnd)return;
+        RECT caret=CaretClientRect();
+        if(IsRectEmpty(&caret)){InvalidateRect(hwnd,nullptr,FALSE);return;}
+        InflateRect(&caret,2,2);InvalidateRect(hwnd,&caret,FALSE);
+    }
     void PaintTextEditing(ID2D1RenderTarget* target){
         if(!target||!editingNode||GetFocus()!=hwnd)return;const auto* box=EditingLayoutBox();
         const auto* styleBox=EditingStyleBox();if(!styleBox||!styleBox->visible)return;
@@ -935,7 +1078,9 @@ struct View::Impl {
         InvalidateRect(hwnd,nullptr,FALSE);
     }
     void CommitTextEdit(){if(IsTextControl(focused)&&textEditDirty){javascript.DispatchNodeEvent(focused,L"change");textEditDirty=false;}}
-    bool SetHoveredNode(const std::shared_ptr<Node>& next){
+    bool SetHoveredNode(const std::shared_ptr<Node>& next,LayoutRect* dirtyBounds=nullptr,
+                        bool* dirtyBoundsValid=nullptr){
+        if(dirtyBoundsValid)*dirtyBoundsValid=false;
         if(next==hovered)return false;
         std::vector<std::shared_ptr<Node>> nextPath;
         for(auto current=next;current;current=current->parent.lock())nextPath.push_back(current);
@@ -962,9 +1107,21 @@ struct View::Impl {
             const auto* root=layout.Root();
             return root&&root->node?layout.Restyle(root->node):false;
         }
+        LayoutRect dirty{};bool hasDirty=false,safe=true;
+        if(dirtyBounds)for(const auto& node:affected){
+            LayoutRect visual{};if(!layout.VisualBounds(node,visual)){safe=false;break;}
+            IncludeBounds(dirty,hasDirty,visual);
+        }
         bool layoutChanged=false;
         for(const auto& node:affected)
             if(layout.BoxFor(node))layoutChanged=layout.Restyle(node)||layoutChanged;
+        if(dirtyBounds&&safe&&!layoutChanged)for(const auto& node:affected){
+            LayoutRect visual{};if(!layout.VisualBounds(node,visual)){safe=false;break;}
+            IncludeBounds(dirty,hasDirty,visual);
+        }
+        if(dirtyBounds&&dirtyBoundsValid&&safe&&hasDirty&&!layoutChanged){
+            *dirtyBounds=dirty;*dirtyBoundsValid=true;
+        }
         return layoutChanged;
     }
     void SetFocusedNode(const std::shared_ptr<Node>& node,bool focusVisible=false,
@@ -973,7 +1130,7 @@ struct View::Impl {
         if(openSelectPopup&&next!=openSelectPopup)CloseSelectPopup();
         if(next==focused){
             const bool desired=focused&&(focusVisible||IsTextControl(focused)||IsContentEditable(focused));
-            if(focused&&desired!=focused->focusVisible){focused->focusVisible=desired;layoutDirty=true;if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);}
+            if(focused&&desired!=focused->focusVisible){focused->focusVisible=desired;RestyleDocument();if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);}
             if(focused&&openTextEditor&&!editingNode&&(IsTextControl(focused)||IsContentEditable(focused)))
                 editingNode=EnsureEditableTextNode(focused);
             if(editingNode)ResetCaretBlink();
@@ -988,7 +1145,7 @@ struct View::Impl {
             if(IsTextControl(focused)){editingNode=focused;const auto length=EditingValue().size();selectionAnchor=std::min(focused->selectionStart,length);caretPosition=std::min(focused->selectionEnd,length);}
             else if(IsContentEditable(focused)){editingNode=EnsureEditableTextNode(focused);selectionAnchor=caretPosition=EditingValue().size();}
             javascript.DispatchNodeEvent(focused,L"focus");javascript.DispatchNodeEvent(focused,L"focusin");}
-        layoutDirty=true;if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);
+        RestyleDocument();if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);
         if(focused&&accessibility)accessibility->RaiseFocusChanged(focused);
         if(focused&&openTextEditor&&(IsTextControl(focused)||IsContentEditable(focused)))
             textInput.UpdateCandidateWindow(hwnd);
@@ -1530,7 +1687,7 @@ struct View::Impl {
         case WM_PAINT:Paint();return 0;case WM_ERASEBKGND:return 1;
         case WM_IME_SETCONTEXT:return DefWindowProcW(hwnd,message,wParam,lParam&~ISC_SHOWUICOMPOSITIONWINDOW);
         case WM_SETFOCUS:textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();return 0;
-        case WM_TIMER:if(wParam==kAnimationFrameTimer){KillTimer(hwnd,kAnimationFrameTimer);javascript.RunAnimationFrame();return 0;}if(wParam==kJavaScriptTimer){KillTimer(hwnd,kJavaScriptTimer);javascript.RunTimers();return 0;}if(wParam==kCssTransitionTimer){const auto now=std::chrono::steady_clock::now();const float elapsed=std::max(1.0f,std::chrono::duration<float,std::milli>(now-cssTransitionTick).count());cssTransitionTick=now;if(layoutDirty)Rebuild();const bool remains=layout.AdvanceTransitions(elapsed);UpdateFrameBounds();InvalidateRect(hwnd,nullptr,FALSE);if(!remains){KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;}return 0;}if(wParam==kCaretBlinkTimer){if(CanBlinkCaret()){caretVisible=!caretVisible;InvalidateRect(hwnd,nullptr,FALSE);}else StopCaretBlink();return 0;}break;
+        case WM_TIMER:if(wParam==kAnimationFrameTimer){KillTimer(hwnd,kAnimationFrameTimer);javascript.RunAnimationFrame();return 0;}if(wParam==kJavaScriptTimer){KillTimer(hwnd,kJavaScriptTimer);javascript.RunTimers();return 0;}if(wParam==kCssTransitionTimer){const auto now=std::chrono::steady_clock::now();const float elapsed=std::max(1.0f,std::chrono::duration<float,std::milli>(now-cssTransitionTick).count());cssTransitionTick=now;if(layoutDirty)Rebuild();const bool remains=layout.AdvanceTransitions(elapsed);UpdateFrameBounds();InvalidateRect(hwnd,nullptr,FALSE);if(!remains){KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;}return 0;}if(wParam==kCaretBlinkTimer){if(CanBlinkCaret()){caretVisible=!caretVisible;InvalidateCaret();}else StopCaretBlink();return 0;}break;
         case kAnimationFrameFallbackMessage:javascript.RunAnimationFrame();return 0;
         case WM_SIZE:{const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
         case WM_DPICHANGED:{const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
@@ -1626,9 +1783,9 @@ struct View::Impl {
             if(scrollbarDragNode){if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
             if(textSelectionDragging){UpdateTextSelectionAt(x,y);return 0;}
             if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y))return 0;}
-            auto n=layout.HitTest(x,y);if(n!=hovered){layoutDirty=SetHoveredNode(n);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+            auto n=layout.HitTest(x,y);if(n!=hovered){LayoutRect dirty{};bool targeted=false;layoutDirty=SetHoveredNode(n,&dirty,&targeted);if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
-        case WM_MOUSELEAVE:trackingMouseLeave=false;if(hovered){layoutDirty=SetHoveredNode({});InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+        case WM_MOUSELEAVE:trackingMouseLeave=false;if(hovered){LayoutRect dirty{};bool targeted=false;layoutDirty=SetHoveredNode({},&dirty,&targeted);if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         case WM_GETDLGCODE:return DLGC_WANTTAB|DLGC_WANTARROWS|
             ((CanEditText()||focused&&focused->tag==L"select")?DLGC_WANTCHARS:0);
         case WM_KEYDOWN:{JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
@@ -1676,13 +1833,13 @@ struct View::Impl {
         case WM_UNDO:ApplyHistory(false);return 0;
         case WM_CHAR:if(textInput.IsComposing())return 0;else if(CanEditText()){if(wParam==VK_BACK)Backspace();else if(wParam==L'\r'){if(!IsTextInput(focused))ReplaceSelection(L"\n",L"insertLineBreak");}else if(wParam>=32&&wParam!=127)ReplaceSelection(std::wstring(1,static_cast<wchar_t>(wParam)));return 0;}break;
         case WM_UNICHAR:if(wParam==UNICODE_NOCHAR)return TRUE;else if(CanEditText()&&wParam>=32&&wParam<=0x10ffff){std::wstring text;if(wParam<=0xffff)text.push_back(static_cast<wchar_t>(wParam));else{const auto value=static_cast<unsigned>(wParam)-0x10000;text.push_back(static_cast<wchar_t>(0xd800+(value>>10)));text.push_back(static_cast<wchar_t>(0xdc00+(value&0x3ff)));}ReplaceSelection(text);return 0;}break;
-        case WM_KILLFOCUS:textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return 0;
+        case WM_KILLFOCUS:textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();InvalidateRect(hwnd,nullptr,FALSE);return 0;
         case WM_SETCURSOR:{POINT screenPoint{};GetCursorPos(&screenPoint);const LRESULT parentHit=ParentResizeHit(screenPoint);if(const HCURSOR resize=ResizeCursor(parentHit)){SetCursor(resize);return TRUE;}const UINT hit=LOWORD(lParam);
             if(const HCURSOR resize=ResizeCursor(hit)){SetCursor(resize);return TRUE;}
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
         case WM_DESTROY:KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
-        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();
         for(const auto& link:document.QuerySelectorAll(L"link[rel='stylesheet']")){
             std::wstring external;if(LoadTextResource(link->Attribute(L"href"),external))css+=external+L"\n";
@@ -1720,7 +1877,9 @@ struct View::Impl {
             }
             javascript.DispatchNodeEvent(node,L"load");
         }
-        layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);NotifyAccessibilityMutation();if(loadHandler)loadHandler(true,L"");return true;
+        layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);JavaScriptRuntime::Mutation initialMutation;
+        initialMutation.kind=JavaScriptRuntime::MutationKind::Tree;initialMutation.targets.push_back(document.Root());
+        NotifyAccessibilityMutation(initialMutation,true);if(loadHandler)loadHandler(true,L"");return true;
     }
 };
 

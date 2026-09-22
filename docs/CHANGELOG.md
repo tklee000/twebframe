@@ -2,6 +2,19 @@
 
 This document records user-visible changes cumulatively by released version. Add each new release above the previous entries.
 
+## 0.6 - 2026-09-22
+
+### Added
+
+- Added incremental DOM ID, tag, and class indexes with mutation-aware updates and document-order-preserving selector queries.
+- Added regression and benchmark coverage for selector indexing, mutation invalidation, scroll-only updates, and large-document rendering.
+
+### Improved
+
+- Reduced repeated selector matching, query parsing, class-token scanning, attribute normalization, and inline event compilation.
+- Reused layout, text, brush, and SVG geometry work where safe, and limited paint work to invalidated regions.
+- Narrowed accessibility live-region updates and scroll-only mutations to the affected state without forcing a complete layout.
+
 ## 0.5 - 2026-09-21
 
 ### Added
