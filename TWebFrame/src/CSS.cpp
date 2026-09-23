@@ -1,4 +1,5 @@
 #include "CSS.h"
+#include "NumericParser.h"
 
 #include <algorithm>
 #include <cmath>
@@ -218,12 +219,12 @@ std::wstring ResolveViewportUnits(std::wstring value,float viewportWidth,float v
         while(begin>0&&(std::iswdigit(value[begin-1])||value[begin-1]==L'.'))--begin;
         if(begin>0&&(value[begin-1]==L'+'||value[begin-1]==L'-')&&
            (begin==1||value[begin-2]==L'('||value[begin-2]==L','||std::iswspace(value[begin-2])))--begin;
-        try{
-            const float number=std::stof(value.substr(begin,position-begin));
+        float number=0;
+        if(TryParseFloat(value.substr(begin,position-begin),number)){
             const auto replacement=std::to_wstring(number*reference/100.0f)+L"px";
             value.replace(begin,position+unitLength-begin,replacement);
             position=begin+replacement.size();
-        }catch(...){position+=unitLength;}
+        }else position+=unitLength;
     }
     return value;
 }
@@ -1019,15 +1020,14 @@ float StyleSheet::Length(const std::wstring& raw, float reference, float viewpor
         }
         return total;
     }
-    try {
-        size_t used = 0; const float number = std::stof(value, &used);
-        const auto unit = value.substr(used);
-        if (unit == L"%") return reference * number / 100.0f;
-        if (unit == L"vh" || unit == L"vw") return viewport * number / 100.0f;
-        if (unit == L"em") return fontSize * number;
-        if (unit == L"rem") return 16.0f * number;
-        return number;
-    } catch (...) { return fallback; }
+    size_t used=0;float number=0;
+    if(!TryParseFloat(value,number,&used))return fallback;
+    const auto unit=value.substr(used);
+    if(unit==L"%")return reference*number/100.0f;
+    if(unit==L"vh"||unit==L"vw")return viewport*number/100.0f;
+    if(unit==L"em")return fontSize*number;
+    if(unit==L"rem")return 16.0f*number;
+    return unit.empty()||unit==L"px"?number:fallback;
 }
 
 unsigned int StyleSheet::Color(const std::wstring& raw, unsigned int fallback) {
@@ -1051,7 +1051,9 @@ unsigned int StyleSheet::Color(const std::wstring& raw, unsigned int fallback) {
             auto parseStop=[&](const std::wstring& source){
                 Stop stop;auto parts=SplitWhitespace(source);if(parts.empty())return stop;
                 if(parts.size()>1&&parts.back().find(L'%')!=std::wstring::npos){
-                    try{stop.weight=std::stof(parts.back())/100.0f;parts.pop_back();}catch(...){return stop;}
+                    size_t used=0;float weight=0;
+                    if(!TryParseFloat(parts.back(),weight,&used)||parts.back().substr(used)!=L"%")return stop;
+                    stop.weight=weight/100.0f;parts.pop_back();
                 }
                 std::wstring colorText;for(const auto& part:parts){if(!colorText.empty())colorText+=L" ";colorText+=part;}
                 constexpr unsigned int invalid=0x01020304u;
@@ -1077,16 +1079,16 @@ unsigned int StyleSheet::Color(const std::wstring& raw, unsigned int fallback) {
         return fallback;
     }
     if (!value.empty() && value[0] == L'#') {
-        try {
-            auto hex = value.substr(1);
-            if (hex.size() == 3) hex = std::wstring{hex[0],hex[0],hex[1],hex[1],hex[2],hex[2]};
-            if (hex.size() == 4) hex = std::wstring{hex[0],hex[0],hex[1],hex[1],hex[2],hex[2],hex[3],hex[3]};
-            if (hex.size() == 6) return 0xff000000u | static_cast<unsigned int>(std::stoul(hex, nullptr, 16));
-            if (hex.size() == 8) {
-                const auto rgba=static_cast<unsigned int>(std::stoul(hex,nullptr,16));
-                return ((rgba&0xffu)<<24)|(rgba>>8);
-            }
-        } catch (...) { return fallback; }
+        auto hex=value.substr(1);
+        if(hex.size()==3)hex=std::wstring{hex[0],hex[0],hex[1],hex[1],hex[2],hex[2]};
+        if(hex.size()==4)hex=std::wstring{hex[0],hex[0],hex[1],hex[1],hex[2],hex[2],hex[3],hex[3]};
+        unsigned long long parsed=0;size_t used=0;
+        if((hex.size()==6||hex.size()==8)&&TryParseUnsignedInteger(hex,parsed,&used,16)&&used==hex.size()){
+            const auto rgba=static_cast<unsigned int>(parsed);
+            if(hex.size()==6)return 0xff000000u|rgba;
+            return ((rgba&0xffu)<<24)|(rgba>>8);
+        }
+        return fallback;
     }
     if (value.rfind(L"rgb", 0) == 0) {
         const auto a = value.find(L'('), b = value.find(L')');
@@ -1098,21 +1100,30 @@ unsigned int StyleSheet::Color(const std::wstring& raw, unsigned int fallback) {
             auto parts=arguments.find(L',')==std::wstring::npos?
                 SplitWhitespace(arguments):Split(arguments,L',');
             parts.erase(std::remove(parts.begin(),parts.end(),L"/"),parts.end());
-            if(parts.size()>=3)try{
-                auto channel=[](const std::wstring& token){
-                    const auto text=Trim(token);const float number=std::stof(text);
-                    const float value=!text.empty()&&text.back()==L'%'?number*2.55f:number;
-                    return static_cast<unsigned int>(std::lround(std::max(0.0f,std::min(255.0f,value))));
+            if(parts.size()>=3){
+                auto channel=[](const std::wstring& token,unsigned int& result){
+                    const auto text=Trim(token);size_t used=0;float number=0;
+                    if(!TryParseFloat(text,number,&used))return false;
+                    const bool percent=used<text.size()&&text.substr(used)==L"%";
+                    if(used!=text.size()&&!percent)return false;
+                    const float value=percent?number*2.55f:number;
+                    result=static_cast<unsigned int>(std::lround(std::max(0.0f,std::min(255.0f,value))));
+                    return true;
                 };
-                auto alpha=[](const std::wstring& token){
-                    const auto text=Trim(token);const float number=std::stof(text);
-                    const float value=!text.empty()&&text.back()==L'%'?number/100.0f:number;
-                    return static_cast<unsigned int>(std::lround(std::max(0.0f,std::min(1.0f,value))*255.0f));
+                auto alpha=[](const std::wstring& token,unsigned int& result){
+                    const auto text=Trim(token);size_t used=0;float number=0;
+                    if(!TryParseFloat(text,number,&used))return false;
+                    const bool percent=used<text.size()&&text.substr(used)==L"%";
+                    if(used!=text.size()&&!percent)return false;
+                    const float value=percent?number/100.0f:number;
+                    result=static_cast<unsigned int>(std::lround(std::max(0.0f,std::min(1.0f,value))*255.0f));
+                    return true;
                 };
-                const auto r=channel(parts[0]),g=channel(parts[1]),bl=channel(parts[2]);
-                const auto opacity=parts.size()>3?alpha(parts[3]):255u;
-                return (opacity<<24)|(r<<16)|(g<<8)|bl;
-            }catch(...){ }
+                unsigned int r=0,g=0,bl=0,opacity=255;
+                if(channel(parts[0],r)&&channel(parts[1],g)&&channel(parts[2],bl)&&
+                   (parts.size()<=3||alpha(parts[3],opacity)))
+                    return (opacity<<24)|(r<<16)|(g<<8)|bl;
+            }
         }
     }
     return fallback;

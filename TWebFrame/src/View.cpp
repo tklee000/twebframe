@@ -5,6 +5,7 @@
 #include "DOM.h"
 #include "JavaScript.h"
 #include "Layout.h"
+#include "NumericParser.h"
 #include "RasterImage.h"
 // Keep the decoder in this long-standing translation unit as well as in its
 // own source file.  Some downstream TWebFrame consumers maintain a fixed
@@ -115,7 +116,8 @@ bool IsFocusable(const std::shared_ptr<Node>& node) {
 int SequentialTabIndex(const std::shared_ptr<Node>& node){
     if(!IsFocusable(node))return -1;
     if(!node->attributes.count(L"tabindex"))return 0;
-    try{return std::stoi(node->Attribute(L"tabindex"));}catch(...){return 0;}
+    const auto value=Trim(node->Attribute(L"tabindex"));size_t used=0;int parsed=0;
+    return TryParseInteger(value,parsed,&used)&&used==value.size()?parsed:0;
 }
 
 bool IsKeyboardActivatable(const std::shared_ptr<Node>& node){
@@ -1875,7 +1877,8 @@ struct View::Impl {
         const float gap=std::max(0.0f,metric(L"--select-menu-gap",box->rect.height,box->rect.height*0.125f));
         const float width=std::max(1.0f,metric(L"--select-menu-width",box->rect.width,box->rect.width));
         float maxRows=editable?5.0f:8.0f;const auto rawMaxRows=box->style.Get(L"--select-menu-max-rows");
-        if(!rawMaxRows.empty())try{maxRows=std::max(1.0f,std::stof(rawMaxRows));}catch(...){}
+        float parsedMaxRows=0;
+        if(TryParseFloat(rawMaxRows,parsedMaxRows))maxRows=std::max(1.0f,parsedMaxRows);
         geometry.contentHeight=geometry.rowHeight*static_cast<float>(options.size());
         geometry.viewportHeight=std::min(geometry.contentHeight,geometry.rowHeight*maxRows);
         float height=geometry.viewportHeight+geometry.borderWidth*2.0f;
@@ -1972,7 +1975,9 @@ struct View::Impl {
         target->CreateSolidColorBrush(d2d(palette.background),&brush);target->FillRectangle(inner,brush.Get());
         auto family=box->style.Get(L"font-family",L"Segoe UI");const auto comma=family.find(L',');if(comma!=std::wstring::npos)family=Trim(family.substr(0,comma));
         family.erase(std::remove(family.begin(),family.end(),L'\''),family.end());family.erase(std::remove(family.begin(),family.end(),L'"'),family.end());
-        int weight=400;try{weight=std::stoi(box->style.Get(L"font-weight",L"400"));}catch(...){if(box->style.Is(L"font-weight",L"bold"))weight=700;}
+        int weight=400;const auto rawWeight=box->style.Get(L"font-weight",L"400");size_t usedWeight=0;
+        if(!TryParseInteger(rawWeight,weight,&usedWeight)||usedWeight!=rawWeight.size())
+            weight=box->style.Is(L"font-weight",L"bold")?700:400;
         const float fontSize=StyleSheet::Length(box->style.Get(L"font-size",L"16px"),16,16,16);
         ComPtr<IDWriteTextFormat> format;
         if(FAILED(writeFactory->CreateTextFormat(family.c_str(),nullptr,static_cast<DWRITE_FONT_WEIGHT>(std::max(1,std::min(999,weight))),
@@ -2175,7 +2180,13 @@ struct View::Impl {
         auto value=EditingValue();size_t begin=atBoundary?0:std::min(selectionAnchor,caretPosition);
         size_t end=atBoundary?0:std::min(value.size(),std::max(selectionAnchor,caretPosition));
         begin=std::min(begin,value.size());std::wstring inserted=replacement;
-        if(IsTextControl(focused)){const auto maximum=focused->Attribute(L"maxlength");if(!maximum.empty()){try{const size_t limit=std::stoul(maximum);const size_t kept=value.size()-(end-begin);if(kept>=limit)inserted.clear();else if(inserted.size()>limit-kept)inserted.resize(limit-kept);}catch(...){} }}
+        if(IsTextControl(focused)){const auto maximum=focused->Attribute(L"maxlength");unsigned long long parsed=0;size_t used=0;
+            if(TryParseUnsignedInteger(maximum,parsed,&used)&&used==maximum.size()&&
+               parsed<=(std::numeric_limits<size_t>::max)()){
+                const size_t limit=static_cast<size_t>(parsed),kept=value.size()-(end-begin);
+                if(kept>=limit)inserted.clear();else if(inserted.size()>limit-kept)inserted.resize(limit-kept);
+            }
+        }
         if(begin==end&&inserted.empty())return false;
         JavaScriptRuntime::EventInit before{};before.data=inserted;before.inputType=inputType;before.isComposing=isComposing;
         if(javascript.DispatchNodeEvent(focused,L"beforeinput",before))return false;

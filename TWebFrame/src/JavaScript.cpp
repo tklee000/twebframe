@@ -1,5 +1,6 @@
 #include "JavaScript.h"
 #include "Canvas.h"
+#include "NumericParser.h"
 #include "RasterImage.h"
 
 #include <windows.h>
@@ -530,7 +531,15 @@ public:
                     ++position_;
                 }
                 token.kind=TokenKind::Number; token.text=source_.substr(start,position_-start);
-                try {auto numeric=token.text;numeric.erase(std::remove(numeric.begin(),numeric.end(),L'_'),numeric.end());if(!numeric.empty()&&numeric.back()==L'n')numeric.pop_back();size_t used=0;if(numeric.size()>2&&numeric[0]==L'0'&&(numeric[1]==L'x'||numeric[1]==L'X'))token.number=static_cast<double>(std::stoull(numeric,&used,16));else token.number=std::stod(numeric,&used);} catch (...) { token.number=0; }
+                auto numeric=token.text;numeric.erase(std::remove(numeric.begin(),numeric.end(),L'_'),numeric.end());
+                if(!numeric.empty()&&numeric.back()==L'n')numeric.pop_back();size_t used=0;
+                if(numeric.size()>2&&numeric[0]==L'0'&&(numeric[1]==L'x'||numeric[1]==L'X')){
+                    unsigned long long parsed=0;
+                    if(TryParseUnsignedInteger(numeric,parsed,&used,16)&&used==numeric.size())
+                        token.number=static_cast<double>(parsed);
+                }else{
+                    double parsed=0;if(TryParseDouble(numeric,parsed,&used)&&used==numeric.size())token.number=parsed;
+                }
                 tokens.push_back(token); continue;
             }
             if (c == L'\'' || c == L'"') { token.kind=TokenKind::String; token.text=ReadString(c); tokens.push_back(token); continue; }
@@ -1696,11 +1705,10 @@ struct RuntimeCore {
                                     unsigned fallback){
         if(!node)return fallback;
         const auto raw=Trim(node->Attribute(name));if(raw.empty())return fallback;
-        try{
-            size_t used=0;const double number=std::stod(raw,&used);
-            if(used!=raw.size()||!std::isfinite(number)||number<0)return fallback;
-            return static_cast<unsigned>(std::min(65535.0,std::floor(number)));
-        }catch(...){return fallback;}
+        size_t used=0;double number=0;
+        if(!TryParseDouble(raw,number,&used)||used!=raw.size()||!std::isfinite(number)||number<0)
+            return fallback;
+        return static_cast<unsigned>(std::min(65535.0,std::floor(number)));
     }
     std::shared_ptr<CanvasSurface> EnsureCanvas(const std::shared_ptr<Node>& node){
         if(!node)return {};
@@ -2642,9 +2650,9 @@ struct RuntimeCore {
             if(node->tag==L"img"&&key==L"complete")return Value::Bool(node->imageComplete);
             if(node->tag==L"img"&&(key==L"width"||key==L"height")){
                 const auto authored=Trim(node->Attribute(key));
-                if(!authored.empty())try{
-                    return Value::Number(std::max(0.0,std::stod(authored)));
-                }catch(...){}
+                double parsed=0;
+                if(TryParseDouble(authored,parsed)&&std::isfinite(parsed))
+                    return Value::Number(std::max(0.0,parsed));
                 if(node->image)return Value::Number(
                     key==L"width"?node->image->width:node->image->height);
                 return Value::Number(0);

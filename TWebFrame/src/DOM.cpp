@@ -1,4 +1,5 @@
 #include "DOM.h"
+#include "NumericParser.h"
 
 #include <algorithm>
 #include <cwctype>
@@ -219,12 +220,18 @@ bool MatchSimple(const std::shared_ptr<Node>& node, std::wstring selector) {
     auto matchesNth=[](int index,std::wstring expression){
         expression=ToLower(expression);expression.erase(std::remove_if(expression.begin(),expression.end(),IsSpace),expression.end());
         if(index<=0||expression.empty())return false;if(expression==L"odd")return index%2==1;if(expression==L"even")return index%2==0;
-        try{
-            const auto n=expression.find(L'n');if(n==std::wstring::npos)return index==std::stoi(expression);
-            const auto coefficient=expression.substr(0,n);const int a=coefficient.empty()||coefficient==L"+"?1:(coefficient==L"-"?-1:std::stoi(coefficient));
-            const int b=n+1>=expression.size()?0:std::stoi(expression.substr(n+1));if(a==0)return index==b;
-            const int delta=index-b;return delta%a==0&&delta/a>=0;
-        }catch(...){return false;}
+        const auto integer=[](const std::wstring& text,int& value){
+            size_t used=0;return TryParseInteger(text,value,&used)&&used==text.size();
+        };
+        const auto n=expression.find(L'n');
+        if(n==std::wstring::npos){int exact=0;return integer(expression,exact)&&index==exact;}
+        const auto coefficient=expression.substr(0,n);int a=0;
+        if(coefficient.empty()||coefficient==L"+")a=1;
+        else if(coefficient==L"-")a=-1;
+        else if(!integer(coefficient,a))return false;
+        int b=0;if(n+1<expression.size()&&!integer(expression.substr(n+1),b))return false;
+        if(a==0)return index==b;
+        const int delta=index-b;return delta%a==0&&delta/a>=0;
     };
     for(;;){
         const auto position=selector.find(L":nth-child(");if(position==std::wstring::npos)break;
@@ -621,10 +628,11 @@ std::wstring DecodeEntities(const std::wstring& value) {
         else if (entity == L"apos" || entity == L"#39") out += L'\'';
         else if (entity == L"nbsp") out += static_cast<wchar_t>(0x00a0);
         else if (!entity.empty() && entity[0] == L'#') {
-            try {
-                const int base = entity.size() > 1 && (entity[1] == L'x' || entity[1] == L'X') ? 16 : 10;
-                out += static_cast<wchar_t>(std::stoul(entity.substr(base == 16 ? 2 : 1), nullptr, base));
-            } catch (...) { out += L'&' + entity + L';'; }
+            const int base=entity.size()>1&&(entity[1]==L'x'||entity[1]==L'X')?16:10;
+            const auto digits=entity.substr(base==16?2:1);size_t used=0;unsigned long long codePoint=0;
+            if(TryParseUnsignedInteger(digits,codePoint,&used,base)&&used==digits.size()&&codePoint<=0xffff)
+                out+=static_cast<wchar_t>(codePoint);
+            else out+=L'&'+entity+L';';
         } else { out += L'&' + entity + L';'; }
         i = end;
     }

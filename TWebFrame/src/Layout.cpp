@@ -1,5 +1,6 @@
 #include "Layout.h"
 #include "Canvas.h"
+#include "NumericParser.h"
 #include "RasterImage.h"
 
 #include <algorithm>
@@ -277,7 +278,8 @@ bool IsBlockifiedItem(const LayoutBox& box) {
 int ZIndex(const LayoutBox& box) {
     const auto value=Trim(ToLower(box.style.Get(L"z-index",L"auto")));
     if(value.empty()||value==L"auto")return 0;
-    try{return std::stoi(value);}catch(...){return 0;}
+    size_t used=0;int parsed=0;
+    return TryParseInteger(value,parsed,&used)&&used==value.size()?parsed:0;
 }
 
 bool HasExplicitZIndex(const LayoutBox& box) {
@@ -295,7 +297,7 @@ bool IsStackingContext(const LayoutBox& box) {
         parentDisplay==L"grid"||parentDisplay==L"inline-grid";
     if(HasExplicitZIndex(box)&&(positioned||flexOrGridItem))return true;
     if(box.style.Get(L"transform",L"none")!=L"none")return true;
-    try{return std::stof(box.style.Get(L"opacity",L"1"))<0.999f;}catch(...){return false;}
+    float opacity=1;return TryParseFloat(box.style.Get(L"opacity",L"1"),opacity)&&opacity<0.999f;
 }
 
 bool ClipsOverflow(const LayoutBox& box) {
@@ -411,12 +413,11 @@ struct TransitionDefinition {
 
 bool TransitionTime(const std::wstring& token,float& milliseconds) {
     const auto value=ToLower(Trim(token));
-    try{
-        size_t consumed=0;const float number=std::stof(value,&consumed);
-        const auto unit=value.substr(consumed);
-        if(unit==L"ms"){milliseconds=number;return true;}
-        if(unit==L"s"){milliseconds=number*1000.0f;return true;}
-    }catch(...){}
+    size_t consumed=0;float number=0;
+    if(!TryParseFloat(value,number,&consumed))return false;
+    const auto unit=value.substr(consumed);
+    if(unit==L"ms"){milliseconds=number;return true;}
+    if(unit==L"s"){milliseconds=number*1000.0f;return true;}
     return false;
 }
 
@@ -430,13 +431,14 @@ bool TransitionTiming(const std::wstring& token,TransitionDefinition& definition
     if(value.rfind(L"cubic-bezier(",0)!=0||value.back()!=L')')return false;
     const auto values=CommaSeparated(value.substr(13,value.size()-14));
     if(values.size()!=4)return false;
-    try{
-        definition.x1=std::stof(values[0]);definition.y1=std::stof(values[1]);
-        definition.x2=std::stof(values[2]);definition.y2=std::stof(values[3]);
-        definition.x1=std::max(0.0f,std::min(1.0f,definition.x1));
-        definition.x2=std::max(0.0f,std::min(1.0f,definition.x2));
-        return true;
-    }catch(...){return false;}
+    size_t used=0;
+    if(!TryParseFloat(values[0],definition.x1,&used)||used!=values[0].size()||
+       !TryParseFloat(values[1],definition.y1,&used)||used!=values[1].size()||
+       !TryParseFloat(values[2],definition.x2,&used)||used!=values[2].size()||
+       !TryParseFloat(values[3],definition.y2,&used)||used!=values[3].size())return false;
+    definition.x1=std::max(0.0f,std::min(1.0f,definition.x1));
+    definition.x2=std::max(0.0f,std::min(1.0f,definition.x2));
+    return true;
 }
 
 std::vector<TransitionDefinition> TransitionDefinitions(const ComputedStyle& style) {
@@ -644,7 +646,8 @@ float BorderWidth(const ComputedStyle& style,const std::wstring& side=L"") {
     std::wistringstream widthTokens(ToLower(value));std::wstring widthToken;
     while(widthTokens>>widthToken){
         if(widthToken==L"thin")return snap(1.0f);if(widthToken==L"medium")return snap(3.0f);if(widthToken==L"thick")return snap(5.0f);
-        try{size_t used=0;std::stof(widthToken,&used);if(used>0)return snap(StyleSheet::Length(widthToken,0,0,0));}catch(...){ }
+        size_t used=0;float parsed=0;
+        if(TryParseFloat(widthToken,parsed,&used)&&used>0)return snap(StyleSheet::Length(widthToken,0,0,0));
     }
     return borderStyle.empty()?0.0f:snap(3.0f);
 }
@@ -670,8 +673,10 @@ float LineHeight(const ComputedStyle& style){
     // box is four thirds of the computed font size.
     constexpr float normalLineHeight=4.0f/3.0f;
     if(raw.empty()||raw==L"normal")cached.lineHeight=font*normalLineHeight;
-    else try{size_t used=0;const float multiple=std::stof(raw,&used);cached.lineHeight=used==raw.size()?font*multiple:StyleSheet::Length(raw,font,font,font*normalLineHeight);}
-    catch(...){cached.lineHeight=StyleSheet::Length(raw,font,font,font*normalLineHeight);}
+    else{size_t used=0;float multiple=0;
+        cached.lineHeight=TryParseFloat(raw,multiple,&used)&&used==raw.size()?
+            font*multiple:StyleSheet::Length(raw,font,font,font*normalLineHeight);
+    }
     cached.lineHeightValid=true;return cached.lineHeight;
 }
 
@@ -903,8 +908,9 @@ bool IsDecorativeControlText(const std::shared_ptr<Node>& node) {
 }
 
 int FontWeight(const ComputedStyle& style) {
-    try{return std::max(1,std::min(999,std::stoi(style.Get(L"font-weight",L"400"))));}
-    catch(...){return style.Is(L"font-weight",L"bold")?700:400;}
+    const auto raw=style.Get(L"font-weight",L"400");size_t used=0;int parsed=0;
+    if(TryParseInteger(raw,parsed,&used)&&used==raw.size())return std::max(1,std::min(999,parsed));
+    return style.Is(L"font-weight",L"bold")?700:400;
 }
 
 float BrowserSymbolAdvanceAdjustment(wchar_t value,float size) {
@@ -1181,13 +1187,11 @@ void ApplyTabSize(IDWriteFactory* factory,IDWriteTextLayout* layout,
     if(!layout||text.find(L'\t')==std::wstring::npos)return;
     const auto raw=ToLower(Trim(style.Get(L"tab-size",L"8")));
     float stop=0;bool number=false;
-    try{
-        size_t used=0;const float value=std::stof(raw,&used);
-        if(used==raw.size()){
-            stop=SpaceAdvance(factory,format,style,controlMetrics)*value;
-            number=true;
-        }
-    }catch(...){}
+    size_t used=0;float value=0;
+    if(TryParseFloat(raw,value,&used)&&used==raw.size()){
+        stop=SpaceAdvance(factory,format,style,controlMetrics)*value;
+        number=true;
+    }
     if(!number)stop=StyleSheet::Length(raw,FontSize(style),FontSize(style),
         SpaceAdvance(factory,format,style,controlMetrics)*8.0f,FontSize(style));
     layout->SetIncrementalTabStop(std::max(0.01f,stop));
@@ -1551,7 +1555,11 @@ size_t GridColumnCount(const LayoutBox& box,float availableWidth){
         return std::max<size_t>(1,std::min(fits,std::max<size_t>(1,box.children.size())));
     }
     const auto repeat=definition.find(L"repeat(");
-    if(repeat!=std::wstring::npos){try{return std::max<size_t>(1,static_cast<size_t>(std::stoul(definition.substr(repeat+7))));}catch(...){} }
+    if(repeat!=std::wstring::npos){unsigned long long parsed=0;
+        if(TryParseUnsignedInteger(definition.substr(repeat+7),parsed)&&
+           parsed<=(std::numeric_limits<size_t>::max)())
+            return std::max<size_t>(1,static_cast<size_t>(parsed));
+    }
     return std::max<size_t>(1,Words(definition).size());
 }
 
@@ -1913,7 +1921,10 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
         auto padding=EdgeValues(box.style,L"padding",availableWidth,availableWidth);
         auto border=BorderValues(box.style);size_t rows=2;
         const auto rawRows=Trim(box.node->Attribute(L"rows"));
-        if(!rawRows.empty())try{rows=std::max<size_t>(1,std::stoul(rawRows));}catch(...){}
+        unsigned long long parsedRows=0;size_t usedRows=0;
+        if(TryParseUnsignedInteger(rawRows,parsedRows,&usedRows)&&usedRows==rawRows.size()&&
+           parsedRows<=(std::numeric_limits<size_t>::max)())
+            rows=std::max<size_t>(1,static_cast<size_t>(parsedRows));
         value=LineHeight(box.style)*rows+padding.top+padding.bottom+border.top+border.bottom;
     }
     else if(box.node->tag==L"input"||box.node->tag==L"select"||
@@ -2165,11 +2176,9 @@ std::vector<std::wstring> SplitGridPlacement(const std::wstring& source) {
 
 bool GridInteger(const std::wstring& source,int& value) {
     const auto trimmed=Trim(source);
-    try{
-        size_t used=0;const int parsed=std::stoi(trimmed,&used);
-        if(used!=trimmed.size()||parsed==0)return false;
-        value=parsed;return true;
-    }catch(...){return false;}
+    size_t used=0;int parsed=0;
+    if(!TryParseInteger(trimmed,parsed,&used)||used!=trimmed.size()||parsed==0)return false;
+    value=parsed;return true;
 }
 
 GridLineValue ParseGridLine(const std::wstring& source) {
@@ -2269,7 +2278,11 @@ std::shared_ptr<const GridTrackDefinitions> ExpandGridTracks(
         const auto repeated=Words(Trim(inside.substr(comma+1)));
         size_t count=0;
         if(countToken==L"auto-fit"||countToken==L"auto-fill")count=GridColumnCount(box,reference);
-        else try{count=std::max<size_t>(1,std::stoul(countToken));}catch(...){count=1;}
+        else{unsigned long long parsed=0;size_t used=0;
+            count=TryParseUnsignedInteger(countToken,parsed,&used)&&used==countToken.size()&&
+                parsed<=(std::numeric_limits<size_t>::max)()?
+                std::max<size_t>(1,static_cast<size_t>(parsed)):1;
+        }
         for(size_t repeat=0;repeat<count;++repeat)
             result->insert(result->end(),repeated.begin(),repeated.end());
     }
@@ -2394,7 +2407,7 @@ GridTrackSizing ParseGridTrack(const std::wstring& source,float reference,float 
         if(contextIndependent){if(cache.size()>=256)cache.clear();cache.emplace(source,value);}
         return value;
     };
-    auto fraction=[](const std::wstring& value){try{return std::stof(value);}catch(...){return 1.0f;}};
+    auto fraction=[](const std::wstring& value){float parsed=0;return TryParseFloat(value,parsed)?parsed:1.0f;};
     auto intrinsic=[](const std::wstring& value){return value==L"auto"||value==L"min-content"||value==L"max-content";};
     if(token.rfind(L"minmax(",0)==0&&token.size()>8&&token.back()==L')'){
         const auto values=CommaSeparated(token.substr(7,token.size()-8));
@@ -2761,10 +2774,10 @@ bool ParseRadialGradientStop(const std::wstring& source,RadialGradientStop& stop
     constexpr unsigned int invalid=0x01020304u;
     stop.color=StyleSheet::Color(colorText,invalid);if(stop.color==invalid)return false;
     if(!positionText.empty()){
-        try{
-            size_t used=0;const float parsed=std::stof(positionText,&used);
+        size_t used=0;float parsed=0;
+        if(TryParseFloat(positionText,parsed,&used))
             stop.position=positionText.find(L'%',used)!=std::wstring::npos?parsed/100.0f:parsed;
-        }catch(...){stop.position=-1;}
+        else stop.position=-1;
     }
     return true;
 }
@@ -2818,7 +2831,7 @@ void PaintGradientBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& sty
             }
         }else if(linear){
             if(prelude.find(L"deg")!=std::wstring::npos){
-                try{angleDegrees=std::stof(prelude);firstStop=1;}catch(...){ }
+                float parsed=0;if(TryParseFloat(prelude,parsed)){angleDegrees=parsed;firstStop=1;}
             }else if(prelude.rfind(L"to ",0)==0){
                 firstStop=1;
                 const bool left=prelude.find(L"left")!=std::wstring::npos;
@@ -3135,12 +3148,16 @@ bool ApplyPaintTransform(ID2D1RenderTarget* target,const LayoutBox& box,D2D1_MAT
     if(transform.empty()||transform==L"none")return false;
     auto argument=[&](const std::wstring& function){const auto start=transform.find(function+L"(");if(start==std::wstring::npos)return std::wstring{};const auto first=start+function.size()+1,close=transform.find(L')',first);return close==std::wstring::npos?std::wstring{}:Trim(transform.substr(first,close-first));};
     float angle=0,scaleX=1,scaleY=1;
-    if(const auto raw=argument(L"rotate");!raw.empty()){try{angle=std::stof(raw);}catch(...){}}
+    if(const auto raw=argument(L"rotate");!raw.empty())TryParseFloat(raw,angle);
     if(const auto raw=argument(L"scale");!raw.empty()){
-        const auto values=CommaSeparated(raw);try{if(!values.empty())scaleX=std::stof(values[0]);scaleY=values.size()>1?std::stof(values[1]):scaleX;}catch(...){scaleX=scaleY=1;}
+        const auto values=CommaSeparated(raw);float parsedX=1,parsedY=1;
+        if(!values.empty()&&TryParseFloat(values[0],parsedX)&&
+           (values.size()<=1||TryParseFloat(values[1],parsedY))){
+            scaleX=parsedX;scaleY=values.size()>1?parsedY:parsedX;
+        }
     }
-    if(const auto raw=argument(L"scalex");!raw.empty())try{scaleX=std::stof(raw);}catch(...){}
-    if(const auto raw=argument(L"scaley");!raw.empty())try{scaleY=std::stof(raw);}catch(...){}
+    if(const auto raw=argument(L"scalex");!raw.empty())TryParseFloat(raw,scaleX);
+    if(const auto raw=argument(L"scaley");!raw.empty())TryParseFloat(raw,scaleY);
     if(std::abs(angle)<0.001f&&std::abs(scaleX-1)<0.001f&&std::abs(scaleY-1)<0.001f)return false;
     target->GetTransform(&previous);const auto center=D2D1::Point2F(box.rect.x+box.rect.width/2,box.rect.y+box.rect.height/2);
     target->SetTransform(D2D1::Matrix3x2F::Scale(scaleX,scaleY,center)*D2D1::Matrix3x2F::Rotation(angle,center)*previous);
@@ -3276,7 +3293,7 @@ void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& s
     const auto strokeWidthText=style.Get(L"stroke-width",L"1");
     const auto strokeWidth=StyleSheet::Length(strokeWidthText,24,24,1);
     float opacity=parentOpacity;
-    try{opacity*=std::stof(style.Get(L"opacity",L"1"));}catch(...){ }
+    float parsedOpacity=1;if(TryParseFloat(style.Get(L"opacity",L"1"),parsedOpacity))opacity*=parsedOpacity;
     opacity=std::max(0.0f,std::min(1.0f,opacity));
     if(node->tag==L"g"||node->tag==L"symbol"){
         for(const auto& child:node->children)
@@ -3296,7 +3313,7 @@ void PaintSvgShape(ID2D1RenderTarget* target,ID2D1Factory* factory,StyleSheet& s
     auto color=[&](const std::wstring& raw){return raw==L"currentColor"?currentColor:StyleSheet::Color(raw,currentColor);};
     auto brushColor=[&](const std::wstring& raw,const wchar_t* opacityProperty){
         auto result=D2DColor(color(raw));float localOpacity=1;
-        try{localOpacity=std::stof(style.Get(opacityProperty,L"1"));}catch(...){ }
+        TryParseFloat(style.Get(opacityProperty,L"1"),localOpacity);
         result.a*=opacity*std::max(0.0f,std::min(1.0f,localOpacity));return result;
     };
     if(!fill.empty()&&fill!=L"none")target->CreateSolidColorBrush(brushColor(fill,L"fill-opacity"),&fillBrush);
@@ -3702,7 +3719,8 @@ float ImagePositionOffset(const std::wstring& token,float freeSpace,bool horizon
     if(value==(horizontal?L"left":L"top"))return 0;
     if(value==(horizontal?L"right":L"bottom"))return freeSpace;
     if(!value.empty()&&value.back()==L'%'){
-        try{return freeSpace*std::stof(value.substr(0,value.size()-1))/100.0f;}catch(...){}
+        float percent=0;if(TryParseFloat(value.substr(0,value.size()-1),percent))
+            return freeSpace*percent/100.0f;
     }
     return StyleSheet::Length(value,std::abs(freeSpace),std::abs(freeSpace),0);
 }
@@ -3762,7 +3780,7 @@ CanvasFont ParseCanvasFont(const std::wstring& source){
     CanvasFont result;const auto lower=ToLower(source);const auto px=lower.find(L"px");
     if(px==std::wstring::npos)return result;size_t begin=px;
     while(begin>0&&(std::iswdigit(source[begin-1])||source[begin-1]==L'.'))--begin;
-    try{result.size=std::max(0.1f,std::stof(source.substr(begin,px-begin)));}catch(...){ }
+    float parsed=0;if(TryParseFloat(source.substr(begin,px-begin),parsed))result.size=std::max(0.1f,parsed);
     auto familyList=Trim(source.substr(px+2));
     if(!familyList.empty())result.family=ResolveFontFamilyList(familyList,L"Arial");
     result.koreanFamily=ExplicitKoreanFontFamily(familyList);
@@ -4997,7 +5015,7 @@ void LayoutEngine::PaintDialogBackdrop(ID2D1RenderTarget* target,const LayoutBox
     auto style=styleSheet_.Compute(dialog.node,nullptr,L"backdrop");
     style.deviceScale=deviceScale_;
     if(style.Is(L"visibility",L"hidden"))return;
-    float opacity=1.0f;try{opacity=std::stof(style.Get(L"opacity",L"1"));}catch(...){}
+    float opacity=1.0f;TryParseFloat(style.Get(L"opacity",L"1"),opacity);
     opacity=std::max(0.0f,std::min(1.0f,opacity));if(opacity<=0.001f)return;
     target->PushAxisAlignedClip(PixelAlignedRect(clipBounds),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;
@@ -5032,7 +5050,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     if(IsDeferredContext(box,deferredContexts))return;
     const bool intersects=box.rect.x<clipBounds.x+clipBounds.width&&box.rect.x+box.rect.width>clipBounds.x&&box.rect.y<clipBounds.y+clipBounds.height&&box.rect.y+box.rect.height>clipBounds.y;
     if(!box.visible||box.rect.width<=0||box.rect.height<=0||!intersects)return;
-    float opacity=1.0f;try{opacity=std::stof(box.style.Get(L"opacity",L"1"));}catch(...){}
+    float opacity=1.0f;TryParseFloat(box.style.Get(L"opacity",L"1"),opacity);
     opacity=std::max(0.0f,std::min(1.0f,opacity));
     if(box.style.Is(L"visibility",L"hidden")||opacity<=0.001f)return;D2D1_MATRIX_3X2_F previousTransform{};const bool transformed=ApplyPaintTransform(target,box,previousTransform);Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;if(opacity<0.999f&&SUCCEEDED(target->CreateLayer(nullptr,&opacityLayer)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),opacity),opacityLayer.Get());const auto background=BackgroundColor(box.style);ID2D1SolidColorBrush* brush=nullptr;
     const auto radius=UniformCornerRadii(box.style,box.rect.width,box.rect.height,viewportWidth_);
@@ -5171,7 +5189,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
             if(placeholderText){
                 const auto placeholderStyle=styleSheet_.Compute(box.node,&box.style,L"placeholder");
                 textColor=StyleSheet::Color(placeholderStyle.Get(L"color"),0xff757575);
-                try{textOpacity=std::stof(placeholderStyle.Get(L"opacity",L"1"));}catch(...){ }
+                TryParseFloat(placeholderStyle.Get(L"opacity",L"1"),textOpacity);
                 textOpacity=std::max(0.0f,std::min(1.0f,textOpacity));
             }
             auto resolvedTextColor=D2DColor(textColor);resolvedTextColor.a*=textOpacity;

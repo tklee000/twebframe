@@ -466,6 +466,34 @@ int wmain(int argc,wchar_t** argv) {
           !scrollSyncLayout.SyncScroll(scroller),
           L"paint-only DOM scrolling translates existing layout boxes exactly once");
 
+    const auto numericExceptionHandler=AddVectoredExceptionHandler(1,CountFirstChanceCppExceptions);
+    InterlockedExchange(&firstChanceCppExceptions,0);
+    Document numericFallbackDoc;
+    Check(numericFallbackDoc.Parse(
+        L"<body><div id='numeric'>&#xnot-a-number;</div>"
+        L"<canvas id='canvas' width='auto'></canvas><img id='image' width='auto'></body>",&error),
+        L"invalid authored numeric tokens remain valid HTML input");
+    Check(numericFallbackDoc.QuerySelectorAll(L"div:nth-child(not-a-number)").empty(),
+          L"invalid nth-child arithmetic fails matching without escaping the DOM selector rule");
+    constexpr unsigned int invalidColorFallback=0x01020304u;
+    Check(StyleSheet::Length(L"inherit",100,100,37)==37&&
+          StyleSheet::Color(L"rgb(not-a-number, 0, 0)",invalidColorFallback)==invalidColorFallback,
+          L"invalid CSS numeric tokens use their property fallback");
+    StyleSheet numericFallbackCss;
+    Check(numericFallbackCss.Parse(
+        L"#numeric{font-weight:bold;transition:all 0.2s ease-in-out;width:inherit}"),
+        L"transition and keyword-font CSS fixture parses");
+    LayoutEngine numericFallbackLayout(numericFallbackDoc,numericFallbackCss);
+    numericFallbackLayout.Layout(240,120);
+    JavaScriptRuntime numericFallbackJs(numericFallbackDoc);std::wstring numericFallbackResult;
+    Check(numericFallbackJs.Execute(
+        L"return document.getElementById('canvas').width+'|'"
+        L"+document.getElementById('image').width;",
+        &numericFallbackResult,&error)&&numericFallbackResult==L"300|0",error.c_str());
+    Check(InterlockedCompareExchange(&firstChanceCppExceptions,0,0)==0,
+          L"DOM, CSS, layout and JavaScript numeric fallbacks do not throw first-chance C++ exceptions");
+    if(numericExceptionHandler)RemoveVectoredExceptionHandler(numericExceptionHandler);
+
     Document switchDoc;Check(switchDoc.Parse(L"<body></body>",&error),L"switch JavaScript fixture parses");
     JavaScriptRuntime switchJs(switchDoc);std::wstring switchResult;
     Check(switchJs.Load(L"function choose(value){let result='';switch(value){case 'a':result+='a';break;default:result+='d';case 'b':result+='b';}return result;}",&error),error.c_str());
