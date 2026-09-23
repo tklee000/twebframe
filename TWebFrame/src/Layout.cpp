@@ -779,12 +779,71 @@ std::uint64_t StyleContextHash(const std::shared_ptr<Node>& node,std::uint64_t p
     MixHash(hash,(node->checked?1ull:0ull)|(node->disabled?2ull:0ull)|(node->hovered?4ull:0ull)|(node->focused?8ull:0ull)|(node->focusVisible?16ull:0ull)|(node->focusWithin?128ull:0ull)|(node->indeterminate?256ull:0ull));auto parent=node->parent.lock();if(parent){bool first=false,last=false;std::uint64_t childIndex=0;std::shared_ptr<Node> previous;if(knownIndex){childIndex=knownIndex;first=knownIndex==1;last=knownIndex==knownCount;previous=knownPrevious;}else{std::uint64_t currentIndex=0;for(const auto& sibling:parent->children)if(sibling->type==NodeType::Element){++currentIndex;if(sibling==node){first=currentIndex==1;childIndex=currentIndex;break;}previous=sibling;}for(auto it=parent->children.rbegin();it!=parent->children.rend();++it)if((*it)->type==NodeType::Element){last=*it==node;break;}}MixHash(hash,(first?32ull:0ull)|(last?64ull:0ull));if(styleSheet.UsesNthChildFor(node))MixHash(hash,childIndex);if(previous){MixHash(hash,HashText(previous->tag));MixHash(hash,(previous->checked?1ull:0ull)|(previous->disabled?2ull:0ull)|(previous->focused?4ull:0ull)|(previous->focusVisible?8ull:0ull)|(previous->indeterminate?16ull:0ull));std::uint64_t siblingAttributes=0;for(const auto& item:previous->attributes)if(styleSheet.AttributeAffectsStyle(item.first)){std::uint64_t pair=HashText(item.first);MixHash(pair,HashText(item.second));siblingAttributes^=pair;}MixHash(hash,siblingAttributes);}}return hash;
 }
 
-std::wstring FontFamily(const ComputedStyle& style) {
-    auto family=style.Get(L"font-family",L"Malgun Gothic");
-    const auto comma=family.find(L',');if(comma!=std::wstring::npos)family=Trim(family.substr(0,comma));
-    family.erase(std::remove(family.begin(),family.end(),L'\''),family.end());
-    family.erase(std::remove(family.begin(),family.end(),L'"'),family.end());
+std::vector<std::wstring> CssFontFamilies(const std::wstring& source){
+    std::vector<std::wstring> result;wchar_t quote=0;size_t start=0;
+    for(size_t index=0;index<=source.size();++index){
+        const wchar_t character=index<source.size()?source[index]:L',';
+        if(quote){
+            if(character==quote&&(index==0||source[index-1]!=L'\\'))quote=0;
+            continue;
+        }
+        if(character==L'\''||character==L'"'){quote=character;continue;}
+        if(character!=L',')continue;
+        auto family=Trim(source.substr(start,index-start));start=index+1;
+        if(family.size()>1&&((family.front()==L'\''&&family.back()==L'\'')||
+                            (family.front()==L'"'&&family.back()==L'"')))
+            family=family.substr(1,family.size()-2);
+        if(!family.empty())result.push_back(std::move(family));
+    }
+    return result;
+}
+
+std::wstring WindowsGenericFontFamily(const std::wstring& family){
+    const auto generic=ToLower(Trim(family));
+    if(generic==L"serif"||generic==L"ui-serif")return L"Times New Roman";
+    if(generic==L"sans-serif"||generic==L"ui-sans-serif")return L"Arial";
+    if(generic==L"system-ui")return L"Segoe UI";
+    if(generic==L"monospace"||generic==L"ui-monospace")return L"Consolas";
+    if(generic==L"cursive")return L"Comic Sans MS";
+    if(generic==L"fantasy")return L"Impact";
+    if(generic==L"math")return L"Cambria Math";
+    if(generic==L"emoji")return L"Segoe UI Emoji";
     return family;
+}
+
+bool SystemFontFamilyExists(const std::wstring& family){
+    static thread_local FastMap<std::wstring,bool> cache;
+    const auto key=ToLower(family);
+    if(const auto found=cache.find(key);found!=cache.end())return found->second;
+    bool result=false;
+    if(auto* factory=SharedWriteFactory()){
+        Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
+        UINT32 index=0;BOOL exists=FALSE;
+        result=SUCCEEDED(factory->GetSystemFontCollection(&collection))&&collection&&
+            SUCCEEDED(collection->FindFamilyName(family.c_str(),&index,&exists))&&exists;
+    }
+    if(cache.size()>256)cache.clear();cache[key]=result;return result;
+}
+
+std::wstring ResolveFontFamilyList(const std::wstring& source,
+                                   const std::wstring& fallback){
+    static thread_local FastMap<std::wstring,std::wstring> cache;
+    const auto key=source+L'\x1f'+fallback;
+    if(const auto found=cache.find(key);found!=cache.end())return found->second;
+    for(auto family:CssFontFamilies(source)){
+        family=WindowsGenericFontFamily(family);
+        if(SystemFontFamilyExists(family)){
+            if(cache.size()>256)cache.clear();cache[key]=family;return family;
+        }
+    }
+    auto resolved=WindowsGenericFontFamily(fallback);
+    if(!SystemFontFamilyExists(resolved))resolved=L"Segoe UI";
+    if(cache.size()>256)cache.clear();cache[key]=resolved;return resolved;
+}
+
+std::wstring FontFamily(const ComputedStyle& style) {
+    return ResolveFontFamilyList(style.Get(L"font-family",L"Malgun Gothic"),
+                                 L"Malgun Gothic");
 }
 
 std::wstring ExplicitKoreanFontFamily(const std::wstring& source){
@@ -878,6 +937,33 @@ IDWriteFactory* SharedWriteFactory() {
         return value;
     }();
     return factory.Get();
+}
+
+Microsoft::WRL::ComPtr<IDWriteRenderingParams> WebTextRenderingParams(
+        IDWriteFactory* factory) {
+    static thread_local FastMap<std::uintptr_t,
+        Microsoft::WRL::ComPtr<IDWriteRenderingParams>> cache;
+    if(!factory)return {};
+    const auto key=reinterpret_cast<std::uintptr_t>(factory);
+    if(const auto found=cache.find(key);found!=cache.end())return found->second;
+    Microsoft::WRL::ComPtr<IDWriteRenderingParams> params;
+    Microsoft::WRL::ComPtr<IDWriteFactory1> factory1;
+    if(SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory1)))){
+        Microsoft::WRL::ComPtr<IDWriteRenderingParams1> params1;
+        if(SUCCEEDED(factory1->CreateCustomRenderingParams(2.2f,0.0f,0.0f,0.0f,
+           DWRITE_PIXEL_GEOMETRY_FLAT,DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,&params1)))
+            params=params1;
+    }
+    if(!params)factory->CreateCustomRenderingParams(2.2f,0.0f,0.0f,
+        DWRITE_PIXEL_GEOMETRY_FLAT,DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,&params);
+    if(params){if(cache.size()>=8)cache.clear();cache.emplace(key,params);}
+    return params;
+}
+
+void ConfigureWebTextRendering(ID2D1RenderTarget* target,IDWriteFactory* factory) {
+    if(!target)return;
+    target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    if(auto params=WebTextRenderingParams(factory))target->SetTextRenderingParams(params.Get());
 }
 
 Microsoft::WRL::ComPtr<IDWriteTextFormat> TextFormat(IDWriteFactory* factory,
@@ -1277,6 +1363,83 @@ D2D1_POINT_2F TextOrigin(const LayoutBox& box) {
     const float selectTop=box.node->tag==L"select"?1.0f:0.0f;
     return D2D1::Point2F(box.content.x+selectInset,box.content.y+selectTop-
         (box.node->tag==L"textarea"?box.node->scrollTop:0.0f));
+}
+
+bool ParseListInteger(const std::wstring& source,int& value) {
+    const auto text=Trim(source);if(text.empty())return false;
+    size_t index=0;bool negative=false;
+    if(text[index]==L'+'||text[index]==L'-'){negative=text[index]==L'-';++index;}
+    if(index==text.size())return false;
+    long long parsed=0;
+    for(;index<text.size();++index){
+        if(text[index]<L'0'||text[index]>L'9')return false;
+        parsed=std::min(1000000LL,parsed*10+static_cast<long long>(text[index]-L'0'));
+    }
+    value=static_cast<int>(negative?-parsed:parsed);return true;
+}
+
+std::wstring AlphabeticListMarker(int value,bool uppercase) {
+    if(value<=0)return std::to_wstring(value);
+    std::wstring marker;
+    while(value>0){
+        --value;const wchar_t base=uppercase?L'A':L'a';
+        marker.insert(marker.begin(),static_cast<wchar_t>(base+value%26));value/=26;
+    }
+    return marker;
+}
+
+std::wstring RomanListMarker(int value,bool uppercase) {
+    if(value<=0||value>3999)return std::to_wstring(value);
+    struct Entry { int value; const wchar_t* digits; };
+    static constexpr Entry entries[]={
+        {1000,L"m"},{900,L"cm"},{500,L"d"},{400,L"cd"},{100,L"c"},
+        {90,L"xc"},{50,L"l"},{40,L"xl"},{10,L"x"},{9,L"ix"},
+        {5,L"v"},{4,L"iv"},{1,L"i"}};
+    std::wstring marker;
+    for(const auto& entry:entries)while(value>=entry.value){
+        marker+=entry.digits;value-=entry.value;
+    }
+    if(uppercase)std::transform(marker.begin(),marker.end(),marker.begin(),
+        [](wchar_t character){return static_cast<wchar_t>(std::towupper(character));});
+    return marker;
+}
+
+int OrderedListMarkerValue(const LayoutBox& box) {
+    const auto* list=box.parent;if(!list||!list->node)return 1;
+    const bool reversed=list->node->tag==L"ol"&&
+        list->node->attributes.count(L"reversed")!=0;
+    int current=1;
+    if(list->node->tag==L"ol"&&!ParseListInteger(list->node->Attribute(L"start"),current)&&reversed)
+        current=static_cast<int>(std::count_if(list->children.begin(),list->children.end(),
+            [](const std::unique_ptr<LayoutBox>& child){
+                return child&&child->node&&child->node->tag==L"li";
+            }));
+    for(const auto& child:list->children){
+        if(!child->node||child->node->tag!=L"li")continue;
+        int explicitValue=0;
+        if(ParseListInteger(child->node->Attribute(L"value"),explicitValue))current=explicitValue;
+        if(child.get()==&box)return current;
+        current+=reversed?-1:1;
+    }
+    return current;
+}
+
+std::wstring ListMarkerText(const LayoutBox& box) {
+    if(!box.node||box.node->tag!=L"li"||
+       !box.style.Is(L"display",L"list-item"))return L"";
+    const auto type=ToLower(Trim(box.style.Get(L"list-style-type",L"disc")));
+    if(type.empty()||type==L"none")return L"";
+    if(type==L"disc")return L"\x2022";
+    if(type==L"circle")return L"\x25e6";
+    if(type==L"square")return L"\x25aa";
+    const int value=OrderedListMarkerValue(box);
+    if(type==L"lower-alpha"||type==L"lower-latin")return AlphabeticListMarker(value,false)+L".";
+    if(type==L"upper-alpha"||type==L"upper-latin")return AlphabeticListMarker(value,true)+L".";
+    if(type==L"lower-roman")return RomanListMarker(value,false)+L".";
+    if(type==L"upper-roman")return RomanListMarker(value,true)+L".";
+    if(type==L"decimal-leading-zero"&&value>=0&&value<10)
+        return L"0"+std::to_wstring(value)+L".";
+    return std::to_wstring(value)+L".";
 }
 
 void EnsureTextLayout(LayoutBox& box,IDWriteFactory* factory,const std::wstring& text) {
@@ -3600,12 +3763,8 @@ CanvasFont ParseCanvasFont(const std::wstring& source){
     if(px==std::wstring::npos)return result;size_t begin=px;
     while(begin>0&&(std::iswdigit(source[begin-1])||source[begin-1]==L'.'))--begin;
     try{result.size=std::max(0.1f,std::stof(source.substr(begin,px-begin)));}catch(...){ }
-    auto familyList=Trim(source.substr(px+2));const auto comma=familyList.find(L',');
-    auto family=Trim(familyList.substr(0,comma));
-    if(family.size()>1&&((family.front()==L'\''&&family.back()==L'\'')||
-                        (family.front()==L'"'&&family.back()==L'"')))
-        family=family.substr(1,family.size()-2);
-    if(!family.empty()&&ToLower(family)!=L"sans-serif")result.family=family;
+    auto familyList=Trim(source.substr(px+2));
+    if(!familyList.empty())result.family=ResolveFontFamilyList(familyList,L"Arial");
     result.koreanFamily=ExplicitKoreanFontFamily(familyList);
     if(lower.find(L"bold")!=std::wstring::npos)result.weight=DWRITE_FONT_WEIGHT_BOLD;
     return result;
@@ -3628,6 +3787,10 @@ void PaintCanvas(ID2D1RenderTarget* target,IDWriteFactory* factory,const LayoutB
             D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,&bitmapTarget)))return;
     bitmapTarget->SetDpi(USER_DEFAULT_SCREEN_DPI,USER_DEFAULT_SCREEN_DPI);
     auto* drawingTarget=static_cast<ID2D1RenderTarget*>(bitmapTarget.Get());
+    // Canvas text is also web content. Its intrinsic 96-DPI backing store must
+    // use the same grayscale coverage as DOM text before the bitmap is scaled
+    // to the CSS box.
+    ConfigureWebTextRendering(drawingTarget,factory);
     drawingTarget->BeginDraw();drawingTarget->SetTransform(D2D1::IdentityMatrix());
     drawingTarget->Clear(D2D1::ColorF(0,0.0f));
     for(const auto& command:surface->commands){
@@ -3816,6 +3979,19 @@ std::unique_ptr<LayoutBox> LayoutEngine::Build(const std::shared_ptr<Node>& node
                         if(fragmentBox)fragmentBox->textSourceOffset=start;
                         appendBuilt(std::move(fragmentBox),child,hasInlineContent,
                             end==std::wstring::npos&&hasFollowingContent[childIndex]);
+                    }else if(end==std::wstring::npos&&start==normalized.size()&&start>0&&
+                             normalized.back()==L'\n'&&ParticipatesInEditableContent(child)){
+                        // A preserved trailing newline owns an empty editable
+                        // line even though it has no DOM character after the
+                        // break.  Keep a zero-width layout probe for that line
+                        // so its height and DOM caret geometry exist before the
+                        // user types the next character.
+                        auto fragment=std::make_shared<Node>();fragment->type=NodeType::Text;
+                        fragment->tag=L"#text";fragment->text=L"\x200b";fragment->parent=node;
+                        auto fragmentBox=Build(fragment,&box->style,cacheKey);
+                        if(fragmentBox)fragmentBox->textSourceOffset=start;
+                        appendBuilt(std::move(fragmentBox),child,false,
+                            hasFollowingContent[childIndex]);
                     }
                     if(end==std::wstring::npos)break;
                     auto lineBreak=std::make_shared<Node>();lineBreak->tag=L"br";lineBreak->parent=node;
@@ -4766,6 +4942,13 @@ void LayoutEngine::EnsureGeometryResources(ID2D1RenderTarget* target){
 
 void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory,const LayoutRect* dirtyBounds){
     if(!root_||!target||!factory)return;
+    // Chromium/WebView2 rasterizes composited page text with grayscale coverage.
+    // Direct2D render targets otherwise choose their own default (commonly
+    // ClearType on an HWND-compatible surface), which makes the same CSS
+    // font-weight appear darker. Keep this a document-wide rendering rule so
+    // every DOM text run, control label and generated-content run uses the same
+    // coverage at every monitor DPI without altering CSS font metrics.
+    ConfigureWebTextRendering(target,factory);
     EnsureGeometryResources(target);
     LayoutRect clip{0,0,viewportWidth_,viewportHeight_};
     if(dirtyBounds){
@@ -4889,6 +5072,30 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         if(borders.right>0&&tableRight){brush=SolidBrush(target,BorderColor(box.style,L"right"));const float x=pixelCenter(std::round(box.rect.x+box.rect.width)+(collapsedTableCell?borders.right/2:-borders.right/2),dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.right);}
         if(borders.bottom>0){brush=SolidBrush(target,BorderColor(box.style,L"bottom"));const float y=pixelCenter(std::round(box.rect.y+box.rect.height)+(collapsedTableCell?borders.bottom/2:-borders.bottom/2),dpiY);target->DrawLine(D2D1::Point2F(std::round(box.rect.x),y),D2D1::Point2F(std::round(box.rect.x+box.rect.width),y),brush,borders.bottom);}
         if(borders.left>0){brush=SolidBrush(target,BorderColor(box.style,L"left"));const float x=pixelCenter(std::round(box.rect.x)+borders.left/2,dpiX);target->DrawLine(D2D1::Point2F(x,std::round(box.rect.y)),D2D1::Point2F(x,std::round(box.rect.y+box.rect.height)),brush,borders.left);}
+    }
+    const auto listMarker=ListMarkerText(box);
+    if(!listMarker.empty()&&factory){
+        auto format=TextFormat(factory,box.style);
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> markerLayout;
+        const float fontSize=FontSize(box.style);
+        const float markerWidth=std::max(24.0f,fontSize*3.0f);
+        const float markerHeight=std::max(1.0f,LineHeight(box.style));
+        if(format&&SUCCEEDED(factory->CreateTextLayout(listMarker.c_str(),
+                static_cast<UINT32>(listMarker.size()),format.Get(),markerWidth,
+                markerHeight,&markerLayout))){
+            markerLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            markerLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            markerLayout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                                         markerHeight,TextBaselineOffset(box.style));
+            ApplyFontFallback(factory,markerLayout.Get(),listMarker,box.style);
+            ApplyCharacterSpacing(markerLayout.Get(),listMarker,box.style);
+            const float gap=std::max(6.0f,fontSize*0.45f);
+            const float markerLeft=box.content.x-gap-markerWidth;
+            brush=SolidBrush(target,StyleSheet::Color(box.style.Get(L"color",L"#000"),
+                                                       0xff000000));
+            target->DrawTextLayout(D2D1::Point2F(markerLeft,box.content.y),
+                                   markerLayout.Get(),brush);
+        }
     }
     const auto appearance=ToLower(Trim(box.style.Get(L"appearance",
         box.style.Get(L"-webkit-appearance",L"auto"))));
@@ -5150,7 +5357,18 @@ std::shared_ptr<Node> LayoutEngine::HitTest(float x,float y)const{
 bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float y,
                                std::shared_ptr<Node>& textNode,size_t& textOffset){
     textNode.reset();textOffset=0;if(!scope||!root_)return false;
-    const auto scopeEntry=boxIndex_.find(scope.get());if(scopeEntry==boxIndex_.end())return false;
+    auto scopeEntry=boxIndex_.find(scope.get());if(scopeEntry==boxIndex_.end())return false;
+    const bool textScope=scope->type==NodeType::Text;
+    if(textScope){
+        // Preserved line breaks split one DOM text node into multiple sibling
+        // layout fragments.  BoxFor(text) names the first fragment, so use the
+        // nearest rendered DOM parent as the search root and filter the walk
+        // back to the requested source node.
+        for(auto parent=scope->parent.lock();parent;parent=parent->parent.lock()){
+            const auto found=boxIndex_.find(parent.get());
+            if(found!=boxIndex_.end()){scopeEntry=found;break;}
+        }
+    }
     LayoutBox* best=nullptr;std::shared_ptr<Node> bestSource;
     float bestDistance=std::numeric_limits<float>::max();
     const LayoutRect viewport{0,0,viewportWidth_,viewportHeight_};
@@ -5165,7 +5383,7 @@ bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float 
                 auto source=textRun&&box.generatedFrom&&box.generatedFrom->type==NodeType::Text?
                     box.generatedFrom:box.node;
                 const auto visible=IntersectRects(box.rect,clip);
-                if(source&&visible.width>0&&visible.height>0){
+                if(source&&(!textScope||source==scope)&&visible.width>0&&visible.height>0){
                     const float dx=x<visible.x?visible.x-x:(x>visible.x+visible.width?x-visible.x-visible.width:0);
                     const float dy=y<visible.y?visible.y-y:(y>visible.y+visible.height?y-visible.y-visible.height:0);
                     // A line under the pointer wins over horizontally closer
@@ -5194,6 +5412,62 @@ bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float 
         bestSource->Attribute(L"value").size();
     const size_t sourceOffset=bestSource->type==NodeType::Text?best->textSourceOffset:0;
     textNode=bestSource;textOffset=std::min(sourceLength,sourceOffset+localOffset);return true;
+}
+
+bool LayoutEngine::TextRangeRects(const std::shared_ptr<Node>& textNode,size_t textStart,
+                                  size_t textLength,std::vector<LayoutRect>& rects){
+    rects.clear();if(!textNode||!root_||!textLength)return false;
+    const size_t sourceLength=textNode->type==NodeType::Text?textNode->text.size():
+        textNode->Attribute(L"value").size();
+    const size_t rangeStart=std::min(textStart,sourceLength);
+    const size_t rangeEnd=rangeStart+std::min(textLength,sourceLength-rangeStart);
+    if(rangeStart==rangeEnd)return false;
+    LayoutBox* searchRoot=root_.get();
+    if(textNode->type==NodeType::Text){
+        for(auto parent=textNode->parent.lock();parent;parent=parent->parent.lock()){
+            const auto found=boxIndex_.find(parent.get());
+            if(found!=boxIndex_.end()){searchRoot=found->second;break;}
+        }
+    }else if(const auto found=boxIndex_.find(textNode.get());found!=boxIndex_.end())
+        searchRoot=found->second;
+    std::function<void(LayoutBox&,bool)> collect=[&](LayoutBox& box,bool generated){
+        if(!box.visible)return;
+        generated=generated||!box.pseudo.empty();
+        if(!generated){
+            auto source=box.node->type==NodeType::Text&&box.generatedFrom&&
+                box.generatedFrom->type==NodeType::Text?box.generatedFrom:box.node;
+            if(source==textNode){
+                const auto text=BoxText(box);
+                const size_t sourceStart=textNode->type==NodeType::Text?box.textSourceOffset:0;
+                const size_t sourceEnd=std::min(sourceLength,sourceStart+text.size());
+                const size_t first=std::max(rangeStart,sourceStart);
+                const size_t last=std::min(rangeEnd,sourceEnd);
+                if(first<last){
+                    EnsureTextLayout(box,SharedWriteFactory(),text);
+                    if(box.textLayout){
+                        const UINT32 localStart=static_cast<UINT32>(first-sourceStart);
+                        const UINT32 localLength=static_cast<UINT32>(last-first);
+                        const auto origin=TextOrigin(box);UINT32 count=0;
+                        box.textLayout->HitTestTextRange(localStart,localLength,
+                            origin.x,origin.y,nullptr,0,&count);
+                        if(count){
+                            std::vector<DWRITE_HIT_TEST_METRICS> metrics(count);
+                            if(SUCCEEDED(box.textLayout->HitTestTextRange(localStart,localLength,
+                               origin.x,origin.y,metrics.data(),count,&count))){
+                                for(UINT32 index=0;index<count;++index){
+                                    const auto& hit=metrics[index];
+                                    rects.push_back({hit.left,hit.top,hit.width,hit.height});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if(generated)return;
+        for(auto& child:box.children)collect(*child,generated);
+    };
+    collect(*searchRoot,false);return !rects.empty();
 }
 
 bool LayoutEngine::VerticalCaretPosition(const std::shared_ptr<Node>& scope,
@@ -5508,6 +5782,11 @@ bool LayoutEngine::VisualBounds(const std::shared_ptr<Node>& node,LayoutRect& bo
         const auto transform=ToLower(Trim(box.style.Get(L"transform")));
         if(!transform.empty()&&transform!=L"none")safe=false;
         LayoutRect painted{box.rect.x-2,box.rect.y-2,box.rect.width+4,box.rect.height+4};
+        if(!ListMarkerText(box).empty()){
+            const float markerExtent=std::max(30.0f,FontSize(box.style)*3.5f);
+            const float left=std::min(painted.x,box.content.x-markerExtent);
+            painted.width+=painted.x-left;painted.x=left;
+        }
         const float stroke=std::max(0.0f,StyleSheet::Length(box.style.Get(L"stroke-width"),
             std::max(box.rect.width,box.rect.height),viewportWidth_,0));
         if(stroke>0){painted.x-=stroke/2;painted.y-=stroke/2;painted.width+=stroke;painted.height+=stroke;}

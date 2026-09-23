@@ -146,6 +146,58 @@ UINT CheckPointerSelection(DPI_AWARENESS_CONTEXT context) {
                               std::stoull(reverseSelection.substr(0, reverseBar)),
                       L"right-to-left dragging exposes normalized DOM selection bounds");
             }
+
+            const wchar_t* codeHtml = LR"HTML(
+                <style>
+                    * { box-sizing: border-box; margin: 0; padding: 0; }
+                    article { display: block; width: 420px; padding: 10px; }
+                    pre { display: block; white-space: pre-wrap; font: 18px/28px Consolas; }
+                    code { font: inherit; }
+                </style>
+                <article id="editor" contenteditable="true"><pre><code id="code">alpha
+bravo
+charlie</code></pre></article>
+            )HTML";
+            Check(view->NavigateToString(codeHtml),
+                  L"the multiline contenteditable code-block fixture loads");
+            std::wstring codeGeometry;
+            Check(view->ExecuteScript(
+                      L"const code=document.getElementById('code');"
+                      L"code.textContent='alpha\\nbravo\\ncharlie';"
+                      L"const r=code.getBoundingClientRect();"
+                      L"return Math.round(r.x+2)+','+Math.round(r.y+5)+','+"
+                      L"Math.round(r.x+r.width-1)+','+Math.round(r.y+r.height-5);",
+                      &codeGeometry, &error), error.c_str());
+            const size_t codeFirst=codeGeometry.find(L',');
+            const size_t codeSecond=codeGeometry.find(L',',codeFirst+1);
+            const size_t codeThird=codeGeometry.find(L',',codeSecond+1);
+            Check(codeFirst!=std::wstring::npos&&codeSecond!=std::wstring::npos&&
+                      codeThird!=std::wstring::npos,
+                  L"multiline code-block drag coordinates are available");
+            if(codeFirst!=std::wstring::npos&&codeSecond!=std::wstring::npos&&
+               codeThird!=std::wstring::npos){
+                const double scale=static_cast<double>(dpi)/USER_DEFAULT_SCREEN_DPI;
+                const auto physical=[scale](const std::wstring& value){
+                    return static_cast<int>(std::lround(std::stod(value)*scale));
+                };
+                const int startX=physical(codeGeometry.substr(0,codeFirst));
+                const int startY=physical(codeGeometry.substr(codeFirst+1,codeSecond-codeFirst-1));
+                const int endX=physical(codeGeometry.substr(codeSecond+1,codeThird-codeSecond-1));
+                const int endY=physical(codeGeometry.substr(codeThird+1));
+                const HWND window=view->Window();
+                SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(startX,startY));
+                SendMessageW(window,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(endX,endY));
+                SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(endX,endY));
+                std::wstring selectedCode;
+                Check(view->ExecuteScript(L"return getSelection().toString();",&selectedCode,&error),
+                      error.c_str());
+                Check(selectedCode.find(L"\nbravo\n")!=std::wstring::npos&&
+                          selectedCode.find(L"charlie")!=std::wstring::npos,
+                      L"dragging from the first to third PRE line selects every intervening code line");
+                SendControlKey(window,L'C');
+                Check(ClipboardText(window)==selectedCode,
+                      L"copying a multiline PRE drag selection preserves all selected lines");
+            }
         }
         DestroyWindow(host);
     }

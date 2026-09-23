@@ -137,6 +137,8 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
                 <style>
                     * { box-sizing: border-box; margin: 0; padding: 0; }
                     #editor { display: block; width: 320px; height: 80px; padding: 10px; font: 16px/24px "Segoe UI"; }
+                    #editor blockquote { margin: 1em 0; padding: .2em 1em; border-left: 4px solid #f05a48; }
+                    #editor ul, #editor ol { padding-left: 40px; }
                     #editor pre { padding: 10px 12px; background: #162033; }
                     #editor table { width: 100%; border-collapse: collapse; }
                     #editor th, #editor td { height: 28px; padding: 4px; border: 1px solid #ccd2da; }
@@ -228,6 +230,204 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
                       L"return '  TABLE  '.trim().toLowerCase();",
                       &dispatchResult, &dispatchError) && dispatchResult == L"table",
                   L"common string methods dispatch normally");
+            const bool linkedSelection=view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');"
+                      L"editor.innerHTML='<p>alpha bravo charlie</p>';"
+                      L"const text=editor.firstElementChild.firstChild;"
+                      L"const range=document.createRange();range.setStart(text,6);range.setEnd(text,11);"
+                      L"const saved=range.cloneRange();const address=document.createElement('input');"
+                      L"document.body.append(address);address.focus();editor.focus();"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(saved);"
+                      L"const linked=document.execCommand('createLink',false,'https://example.test/docs?q=1&lang=ko');"
+                      L"editor.normalize();const anchor=editor.querySelector('a');"
+                      L"return linked+'|'+document.queryCommandSupported('createLink')+'|' +"
+                      L"(anchor?.tagName||'')+'|'+(anchor?.getAttribute('href')||'')+'|' +"
+                      L"(anchor?.textContent||'')+'|'+getSelection().toString();",
+                      &dispatchResult, &dispatchError) &&
+                  dispatchResult ==
+                      L"true|true|A|https://example.test/docs?q=1&lang=ko|bravo|bravo";
+            if(!linkedSelection)std::wcerr<<L"createLink state: "<<dispatchResult
+                                         <<L" ("<<dispatchError<<L")\n";
+            Check(linkedSelection,
+                  L"createLink restores a saved editable selection and inserts a common anchor at 100 and 150 percent DPI");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');editor.innerHTML='';editor.focus();"
+                      L"const range=document.createRange();range.selectNodeContents(editor);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const href='https://empty.example/link';"
+                      L"const linked=document.execCommand('createLink',false,href);"
+                      L"const anchor=editor.querySelector('a');const text=anchor?.firstChild;"
+                      L"const updated=getSelection();"
+                      L"return linked+'|'+editor.childNodes.length+'|'+(anchor?.tagName||'')+'|' +"
+                      L"(anchor?.getAttribute('href')||'')+'|'+(anchor?.textContent||'')+'|' +"
+                      L"updated.toString()+'|'+(updated.anchorNode===text)+'|' +"
+                      L"updated.anchorOffset+'|'+updated.focusOffset;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==
+                      L"true|1|A|https://empty.example/link|https://empty.example/link|"
+                      L"https://empty.example/link|true|0|26",
+                  L"createLink inserts its address as linked text at an empty editable element boundary at 100 and 150 percent DPI");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');"
+                      L"editor.innerHTML='<p>alphaomega</p>';editor.focus();"
+                      L"const source=editor.firstElementChild.firstChild;"
+                      L"const range=document.createRange();range.setStart(source,5);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const href='https://caret.example/link';"
+                      L"const linked=document.execCommand('createLink',false,href);"
+                      L"const anchor=editor.querySelector('a');"
+                      L"return linked+'|'+editor.textContent+'|'+(anchor?.getAttribute('href')||'')+'|' +"
+                      L"(anchor?.textContent||'')+'|'+getSelection().toString();",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==
+                      L"true|alphahttps://caret.example/linkomega|https://caret.example/link|"
+                      L"https://caret.example/link|https://caret.example/link",
+                  L"createLink inserts its address as linked text at a collapsed text caret at 100 and 150 percent DPI");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');const anchor=editor.querySelector('a');"
+                      L"const text=anchor.firstChild;const range=document.createRange();"
+                      L"range.selectNodeContents(text);const selection=getSelection();"
+                      L"selection.removeAllRanges();selection.addRange(range);"
+                      L"const unlinked=document.execCommand('unlink',false);editor.normalize();"
+                      L"return unlinked+'|'+document.queryCommandSupported('unlink')+'|' +"
+                      L"(editor.querySelector('a')===null)+'|'+editor.textContent+'|' +"
+                      L"getSelection().toString();",
+                      &dispatchResult, &dispatchError) &&
+                  dispatchResult==
+                      L"true|true|true|alphahttps://caret.example/linkomega|"
+                      L"https://caret.example/link",
+                  L"unlink removes the common anchor without losing its editable selection");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');editor.innerHTML='';editor.focus();"
+                      L"const range=document.createRange();range.selectNodeContents(editor);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const inserted=document.execCommand('insertHorizontalRule',false);"
+                      L"const updated=getSelection();"
+                      L"return inserted+'|'+document.queryCommandSupported('insertHorizontalRule')+'|' +"
+                      L"editor.innerHTML+'|'+(editor.firstElementChild?.tagName||'')+'|' +"
+                      L"(updated.anchorNode===editor)+'|'+updated.anchorOffset;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|true|<hr>|HR|true|1",
+                  L"insertHorizontalRule creates a common HR at an empty editable boundary at 100 and 150 percent DPI");
+            const bool emptyBulletList=view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');editor.innerHTML='';editor.focus();"
+                      L"const range=document.createRange();range.selectNodeContents(editor);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const inserted=document.execCommand('insertUnorderedList',false);"
+                      L"const list=editor.firstElementChild;const item=list?.firstElementChild;"
+                      L"const text=item?.firstChild;const listStyle=getComputedStyle(list);"
+                      L"const itemStyle=getComputedStyle(item);const updated=getSelection();"
+                      L"return inserted+'|'+document.queryCommandSupported('insertUnorderedList')+'|' +"
+                      L"document.queryCommandState('insertUnorderedList')+'|' +"
+                      L"(list?.tagName||'')+'|'+(item?.tagName||'')+'|' +"
+                      L"listStyle.listStyleType+'|'+itemStyle.display+'|' +"
+                      L"(updated.anchorNode===text)+'|'+updated.anchorOffset+'|'+editor.innerHTML;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|true|true|UL|LI|disc|list-item|true|0|<ul><li></li></ul>";
+            if(!emptyBulletList)std::wcerr<<L"empty bullet-list state: "
+                                              <<dispatchResult<<L" ("<<dispatchError<<L")\n";
+            Check(emptyBulletList,
+                  L"insertUnorderedList creates a caret-bearing list item with the common bullet marker style at 100 and 150 percent DPI");
+            const bool populatedNumberedList=view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');"
+                      L"editor.innerHTML='<p>alpha</p>';editor.focus();"
+                      L"const source=editor.firstElementChild.firstChild;"
+                      L"const range=document.createRange();range.setStart(source,2);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const inserted=document.execCommand('insertOrderedList',false);"
+                      L"const list=editor.firstElementChild;const item=list?.firstElementChild;"
+                      L"return inserted+'|'+document.queryCommandSupported('insertOrderedList')+'|' +"
+                      L"document.queryCommandState('insertOrderedList')+'|' +"
+                      L"editor.innerHTML+'|'+getComputedStyle(list).listStyleType+'|' +"
+                      L"getComputedStyle(item).display+'|'+(getSelection().anchorNode===source)+'|' +"
+                      L"getSelection().anchorOffset;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|true|true|<ol><li>alpha</li></ol>|decimal|list-item|true|2";
+            if(!populatedNumberedList)std::wcerr<<L"numbered-list state: "
+                                                  <<dispatchResult<<L" ("<<dispatchError<<L")\n";
+            Check(populatedNumberedList,
+                  L"insertOrderedList converts a common paragraph to an ordered list without losing its caret");
+            const bool taskListFlow=view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');editor.innerHTML='';editor.focus();"
+                      L"const range=document.createRange();range.selectNodeContents(editor);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const inserted=document.execCommand('insertUnorderedList',false);"
+                      L"const updated=getSelection();let node=updated.anchorNode;"
+                      L"if(node&&!node.tagName)node=node.parentElement;"
+                      L"const list=node?.closest?.('ul');"
+                      L"const items=list?[...list.querySelectorAll(':scope > li')]:[];"
+                      L"items.forEach(item=>{const input=document.createElement('input');"
+                      L"input.type='checkbox';input.contentEditable='false';"
+                      L"item.dataset.task='true';item.prepend(input);});"
+                      L"const item=items[0];const checkbox=item?.firstElementChild;"
+                      L"return inserted+'|'+Boolean(list)+'|'+items.length+'|' +"
+                      L"(checkbox?.tagName||'')+'|'+(checkbox?.type||'')+'|' +"
+                      L"item?.dataset.task+'|'+(getSelection().anchorNode?.parentElement===item)+'|' +"
+                      L"getComputedStyle(checkbox).display;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|true|1|INPUT|checkbox|true|true|inline-block";
+            if(!taskListFlow)std::wcerr<<L"task-list state: "
+                                         <<dispatchResult<<L" ("<<dispatchError<<L")\n";
+            Check(taskListFlow,
+                  L"the shared task-list flow can prepend a visible checkbox to the newly created list item");
+            const bool splitHorizontalRule=view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');"
+                      L"editor.innerHTML='<p>alphabeta</p>';editor.focus();"
+                      L"const source=editor.firstElementChild.firstChild;"
+                      L"const range=document.createRange();range.setStart(source,5);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const inserted=document.execCommand('insertHorizontalRule',false);"
+                      L"const updated=getSelection();"
+                      L"return inserted+'|'+editor.innerHTML+'|' +"
+                      L"(updated.anchorNode===editor.lastElementChild.firstChild)+'|' +"
+                      L"updated.anchorOffset;",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|<p>alpha</p><hr><p>beta</p>|true|0";
+            if(!splitHorizontalRule)std::wcerr<<L"insertHorizontalRule split state: "
+                                               <<dispatchResult<<L" ("<<dispatchError<<L")\n";
+            Check(splitHorizontalRule,
+                  L"insertHorizontalRule splits a common text block and keeps the caret after the rule");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');editor.innerHTML='';editor.focus();"
+                      L"const range=document.createRange();range.selectNodeContents(editor);range.collapse(true);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const indented=document.execCommand('indent',false);"
+                      L"const quote=editor.firstElementChild;const paragraph=quote?.firstElementChild;"
+                      L"const text=paragraph?.firstChild;const indentedSelection=getSelection();"
+                      L"const style=getComputedStyle(quote);"
+                      L"const browserIndent=quote?.getAttribute('style')==='margin: 0 0 0 40px; border: none; padding: 0px;'&&"
+                      L"style.marginLeft==='40px'&&style.borderLeftStyle==='none'&&style.paddingLeft==='0px';"
+                      L"const state=indented+'|'+document.queryCommandSupported('indent')+'|' +"
+                      L"document.queryCommandSupported('outdent')+'|'+(quote?.tagName||'')+'|' +"
+                      L"(paragraph?.tagName||'')+'|'+browserIndent+'|' +"
+                      L"(indentedSelection.anchorNode===text)+'|' +"
+                      L"indentedSelection.anchorOffset;"
+                      L"const outdented=document.execCommand('outdent',false);"
+                      L"const updated=getSelection();"
+                      L"return state+'|'+outdented+'|'+(editor.firstElementChild?.tagName||'')+'|' +"
+                      L"(updated.anchorNode===text)+'|'+updated.anchorOffset+'|' +"
+                      L"Boolean(editor.querySelector('blockquote'));",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|true|true|BLOCKQUOTE|P|true|true|0|true|P|true|0|false",
+                  L"indent uses the browser block offset without inheriting quote decoration, and outdent preserves the empty caret at 100 and 150 percent DPI");
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('editor');"
+                      L"editor.innerHTML='<p>alpha</p>';editor.focus();"
+                      L"const text=editor.firstElementChild.firstChild;"
+                      L"const range=document.createRange();range.setStart(text,1);range.setEnd(text,4);"
+                      L"const selection=getSelection();selection.removeAllRanges();selection.addRange(range);"
+                      L"const indented=document.execCommand('indent',false);"
+                      L"const wrapped=editor.firstElementChild?.tagName;"
+                      L"const selected=getSelection().toString();"
+                      L"const outdented=document.execCommand('outdent',false);"
+                      L"return indented+'|'+wrapped+'|'+selected+'|'+outdented+'|' +"
+                      L"editor.innerHTML+'|'+getSelection().toString();",
+                      &dispatchResult,&dispatchError)&&
+                  dispatchResult==L"true|BLOCKQUOTE|lph|true|<p>alpha</p>|lph",
+                  L"indent and outdent preserve a selected range in a common text block");
+            Check(view->ExecuteScript(
+                      L"document.getElementById('editor').innerHTML='<p id=\"line\">alpha</p>';",
+                      nullptr, &dispatchError), dispatchError.c_str());
             Click(*view, L"line", scale);
             Click(*view, L"open", scale);
             Click(*view, L"code", scale);

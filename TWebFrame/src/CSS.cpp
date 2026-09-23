@@ -261,6 +261,8 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
     set(L"flex-shrink", L"1");
     set(L"flex-direction", L"row");
     set(L"flex-wrap", L"nowrap");
+    set(L"list-style-position", L"outside");
+    set(L"list-style-type", L"disc");
     std::wstring display = L"block";
     if (!node || node->type == NodeType::Text) display = L"inline";
     else if (node->tag == L"a" || node->tag == L"abbr" || node->tag == L"b" ||
@@ -282,6 +284,7 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
     else if (node->tag == L"tfoot") display = L"table-footer-group";
     else if (node->tag == L"tr") display = L"table-row";
     else if (node->tag == L"td" || node->tag == L"th") display = L"table-cell";
+    else if (node->tag == L"li") display = L"list-item";
     else if (node->tag == L"head" || node->tag == L"style" || node->tag == L"script" || node->tag == L"meta" || node->tag == L"title" || node->tag == L"col" || node->tag == L"colgroup" || node->tag == L"option" || node->tag == L"datalist" || node->tag == L"template" || (node->tag == L"dialog" && !node->attributes.count(L"open")) || node->attributes.count(L"hidden")) display = L"none";
     set(L"display", display.c_str());
     if (node && node->tag == L"dialog" && node->attributes.count(L"open")) {
@@ -299,6 +302,11 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
             (*style.values)[L"background-image"]=L"url(\""+background+L"\")";
     }
     if (node && node->tag == L"p") set(L"margin", L"1em 0");
+    if (node && (node->tag == L"ul" || node->tag == L"ol")) {
+        set(L"margin", L"1em 0");
+        set(L"padding-left", L"40px");
+        (*style.values)[L"list-style-type"] = node->tag == L"ol" ? L"decimal" : L"disc";
+    }
     if (node && node->tag.size() == 2 && node->tag[0] == L'h' &&
         node->tag[1] >= L'1' && node->tag[1] <= L'6') {
         static const wchar_t* sizes[] = {L"2em",L"1.5em",L"1.17em",L"1em",L"0.83em",L"0.67em"};
@@ -666,7 +674,7 @@ std::wstring StyleSheet::ResolveVariables(const std::wstring& input,
 ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const ComputedStyle* parent,
                                   const std::wstring& pseudo) const {
     ComputedStyle result;
-    if (parent) for (const auto* inherited : {L"color", L"color-scheme", L"font-family", L"font-size", L"font-style", L"font-weight", L"letter-spacing", L"line-height", L"tab-size", L"text-align", L"text-decoration", L"text-decoration-line", L"white-space", L"pointer-events", L"visibility", L"fill", L"fill-opacity", L"fill-rule", L"stroke", L"stroke-opacity", L"stroke-width", L"stroke-linecap", L"stroke-linejoin"}) {
+    if (parent) for (const auto* inherited : {L"color", L"color-scheme", L"font-family", L"font-size", L"font-style", L"font-weight", L"letter-spacing", L"line-height", L"list-style-image", L"list-style-position", L"list-style-type", L"tab-size", L"text-align", L"text-decoration", L"text-decoration-line", L"white-space", L"pointer-events", L"visibility", L"fill", L"fill-opacity", L"fill-rule", L"stroke", L"stroke-opacity", L"stroke-width", L"stroke-linecap", L"stroke-linejoin"}) {
         const auto value = parent->Get(inherited);
         if (!value.empty()) (*result.values)[inherited] = value;
     }
@@ -853,6 +861,18 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
                 setProperty(L"overflow-x", parts[0], candidate);
                 setProperty(L"overflow-y", parts.size() > 1 ? parts[1] : parts[0], candidate);
             }
+        } else if (name == L"list-style") {
+            const auto parts=SplitWhitespace(value);
+            std::wstring type=L"disc",position=L"outside",image=L"none";
+            for(const auto& part:parts){
+                const auto lowered=ToLower(part);
+                if(lowered==L"inside"||lowered==L"outside")position=part;
+                else if(lowered.rfind(L"url(",0)==0)image=part;
+                else type=part;
+            }
+            setProperty(L"list-style-type",type,candidate);
+            setProperty(L"list-style-position",position,candidate);
+            setProperty(L"list-style-image",image,candidate);
         } else if (name == L"place-items") {
             const auto parts=SplitWhitespace(value);
             if(!parts.empty()){

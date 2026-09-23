@@ -108,6 +108,8 @@ public:
     std::shared_ptr<Node> HitTest(float x, float y) const;
     bool HitTestText(const std::shared_ptr<Node>& scope, float x, float y,
                      std::shared_ptr<Node>& textNode, size_t& textOffset);
+    bool TextRangeRects(const std::shared_ptr<Node>& textNode, size_t textStart,
+                        size_t textLength, std::vector<LayoutRect>& rects);
     bool VerticalCaretPosition(const std::shared_ptr<Node>& scope,
                                const std::shared_ptr<Node>& currentNode,
                                size_t currentOffset, float preferredX, bool upward,

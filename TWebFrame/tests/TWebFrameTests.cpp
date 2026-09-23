@@ -237,6 +237,79 @@ int RunEditingBenchmark() {
     }
     return 0;
 }
+
+struct TextRasterSample {
+    bool rendered=false;
+    bool grayscaleMode=false;
+    bool webRenderingParams=false;
+    size_t grayscaleEdgePixels=0;
+    size_t colorFringePixels=0;
+};
+
+TextRasterSample CaptureTextRaster(LayoutEngine& layout,float scale) {
+    TextRasterSample sample;
+    const UINT width=static_cast<UINT>(std::lround(240.0f*scale));
+    const UINT height=static_cast<UINT>(std::lround(80.0f*scale));
+    BITMAPINFO bitmapInfo{};bitmapInfo.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth=static_cast<LONG>(width);
+    bitmapInfo.bmiHeader.biHeight=-static_cast<LONG>(height);
+    bitmapInfo.bmiHeader.biPlanes=1;bitmapInfo.bmiHeader.biBitCount=32;
+    bitmapInfo.bmiHeader.biCompression=BI_RGB;
+    void* pixels=nullptr;
+    HDC memory=CreateCompatibleDC(nullptr);
+    HBITMAP bitmap=CreateDIBSection(memory,&bitmapInfo,DIB_RGB_COLORS,&pixels,nullptr,0);
+    HGDIOBJ previous=bitmap?SelectObject(memory,bitmap):nullptr;
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;
+    Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
+    Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory;
+    const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE));
+    RECT bounds{0,0,static_cast<LONG>(width),static_cast<LONG>(height)};
+    D2D1_FACTORY_OPTIONS factoryOptions{};
+    const bool ready=memory&&bitmap&&
+        SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            __uuidof(ID2D1Factory),&factoryOptions,
+            reinterpret_cast<void**>(d2dFactory.ReleaseAndGetAddressOf())))&&
+        SUCCEEDED(d2dFactory->CreateDCRenderTarget(&properties,&target))&&
+        SUCCEEDED(target->BindDC(memory,&bounds))&&
+        SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf())));
+    if(ready){
+        layout.DiscardDeviceResources();layout.Layout(240,80,scale);
+        target->SetDpi(USER_DEFAULT_SCREEN_DPI*scale,USER_DEFAULT_SCREEN_DPI*scale);
+        target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        target->BeginDraw();target->Clear(D2D1::ColorF(D2D1::ColorF::White));
+        layout.Paint(target.Get(),writeFactory.Get());
+        sample.rendered=SUCCEEDED(target->EndDraw());
+        sample.grayscaleMode=target->GetTextAntialiasMode()==D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+        Microsoft::WRL::ComPtr<IDWriteRenderingParams> renderingParams;
+        target->GetTextRenderingParams(&renderingParams);
+        Microsoft::WRL::ComPtr<IDWriteRenderingParams1> renderingParams1;
+        if(renderingParams)renderingParams.As(&renderingParams1);
+        sample.webRenderingParams=renderingParams&&
+            std::abs(renderingParams->GetEnhancedContrast())<0.001f&&
+            std::abs(renderingParams->GetClearTypeLevel())<0.001f&&
+            renderingParams->GetPixelGeometry()==DWRITE_PIXEL_GEOMETRY_FLAT&&
+            renderingParams->GetRenderingMode()==DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC&&
+            renderingParams1&&
+            std::abs(renderingParams1->GetGrayscaleEnhancedContrast())<0.001f;
+        GdiFlush();
+        const auto* values=static_cast<const std::uint32_t*>(pixels);
+        for(size_t index=0;index<static_cast<size_t>(width)*height;++index){
+            const auto pixel=values[index];
+            const auto blue=static_cast<unsigned char>(pixel);
+            const auto green=static_cast<unsigned char>(pixel>>8);
+            const auto red=static_cast<unsigned char>(pixel>>16);
+            if(red!=green||green!=blue)++sample.colorFringePixels;
+            else if(red>0&&red<255)++sample.grayscaleEdgePixels;
+        }
+    }
+    layout.DiscardDeviceResources();
+    if(previous)SelectObject(memory,previous);
+    if(bitmap)DeleteObject(bitmap);
+    if(memory)DeleteDC(memory);
+    return sample;
+}
 }
 
 int wmain(int argc,wchar_t** argv) {
@@ -792,6 +865,53 @@ int wmain(int argc,wchar_t** argv) {
           childFont.Get(L"font-family")==bodyFont.Get(L"font-family")&&
           childFont.Get(L"white-space")==L"nowrap",
           L"font shorthand and font inherit populate the longhands used by text layout");
+    Document fontFallbackDoc;
+    Check(fontFallbackDoc.Parse(
+        L"<style>*{box-sizing:border-box;margin:0;padding:0}pre{display:block;white-space:pre;font:14px/1.55 '__TWebFrame Missing Font__',Consolas,monospace}code{font:inherit}#explicit{font-family:Consolas}#generic{font-family:monospace}</style>"
+        L"<pre><code id='fallback'>0123456789 ABC xyz</code></pre>"
+        L"<pre><code id='explicit'>0123456789 ABC xyz</code></pre>"
+        L"<pre><code id='generic'>0123456789 ABC xyz</code></pre>",
+        &error),L"CSS font-family fallback fixture parses");
+    StyleSheet fontFallbackCss;
+    Check(fontFallbackCss.Parse(fontFallbackDoc.StyleText(),&error),
+          L"CSS font-family fallback styles parse");
+    LayoutEngine fontFallbackLayout(fontFallbackDoc,fontFallbackCss);
+    float fallbackWidth100=0,explicitWidth100=0,genericWidth100=0;
+    const auto verifyFontFallback=[&](float scale){
+        fontFallbackLayout.Layout(360,180,scale);
+        const auto* fallback=fontFallbackLayout.BoxFor(fontFallbackDoc.GetElementById(L"fallback"));
+        const auto* explicitFont=fontFallbackLayout.BoxFor(fontFallbackDoc.GetElementById(L"explicit"));
+        const auto* generic=fontFallbackLayout.BoxFor(fontFallbackDoc.GetElementById(L"generic"));
+        if(!fallback||!explicitFont||!generic)return false;
+        if(scale==1.0f){fallbackWidth100=fallback->rect.width;
+            explicitWidth100=explicitFont->rect.width;genericWidth100=generic->rect.width;}
+        return std::abs(fallback->rect.width-explicitFont->rect.width)<0.01f&&
+               std::abs(generic->rect.width-explicitFont->rect.width)<0.01f&&
+               (scale==1.0f||(std::abs(fallback->rect.width-fallbackWidth100)<0.01f&&
+                std::abs(explicitFont->rect.width-explicitWidth100)<0.01f&&
+                std::abs(generic->rect.width-genericWidth100)<0.01f));
+    };
+    Check(verifyFontFallback(1.0f)&&verifyFontFallback(1.5f),
+          L"CSS font-family lists skip missing faces and map monospace to the same installed face in stable CSS DIPs at 100 and 150 percent DPI");
+    Document textRasterDoc;
+    Check(textRasterDoc.Parse(
+        L"<style>html,body{margin:0;width:100%;height:100%;background:#fff}pre{margin:4px;color:#000;white-space:pre;font:400 18px Arial}</style><pre id='text-raster'>ASDF 0123</pre>",
+        &error),L"text antialiasing fixture parses");
+    StyleSheet textRasterCss;
+    Check(textRasterCss.Parse(textRasterDoc.StyleText(),&error),
+          L"text antialiasing fixture styles parse");
+    LayoutEngine textRasterLayout(textRasterDoc,textRasterCss);
+    const auto textRasterStyle=textRasterCss.Compute(textRasterDoc.GetElementById(L"text-raster"));
+    Check(textRasterStyle.Get(L"font-weight")==L"400",
+          L"normal CSS text retains computed font-weight 400 before rasterization");
+    const auto textRaster100=CaptureTextRaster(textRasterLayout,1.0f);
+    const auto textRaster150=CaptureTextRaster(textRasterLayout,1.5f);
+    const auto isGrayscaleText=[](const TextRasterSample& sample){
+        return sample.rendered&&sample.grayscaleMode&&sample.webRenderingParams&&
+               sample.grayscaleEdgePixels>0&&sample.colorFringePixels==0;
+    };
+    Check(isGrayscaleText(textRaster100)&&isGrayscaleText(textRaster150),
+          L"all DOM text uses grayscale coverage without color fringes at 100 and 150 percent DPI");
     Document normalLineDoc;
     Check(normalLineDoc.Parse(
           L"<style>body{margin:0}#normal-line{font-size:13px}</style><div id='normal-line'>Text</div>",
@@ -990,6 +1110,28 @@ int wmain(int argc,wchar_t** argv) {
           L"an auto-height block contains multiline inline descendants before following flow content");
     Check(multilineEditor&&multilineEditor->scrollHeight>multilineEditor->content.height,
           L"textarea overflow measures every preserved source line");
+    const auto preservedSourceText=preservedWhitespaceDoc.GetElementById(L"source-code")->children.front();
+    const auto verifyPreservedSelectionGeometry=[&](float scale){
+        preservedWhitespaceLayout.Layout(240,180,scale);
+        LayoutRect thirdLineCaret{};std::shared_ptr<Node> hitNode;size_t hitOffset=0;
+        std::vector<LayoutRect> selectionRects;
+        const bool caret=preservedWhitespaceLayout.TextCaretRect(
+            preservedSourceText,12,thirdLineCaret);
+        const bool hit=caret&&preservedWhitespaceLayout.HitTestText(preservedSourceText,
+            thirdLineCaret.x+12.0f,thirdLineCaret.y+thirdLineCaret.height*0.5f,
+            hitNode,hitOffset);
+        const bool range=preservedWhitespaceLayout.TextRangeRects(preservedSourceText,2,
+            preservedSourceText->text.size()-4,selectionRects);
+        if(!caret||!hit||hitNode!=preservedSourceText||hitOffset<12||!range)return false;
+        std::vector<float> lines;
+        for(const auto& rect:selectionRects){
+            if(std::none_of(lines.begin(),lines.end(),[&](float y){return std::abs(y-rect.y)<0.01f;}))
+                lines.push_back(rect.y);
+        }
+        return lines.size()==3&&lines[0]<lines[1]&&lines[1]<lines[2];
+    };
+    Check(verifyPreservedSelectionGeometry(1.0f)&&verifyPreservedSelectionGeometry(1.5f),
+          L"preserved multiline DOM text hit testing and selection rectangles cover every line at 100 and 150 percent DPI");
 
     Document editableCaretDoc;
     Check(editableCaretDoc.Parse(
@@ -1089,6 +1231,45 @@ int wmain(int argc,wchar_t** argv) {
     };
     Check(verifyWrappedCaret(1.0f)&&verifyWrappedCaret(1.5f),
           L"vertical caret hit testing follows visual lines created by text wrapping at 100 and 150 percent DPI");
+
+    Document trailingNewlineCaretDoc;
+    Check(trailingNewlineCaretDoc.Parse(
+        L"<style>*{box-sizing:border-box;margin:0;padding:0}article,pre{display:block;width:240px}pre{white-space:pre-wrap;font:16px/24px 'Segoe UI'}code{font:inherit}</style>"
+        L"<article contenteditable='true'><pre id='trailing-pre'><code id='trailing-code'>hello</code></pre></article>",
+        &error),L"trailing preformatted newline caret fixture parses");
+    StyleSheet trailingNewlineCaretCss;
+    Check(trailingNewlineCaretCss.Parse(trailingNewlineCaretDoc.StyleText(),&error),
+          L"trailing preformatted newline caret CSS parses");
+    LayoutEngine trailingNewlineCaretLayout(trailingNewlineCaretDoc,trailingNewlineCaretCss);
+    const auto trailingCode=trailingNewlineCaretDoc.GetElementById(L"trailing-code");
+    const auto trailingNewlineText=trailingCode&&!trailingCode->children.empty()?
+        trailingCode->children.front():std::shared_ptr<Node>{};
+    const auto verifyTrailingNewlineCaret=[&](float scale){
+        if(!trailingNewlineText)return false;
+        trailingNewlineText->text=L"hello\n";
+        trailingNewlineCaretLayout.Layout(280,140,scale);
+        const auto* emptyLinePre=trailingNewlineCaretLayout.BoxFor(
+            trailingNewlineCaretDoc.GetElementById(L"trailing-pre"));
+        LayoutRect firstLine{},emptyLine{};
+        if(!emptyLinePre||
+           !trailingNewlineCaretLayout.TextCaretRect(trailingNewlineText,2,firstLine)||
+           !trailingNewlineCaretLayout.TextCaretRect(
+               trailingNewlineText,trailingNewlineText->text.size(),emptyLine))return false;
+        const float emptyLinePreHeight=emptyLinePre->rect.height;
+        trailingNewlineText->text=L"hello\nX";
+        trailingNewlineCaretLayout.Layout(280,140,scale);
+        LayoutRect beforeTypedCharacter{};
+        if(!trailingNewlineCaretLayout.TextCaretRect(
+               trailingNewlineText,trailingNewlineText->text.size()-1,beforeTypedCharacter))return false;
+        return emptyLine.y>=firstLine.y+firstLine.height-0.01f&&
+               emptyLinePreHeight>=firstLine.height*2.0f-0.01f&&
+               std::abs(emptyLine.x-beforeTypedCharacter.x)<0.01f&&
+               std::abs(emptyLine.y-beforeTypedCharacter.y)<0.01f&&
+               std::abs(emptyLine.height-beforeTypedCharacter.height)<0.01f&&
+               std::abs(emptyLine.width-1.0f/scale)<0.01f;
+    };
+    Check(verifyTrailingNewlineCaret(1.0f)&&verifyTrailingNewlineCaret(1.5f),
+          L"a preserved trailing newline reserves the same empty-line caret position before and after typing at 100 and 150 percent DPI");
 
     Document atomicCaretDoc;
     Check(atomicCaretDoc.Parse(
@@ -2263,6 +2444,34 @@ int wmain(int argc,wchar_t** argv) {
                 L"return (s.anchorNode===e.children[1].firstChild)+'|'+s.anchorOffset;",
                 &paragraphResult,&selectionError)&&paragraphResult==firstDown,
                 L"Up Arrow returns to the previous line while preserving the preferred visual column");
+            const wchar_t* codeBlockInputHtml=LR"HTML(<style>*{box-sizing:border-box;margin:0}article{display:block;width:280px;min-height:90px;padding:10px;font:16px/24px "Segoe UI"}pre{display:block;white-space:pre-wrap;margin:0}code{font:inherit}</style><article id="code-editor" contenteditable="true"><pre><code>helloworld</code></pre></article>)HTML";
+            Check(inputView->NavigateToString(codeBlockInputHtml),
+                  L"contenteditable code-block input fixture loads in a real view");
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('code-editor');const t=e.querySelector('code').firstChild;"
+                L"e.addEventListener('beforeinput',function(event){this.setAttribute('data-before',event.inputType);});"
+                L"e.addEventListener('input',function(event){this.setAttribute('data-input',event.inputType);});"
+                L"e.focus();const r=document.createRange();r.setStart(t,5);r.collapse(true);"
+                L"const s=getSelection();s.removeAllRanges();s.addRange(r);",
+                nullptr,&selectionError),selectionError.c_str());
+            SetFocus(inputWindow);SendMessageW(inputWindow,WM_CHAR,VK_RETURN,1);
+            std::wstring codeBlockResult;
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('code-editor');const p=e.querySelector('pre');"
+                L"const t=p.querySelector('code').firstChild;const s=getSelection();"
+                L"return e.children.length+'|'+e.querySelectorAll('pre').length+'|'"
+                L"+p.textContent.replace('\\n','<LF>')+'|'+(s.anchorNode===t)+'|'"
+                L"+s.anchorOffset+'|'+e.getAttribute('data-before')+'|'"
+                L"+e.getAttribute('data-input');",
+                &codeBlockResult,&selectionError)&&
+                codeBlockResult==L"1|1|hello<LF>world|true|6|insertParagraph|insertParagraph",
+                L"Enter in PRE inserts a preserved newline without creating another code block");
+            SendMessageW(inputWindow,WM_CHAR,static_cast<WPARAM>(L'X'),1);
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('code-editor');return e.children.length+'|'"
+                L"+e.firstElementChild.textContent.replace('\\n','<LF>');",
+                &codeBlockResult,&selectionError)&&codeBlockResult==L"1|hello<LF>Xworld",
+                L"typing after Enter remains inside the original PRE code block");
             const wchar_t* atomicSelectionHtml=LR"HTML(<style>*{box-sizing:border-box;margin:0}article{display:block;width:280px;min-height:90px;padding:10px;font:16px/24px "Segoe UI"}p{display:block;margin:0}img{width:32px;height:24px}</style><article id="image-editor" contenteditable="true"><p id="image-line">alpha</p></article>)HTML";
             Check(inputView->NavigateToString(atomicSelectionHtml),
                   L"atomic contenteditable selection fixture loads in a real view");

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "DOM.h"
+#include "EditingCommand.h"
 
 #include <functional>
 #include <memory>
@@ -29,12 +29,7 @@ public:
     using PointerCaptureSink = std::function<void(bool)>;
     using SelectionProvider = std::function<bool(const std::shared_ptr<Node>&, size_t&, size_t&)>;
     using SelectionSetter = std::function<void(const std::shared_ptr<Node>&, size_t, size_t)>;
-    struct DomSelection {
-        std::shared_ptr<Node> anchorNode;
-        size_t anchorOffset = 0;
-        std::shared_ptr<Node> focusNode;
-        size_t focusOffset = 0;
-    };
+    using DomSelection = EditingSelection;
     using DomSelectionProvider = std::function<bool(DomSelection&)>;
     using DomSelectionSetter = std::function<void(const DomSelection&)>;
     struct EventInit {

@@ -1284,6 +1284,7 @@ struct RuntimeCore {
         ~MutationBatch(){runtime.EndMutationBatch();}
     };
     Document& document;
+    EditingCommandExecutor editingCommands;
     JavaScriptRuntime::MessageSink messageSink;
     JavaScriptRuntime::MutationSink mutationSink;
     JavaScriptRuntime::GeometryProvider geometryProvider;
@@ -1354,7 +1355,27 @@ struct RuntimeCore {
     double devicePixelRatio=1;
     std::weak_ptr<Node> pointerCaptureNode;
 
-    explicit RuntimeCore(Document& d):document(d){global=CreateEnvironment();InstallGlobals();}
+    explicit RuntimeCore(Document& d)
+        :document(d),
+         editingCommands(
+             document,
+             [this](EditingSelection& selection){
+                 return domSelectionProvider&&domSelectionProvider(selection);
+             },
+             [this](const EditingSelection& selection){
+                 if(domSelectionSetter)domSelectionSetter(selection);
+             },
+             [this](const std::shared_ptr<Node>& target,EditingMutationKind kind,
+                    bool requiresIndex){
+                 Mutated(target,
+                         kind==EditingMutationKind::Tree?
+                             JavaScriptRuntime::MutationKind::Tree:
+                             JavaScriptRuntime::MutationKind::Style,
+                         requiresIndex);
+             },
+             [this](const std::shared_ptr<Node>& node){ExecuteConnectedScripts(node);}){
+        global=CreateEnvironment();InstallGlobals();
+    }
     ~RuntimeCore(){ReleaseManagedGraph();}
 
     template<class Map>
@@ -1670,299 +1691,6 @@ struct RuntimeCore {
             selection->props[L"$range"]=RangeValue(current.anchorNode,current.anchorOffset,
                                                     current.focusNode,current.focusOffset);
         return Value::FromObject(selection);
-    }
-    static std::shared_ptr<Node> EditableRoot(std::shared_ptr<Node> node){
-        std::shared_ptr<Node> result;
-        for(auto current=node;current;current=current->parent.lock()){
-            const auto editable=ToLower(Trim(current->Attribute(L"contenteditable")));
-            if(current->attributes.count(L"contenteditable")&&editable!=L"false")result=current;
-            else if(current->attributes.count(L"contenteditable")&&editable==L"false")break;
-        }
-        return result;
-    }
-    static bool IsEditingBlock(const std::wstring& tag){
-        return tag==L"address"||tag==L"blockquote"||tag==L"div"||tag==L"p"||tag==L"pre"||
-               tag==L"h1"||tag==L"h2"||tag==L"h3"||tag==L"h4"||tag==L"h5"||tag==L"h6";
-    }
-    bool QueryEditingCommandState(const std::wstring& rawCommand){
-        JavaScriptRuntime::DomSelection selection;
-        if(!domSelectionProvider||!domSelectionProvider(selection)||!selection.anchorNode)return false;
-        const auto command=ToLower(rawCommand);
-        for(auto current=selection.anchorNode;current;current=current->parent.lock()){
-            if(command==L"bold"&&(current->tag==L"b"||current->tag==L"strong"))return true;
-            if(command==L"italic"&&(current->tag==L"i"||current->tag==L"em"))return true;
-            if(command==L"strikethrough"&&(current->tag==L"s"||current->tag==L"strike"||current->tag==L"del"))return true;
-            if(EditableRoot(current)==current)break;
-        }
-        return false;
-    }
-    static bool IsInsertedBlock(const std::shared_ptr<Node>& node){
-        if(!node||node->type!=NodeType::Element)return false;
-        static constexpr const wchar_t* tags[]={
-            L"address",L"article",L"aside",L"blockquote",L"div",L"dl",L"fieldset",
-            L"footer",L"form",L"h1",L"h2",L"h3",L"h4",L"h5",L"h6",L"header",
-            L"hgroup",L"hr",L"main",L"menu",L"nav",L"ol",L"p",L"pre",L"section",
-            L"table",L"ul"};
-        return std::find(std::begin(tags),std::end(tags),node->tag)!=std::end(tags);
-    }
-    static std::shared_ptr<Node> EditingTextNode(const std::wstring& text,
-                                                 const std::shared_ptr<Node>& parent={}){
-        auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";
-        node->text=text;node->parent=parent;return node;
-    }
-    static std::shared_ptr<Node> LastEditingText(const std::shared_ptr<Node>& node){
-        if(!node)return {};
-        if(node->type==NodeType::Text)return node;
-        for(auto child=node->children.rbegin();child!=node->children.rend();++child)
-            if(auto text=LastEditingText(*child))return text;
-        return {};
-    }
-    static std::shared_ptr<Node> EnsureInsertedCaretText(
-        const std::vector<std::shared_ptr<Node>>& inserted){
-        if(inserted.empty())return {};
-        auto last=inserted.back();
-        if(auto text=LastEditingText(last))return text;
-        if(!last||last->type!=NodeType::Element||IsVoidHtmlElement(last->tag))return {};
-        // A trailing <p><br></p> is the conventional editable caret block.
-        // Back the caret with one persistent empty text node so DOM normalize()
-        // cannot detach the native editing selection immediately after insertion.
-        if(last->children.size()==1&&last->children.front()->type==NodeType::Element&&
-           last->children.front()->tag==L"br"){
-            last->children.front()->parent.reset();last->children.clear();
-        }
-        auto text=EditingTextNode(L"",last);last->children.push_back(text);return text;
-    }
-    bool InsertEditingHtml(const std::wstring& html){
-        JavaScriptRuntime::DomSelection selection;
-        if(!domSelectionProvider||!domSelectionProvider(selection)||
-           !selection.anchorNode||!selection.focusNode)return false;
-        auto root=EditableRoot(selection.anchorNode);
-        if(!root||EditableRoot(selection.focusNode)!=root)return false;
-        auto fragment=document.ParseFragment(html);
-        if(fragment.empty()&&!html.empty())return false;
-        bool indexOk=true;
-        std::shared_ptr<Node> caretText;
-        auto attach=[&](const std::shared_ptr<Node>& parent,size_t position,
-                        std::vector<std::shared_ptr<Node>>& nodes){
-            position=std::min(position,parent->children.size());
-            for(auto& node:nodes)node->parent=parent;
-            parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(position),
-                                    nodes.begin(),nodes.end());
-            for(const auto& node:nodes){
-                indexOk=document.IndexSubtree(node)&&indexOk;
-                ExecuteConnectedScripts(node);
-            }
-        };
-
-        if(selection.anchorNode==selection.focusNode&&
-           selection.anchorNode->type==NodeType::Text){
-            const auto textNode=selection.anchorNode;
-            const auto parent=textNode->parent.lock();if(!parent)return false;
-            const size_t start=std::min({selection.anchorOffset,selection.focusOffset,
-                                         textNode->text.size()});
-            const size_t end=std::min(std::max(selection.anchorOffset,selection.focusOffset),
-                                      textNode->text.size());
-            const auto before=textNode->text.substr(0,start),after=textNode->text.substr(end);
-            const bool insertsBlock=std::any_of(fragment.begin(),fragment.end(),IsInsertedBlock);
-            auto directBlock=parent;
-            while(directBlock&&directBlock->parent.lock()!=root)
-                directBlock=directBlock->parent.lock();
-            const bool splitSimpleBlock=insertsBlock&&directBlock&&
-                directBlock->parent.lock()==root&&directBlock->children.size()==1&&
-                directBlock->children.front()==textNode;
-            if(splitSimpleBlock){
-                const auto position=std::find(root->children.begin(),root->children.end(),directBlock);
-                if(position==root->children.end())return false;
-                const size_t offset=static_cast<size_t>(position-root->children.begin());
-                indexOk=document.UnindexSubtree(directBlock)&&indexOk;
-                root->children.erase(position);directBlock->parent.reset();
-                std::vector<std::shared_ptr<Node>> inserted;
-                if(!before.empty()){
-                    textNode->text=before;textNode->parent=directBlock;directBlock->children={textNode};
-                    inserted.push_back(directBlock);
-                }
-                inserted.insert(inserted.end(),fragment.begin(),fragment.end());
-                if(!after.empty()){
-                    auto trailing=CloneDomNode(directBlock,false);trailing->RemoveAttribute(L"id");
-                    auto trailingText=EditingTextNode(after,trailing);trailing->children={trailingText};
-                    inserted.push_back(trailing);caretText=trailingText;
-                }
-                if(!caretText)caretText=EnsureInsertedCaretText(inserted);
-                attach(root,offset,inserted);
-                if(!caretText){selection.anchorNode=selection.focusNode=root;
-                    selection.anchorOffset=selection.focusOffset=offset+inserted.size();}
-            }else{
-                const auto position=std::find(parent->children.begin(),parent->children.end(),textNode);
-                if(position==parent->children.end())return false;
-                const size_t offset=static_cast<size_t>(position-parent->children.begin());
-                indexOk=document.UnindexSubtree(textNode)&&indexOk;
-                parent->children.erase(position);textNode->parent.reset();
-                std::vector<std::shared_ptr<Node>> inserted;
-                if(!before.empty())inserted.push_back(EditingTextNode(before));
-                inserted.insert(inserted.end(),fragment.begin(),fragment.end());
-                if(!after.empty()){
-                    caretText=EditingTextNode(after);inserted.push_back(caretText);
-                }
-                if(!caretText)caretText=EnsureInsertedCaretText(inserted);
-                attach(parent,offset,inserted);
-                if(!caretText){selection.anchorNode=selection.focusNode=parent;
-                    selection.anchorOffset=selection.focusOffset=offset+inserted.size();}
-            }
-        }else if(selection.anchorNode==selection.focusNode&&
-                 selection.anchorNode->type!=NodeType::Text){
-            const auto parent=selection.anchorNode;
-            if(EditableRoot(parent)!=root&&parent!=root)return false;
-            const size_t start=std::min({selection.anchorOffset,selection.focusOffset,
-                                         parent->children.size()});
-            const size_t end=std::min(std::max(selection.anchorOffset,selection.focusOffset),
-                                      parent->children.size());
-            for(size_t index=start;index<end;++index)
-                indexOk=document.UnindexSubtree(parent->children[index])&&indexOk;
-            for(size_t index=start;index<end;++index)parent->children[index]->parent.reset();
-            parent->children.erase(parent->children.begin()+static_cast<std::ptrdiff_t>(start),
-                                   parent->children.begin()+static_cast<std::ptrdiff_t>(end));
-            caretText=EnsureInsertedCaretText(fragment);attach(parent,start,fragment);
-            if(!caretText){selection.anchorNode=selection.focusNode=parent;
-                selection.anchorOffset=selection.focusOffset=start+fragment.size();}
-        }else return false;
-
-        if(caretText){selection.anchorNode=selection.focusNode=caretText;
-            selection.anchorOffset=selection.focusOffset=caretText->text.size();}
-        Mutated(root,JavaScriptRuntime::MutationKind::Tree,!indexOk);
-        if(domSelectionSetter)domSelectionSetter(selection);
-        return true;
-    }
-    static bool IsInlineFormattingNode(const std::shared_ptr<Node>& node,
-                                       const std::wstring& command){
-        if(!node||node->type!=NodeType::Element)return false;
-        if(command==L"bold")return node->tag==L"b"||node->tag==L"strong";
-        if(command==L"italic")return node->tag==L"i"||node->tag==L"em";
-        if(command==L"strikethrough")
-            return node->tag==L"s"||node->tag==L"strike"||node->tag==L"del";
-        return false;
-    }
-    bool ExecuteInlineFormattingCommand(const std::wstring& command){
-        JavaScriptRuntime::DomSelection selection;
-        if(!domSelectionProvider||!domSelectionProvider(selection)||
-           !selection.anchorNode||selection.anchorNode!=selection.focusNode||
-           selection.anchorNode->type!=NodeType::Text)return false;
-        const auto textNode=selection.anchorNode;
-        const auto root=EditableRoot(textNode);if(!root)return false;
-        const auto parent=textNode->parent.lock();if(!parent)return false;
-        const size_t start=std::min({selection.anchorOffset,selection.focusOffset,
-                                     textNode->text.size()});
-        const size_t end=std::min(std::max(selection.anchorOffset,selection.focusOffset),
-                                  textNode->text.size());
-        if(start==end)return false;
-        const bool backward=selection.anchorOffset>selection.focusOffset;
-        const auto selectedValue=textNode->text.substr(start,end-start);
-        const auto beforeValue=textNode->text.substr(0,start);
-        const auto afterValue=textNode->text.substr(end);
-        const auto makeText=[&](const std::wstring& value,
-                                const std::shared_ptr<Node>& owner){
-            auto text=EditingTextNode(value,owner);
-            text->ownerDocument=textNode->ownerDocument;return text;
-        };
-
-        std::shared_ptr<Node> formatting;
-        for(auto current=parent;current&&current!=root;current=current->parent.lock())
-            if(IsInlineFormattingNode(current,command)){formatting=current;break;}
-
-        if(formatting&&formatting==parent&&formatting->children.size()==1){
-            // Toggle a simple formatted run off while preserving formatting on
-            // any unselected prefix and suffix of the same text node.
-            const auto container=formatting->parent.lock();if(!container)return false;
-            const auto position=std::find(container->children.begin(),container->children.end(),formatting);
-            if(position==container->children.end())return false;
-            std::vector<std::shared_ptr<Node>> replacement;
-            if(!beforeValue.empty()){
-                auto before=makeText(beforeValue,formatting);
-                formatting->children={before};replacement.push_back(formatting);
-            }
-            textNode->text=selectedValue;textNode->parent=container;
-            replacement.push_back(textNode);
-            if(!afterValue.empty()){
-                auto afterFormatting=beforeValue.empty()?formatting:CloneDomNode(formatting,false);
-                afterFormatting->ownerDocument=formatting->ownerDocument;
-                if(!beforeValue.empty())afterFormatting->RemoveAttribute(L"id");
-                auto after=makeText(afterValue,afterFormatting);
-                afterFormatting->children={after};afterFormatting->parent=container;
-                replacement.push_back(afterFormatting);
-            }else if(beforeValue.empty())formatting->parent.reset();
-            const auto index=static_cast<size_t>(position-container->children.begin());
-            container->children.erase(position);
-            container->children.insert(container->children.begin()+static_cast<std::ptrdiff_t>(index),
-                                       replacement.begin(),replacement.end());
-            for(auto& node:replacement)node->parent=container;
-            Mutated(container,JavaScriptRuntime::MutationKind::Tree,true);
-        }else{
-            const auto position=std::find(parent->children.begin(),parent->children.end(),textNode);
-            if(position==parent->children.end())return false;
-            const wchar_t* tag=command==L"bold"?L"strong":
-                               command==L"italic"?L"em":L"s";
-            auto wrapper=document.CreateElement(tag);wrapper->parent=parent;
-            textNode->text=selectedValue;textNode->parent=wrapper;
-            wrapper->children={textNode};
-            std::vector<std::shared_ptr<Node>> replacement;
-            if(!beforeValue.empty())replacement.push_back(makeText(beforeValue,parent));
-            replacement.push_back(wrapper);
-            if(!afterValue.empty())replacement.push_back(makeText(afterValue,parent));
-            const auto index=static_cast<size_t>(position-parent->children.begin());
-            parent->children.erase(position);
-            parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(index),
-                                    replacement.begin(),replacement.end());
-            Mutated(parent,JavaScriptRuntime::MutationKind::Tree,true);
-        }
-        selection.anchorNode=selection.focusNode=textNode;
-        selection.anchorOffset=backward?selectedValue.size():0;
-        selection.focusOffset=backward?0:selectedValue.size();
-        if(domSelectionSetter)domSelectionSetter(selection);
-        return true;
-    }
-    bool ExecuteEditingCommand(const std::wstring& rawCommand,const std::wstring& rawValue){
-        const auto command=ToLower(Trim(rawCommand));
-        if(command==L"inserthtml")return InsertEditingHtml(rawValue);
-        if(command==L"bold"||command==L"italic"||command==L"strikethrough")
-            return ExecuteInlineFormattingCommand(command);
-        if(command!=L"formatblock")return false;
-        JavaScriptRuntime::DomSelection selection;
-        if(!domSelectionProvider||!domSelectionProvider(selection)||!selection.anchorNode)return false;
-        auto root=EditableRoot(selection.anchorNode);if(!root)return false;
-        auto tag=ToLower(Trim(rawValue));
-        if(tag.size()>2&&tag.front()==L'<'&&tag.back()==L'>')tag=tag.substr(1,tag.size()-2);
-        if(!IsEditingBlock(tag))return false;
-
-        std::shared_ptr<Node> block;
-        for(auto current=selection.anchorNode;current&&current!=root;current=current->parent.lock())
-            if(IsEditingBlock(current->tag)){block=current;break;}
-        bool indexOk=true;
-        if(block){
-            if(block->tag==tag)return true;
-            indexOk=document.UnindexSubtree(block);block->tag=tag;
-            indexOk=document.IndexSubtree(block)&&indexOk;
-        }else{
-            auto direct=selection.anchorNode;
-            if(direct==root){
-                const size_t index=std::min(selection.anchorOffset,root->children.size());
-                if(index<root->children.size())direct=root->children[index];
-                else if(!root->children.empty())direct=root->children.back();
-                else{
-                    direct=std::make_shared<Node>();direct->type=NodeType::Text;direct->tag=L"#text";
-                    direct->parent=root;root->children.push_back(direct);
-                    selection.anchorNode=selection.focusNode=direct;
-                    selection.anchorOffset=selection.focusOffset=0;
-                }
-            }
-            while(direct&&direct->parent.lock()!=root)direct=direct->parent.lock();
-            if(!direct)return false;
-            const auto position=std::find(root->children.begin(),root->children.end(),direct);
-            if(position==root->children.end())return false;
-            block=document.CreateElement(tag);block->parent=root;direct->parent=block;block->children.push_back(direct);
-            *position=block;indexOk=document.IndexSubtree(block);
-        }
-        Mutated(root,JavaScriptRuntime::MutationKind::Tree,!indexOk);
-        if(domSelectionSetter)domSelectionSetter(selection);
-        return true;
     }
     static unsigned CanvasDimension(const std::shared_ptr<Node>& node,const wchar_t* name,
                                     unsigned fallback){
@@ -2805,16 +2533,14 @@ struct RuntimeCore {
             if(key==L"execCommand")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 const auto command=a.empty()?L"":r.String(a[0]);
                 const auto value=a.size()>2?r.String(a[2]):L"";
-                return Value::Bool(r.ExecuteEditingCommand(command,value));
+                return Value::Bool(r.editingCommands.Execute(command,value));
             });
             if(key==L"queryCommandState")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
-                return Value::Bool(!a.empty()&&r.QueryEditingCommandState(r.String(a[0])));
+                return Value::Bool(!a.empty()&&r.editingCommands.QueryState(r.String(a[0])));
             });
             if(key==L"queryCommandSupported")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
-                if(a.empty())return Value::Bool(false);
-                const auto command=ToLower(r.String(a[0]));
-                return Value::Bool(command==L"formatblock"||command==L"inserthtml"||
-                    command==L"bold"||command==L"italic"||command==L"strikethrough");
+                return Value::Bool(!a.empty()&&
+                    EditingCommandExecutor::IsSupported(r.String(a[0])));
             });
             if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.documentListeners,a);return Value::Undefined();});
             if(key==L"removeEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.RemoveEventListener(r.documentListeners,a);return Value::Undefined();});

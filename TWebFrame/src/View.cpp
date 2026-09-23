@@ -1480,38 +1480,27 @@ struct View::Impl {
     }
     void PaintTextEditing(ID2D1RenderTarget* target){
         if(!target||(!editingNode&&!editingBoundaryContainer)||GetFocus()!=hwnd)return;
-        const auto* box=EditingLayoutBox();
         const auto* styleBox=EditingStyleBox();if(!styleBox||!styleBox->visible)return;
         const size_t valueLength=EditingValue().size();
         const size_t begin=std::min({selectionAnchor,caretPosition,valueLength});
         const size_t end=std::min(valueLength,std::max(selectionAnchor,caretPosition));
         ComPtr<ID2D1SolidColorBrush> brush;
-        if(box&&box->textLayout&&end>begin){UINT32 count=0;box->textLayout->HitTestTextRange(static_cast<UINT32>(begin),
-                static_cast<UINT32>(end-begin),box->content.x,box->content.y,nullptr,0,&count);
-            if(count){std::vector<DWRITE_HIT_TEST_METRICS> metrics(count);if(SUCCEEDED(
-                box->textLayout->HitTestTextRange(static_cast<UINT32>(begin),static_cast<UINT32>(end-begin),
-                    box->content.x,box->content.y,metrics.data(),count,&count))){
-                target->CreateSolidColorBrush(D2D1::ColorF(0x3b82f6,0.36f),&brush);
-                for(UINT32 index=0;index<count;++index){const auto& hit=metrics[index];
-                    target->FillRectangle(D2D1::RectF(hit.left,hit.top,hit.left+hit.width,
-                                                      hit.top+hit.height),brush.Get());
-                }
-            }}
+        std::vector<LayoutRect> rangeRects;
+        if(editingNode&&end>begin&&layout.TextRangeRects(editingNode,begin,end-begin,rangeRects)){
+            target->CreateSolidColorBrush(D2D1::ColorF(0x3b82f6,0.36f),&brush);
+            for(const auto& rect:rangeRects)
+                target->FillRectangle(D2D1::RectF(rect.x,rect.y,rect.x+rect.width,
+                                                  rect.y+rect.height),brush.Get());
         }
-        if(box&&box->textLayout&&compositionActive&&!compositionText.empty()){
-            UINT32 count=0;box->textLayout->HitTestTextRange(static_cast<UINT32>(compositionReplaceStart),
-                static_cast<UINT32>(compositionText.size()),box->content.x,box->content.y,nullptr,0,&count);
-            if(count){std::vector<DWRITE_HIT_TEST_METRICS> metrics(count);if(SUCCEEDED(
-                box->textLayout->HitTestTextRange(static_cast<UINT32>(compositionReplaceStart),
-                    static_cast<UINT32>(compositionText.size()),box->content.x,box->content.y,
-                    metrics.data(),count,&count))){
-                target->CreateSolidColorBrush(D2D1::ColorF(0xff2563eb),&brush);
-                for(UINT32 index=0;index<count;++index){const auto& hit=metrics[index];
-                    target->DrawLine(D2D1::Point2F(hit.left,hit.top+hit.height-1.0f/DpiScale()),
-                        D2D1::Point2F(hit.left+hit.width,hit.top+hit.height-1.0f/DpiScale()),
-                        brush.Get(),1.0f/DpiScale());
-                }
-            }}
+        rangeRects.clear();
+        if(editingNode&&compositionActive&&!compositionText.empty()&&
+           layout.TextRangeRects(editingNode,compositionReplaceStart,
+                                 compositionText.size(),rangeRects)){
+            target->CreateSolidColorBrush(D2D1::ColorF(0xff2563eb),&brush);
+            for(const auto& rect:rangeRects)
+                target->DrawLine(D2D1::Point2F(rect.x,rect.y+rect.height-1.0f/DpiScale()),
+                    D2D1::Point2F(rect.x+rect.width,rect.y+rect.height-1.0f/DpiScale()),
+                    brush.Get(),1.0f/DpiScale());
         }
         if((selectionAnchor==caretPosition||compositionActive)&&caretVisible){D2D1_RECT_F caret{};if(CaretDipRect(caret)){
             const auto color=StyleSheet::Color(styleBox->style.Get(L"caret-color",styleBox->style.Get(L"color",L"#000")),0xff000000);
@@ -2268,6 +2257,16 @@ struct View::Impl {
     }
     bool InsertEditingParagraph(){
         if(!focused||!IsContentEditable(focused))return false;
+        // HTML pre elements are line-oriented editing hosts.  Enter inserts a
+        // preserved newline inside the current pre (including the common
+        // <pre><code>...</code></pre> shape) instead of cloning the pre into a
+        // second block.  This also keeps preview serializers from interpreting
+        // one code fence as two adjacent code blocks.
+        for(auto current=editingBoundaryContainer?editingBoundaryContainer:editingNode;
+            current;current=current->parent.lock()){
+            if(current->tag==L"pre")return ReplaceSelection(L"\n",L"insertParagraph");
+            if(current==focused)break;
+        }
         JavaScriptRuntime::EventInit before{};before.inputType=L"insertParagraph";
         if(javascript.DispatchNodeEvent(focused,L"beforeinput",before))return true;
         if(layoutDirty)Rebuild();
