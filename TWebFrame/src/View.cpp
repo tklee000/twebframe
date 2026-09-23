@@ -743,7 +743,12 @@ struct View::Impl {
         RECT r{};GetClientRect(hwnd,&r);const auto size=D2D1::SizeU(
             static_cast<UINT32>(std::max(1L,r.right-r.left)),
             static_cast<UINT32>(std::max(1L,r.bottom-r.top)));
-        const auto properties=D2D1::HwndRenderTargetProperties(hwnd,size);
+        // Interactive HTML surfaces already pace animation through their
+        // requestAnimationFrame timer.  Present editor and pointer updates as
+        // soon as the dirty back buffer is ready instead of making EndDraw
+        // wait for the desktop compositor's next presentation interval.
+        const auto properties=D2D1::HwndRenderTargetProperties(
+            hwnd,size,D2D1_PRESENT_OPTIONS_IMMEDIATELY);
         if(SUCCEEDED(d2dFactory->CreateHwndRenderTarget(D2D1::RenderTargetProperties(),properties,
             renderTarget.ReleaseAndGetAddressOf()))){const float dpi=USER_DEFAULT_SCREEN_DPI*DpiScale();renderTarget->SetDpi(dpi,dpi);}
     }

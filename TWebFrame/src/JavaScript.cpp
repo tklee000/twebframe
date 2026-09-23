@@ -1240,17 +1240,19 @@ std::shared_ptr<Node> CloneDomNode(const std::shared_ptr<Node>& source,bool deep
     return clone;
 }
 
-void NormalizeDomNode(const std::shared_ptr<Node>& node){
-    if(!node||node->type==NodeType::Text)return;
-    for(auto& child:node->children)NormalizeDomNode(child);
+bool NormalizeDomNode(const std::shared_ptr<Node>& node){
+    if(!node||node->type==NodeType::Text)return false;
+    bool changed=false;
+    for(auto& child:node->children)changed=NormalizeDomNode(child)||changed;
     for(size_t index=0;index<node->children.size();){
         auto& child=node->children[index];
-        if(child->type==NodeType::Text&&child->text.empty()&&node->children.size()>1){child->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index));continue;}
+        if(child->type==NodeType::Text&&child->text.empty()&&node->children.size()>1){child->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index));changed=true;continue;}
         if(index+1<node->children.size()&&child->type==NodeType::Text&&node->children[index+1]->type==NodeType::Text){
-            child->text+=node->children[index+1]->text;node->children[index+1]->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index+1));continue;
+            child->text+=node->children[index+1]->text;node->children[index+1]->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index+1));changed=true;continue;
         }
         ++index;
     }
+    return changed;
 }
 
 std::wstring CamelToKebab(const std::wstring& value){std::wstring out;for(wchar_t c:value){if(std::iswupper(c)){out+=L'-';out+=std::towlower(c);}else out+=c;}return out;}
@@ -3113,7 +3115,14 @@ struct RuntimeCore {
                 r.Mutated(parent,JavaScriptRuntime::MutationKind::Tree,!indexOk);return Value::Undefined();
             });
             if(key==L"cloneNode")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(CloneDomNode(node,!a.empty()&&r.Truth(a[0])));});
-            if(key==L"normalize")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){NormalizeDomNode(node);r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,true);return Value::Undefined();});
+            if(key==L"normalize")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){
+                // normalize() is commonly called after every contenteditable
+                // input.  A single existing text node is already normalized;
+                // avoid turning that no-op into a full DOM index and layout
+                // rebuild. Text-node merges do not affect element indexes.
+                if(NormalizeDomNode(node))r.Mutated(node,JavaScriptRuntime::MutationKind::Tree);
+                return Value::Undefined();
+            });
             if(key==L"focus")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink(node);else{node->focused=true;r.Mutated(node,JavaScriptRuntime::MutationKind::Style);}return Value::Undefined();});
             if(key==L"blur")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink({});return Value::Undefined();});
             if(key==L"click")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.activationSink)r.activationSink(node);else r.Dispatch(node,L"click");return Value::Undefined();});

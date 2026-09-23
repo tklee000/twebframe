@@ -157,6 +157,86 @@ int RunFrameBenchmark() {
     }
     return 0;
 }
+
+int RunEditingBenchmark() {
+    constexpr size_t sampleCount=120;
+    HWND host=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"",WS_POPUP|WS_VISIBLE,
+        -10000,-10000,1000,700,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    if(!host){std::wcerr<<L"editing benchmark host creation failed\n";return 1;}
+    RECT bounds{0,0,1000,700};auto view=TWebFrame::View::Create(host,bounds);
+    if(!view){DestroyWindow(host);std::wcerr<<L"editing benchmark view creation failed\n";return 1;}
+
+    std::wstring html=LR"HTML(<style>
+        *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:14px Segoe UI}
+        #toolbar{height:48px;display:flex;gap:4px;padding:8px;border-bottom:1px solid #ddd}
+        button{width:28px;height:28px}.active{background:#dbeafe}
+        #editor{height:calc(100% - 48px);padding:20px;overflow:auto;white-space:pre-wrap}
+    </style><div id="toolbar">)HTML";
+    for(size_t index=0;index<32;++index)
+        html+=L"<button data-command='command-"+std::to_wstring(index)+L"'>"+
+              std::to_wstring(index%10)+L"</button>";
+    html+=LR"HTML(</div><article id="editor" contenteditable="true"></article><script>
+        const editor=document.getElementById('editor');
+        const history=[];
+        let currentText='';
+        function inlineText(node){
+            if(node.nodeType===3)return node.nodeValue||'';
+            if(node.nodeType!==1)return '';
+            return [...node.childNodes].map(inlineText).join('');
+        }
+        function serialize(){
+            return [...editor.childNodes]
+                .map((node)=>inlineText(node).trim())
+                .filter((block)=>block!=='')
+                .join('\n\n').replace(/\n{3,}/g,'\n\n');
+        }
+        function updateChrome(){
+            document.querySelectorAll('[data-command]').forEach((button,index)=>{
+                button.disabled=history.length===0;
+                button.setAttribute('aria-pressed',String(index===0&&currentText.length>0));
+            });
+        }
+        editor.addEventListener('beforeinput',()=>{
+            history.push({text:serialize(),html:editor.innerHTML});
+        });
+        editor.addEventListener('input',()=>{
+            editor.querySelectorAll('span[style]').forEach((span)=>{
+                if(span.style.length===1&&span.style.fontSize)span.replaceWith(...span.childNodes);
+            });
+            editor.querySelectorAll('li > li').forEach(()=>{});
+            editor.normalize();
+            currentText=serialize();
+            updateChrome();
+        });
+    </script>)HTML";
+    if(!view->NavigateToString(html)){
+        std::wcerr<<view->LastError()<<L'\n';view.reset();DestroyWindow(host);return 1;
+    }
+    UpdateWindow(view->Window());std::wstring error;
+    if(!view->ExecuteScript(L"document.getElementById('editor').focus();",nullptr,&error)){
+        std::wcerr<<error<<L'\n';view.reset();DestroyWindow(host);return 1;
+    }
+    UpdateWindow(view->Window());
+
+    FrameStats typing;
+    const bool typingOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const wchar_t character=L'a'+static_cast<wchar_t>(index%26);
+        SendMessageW(view->Window(),WM_CHAR,character,1);return true;
+    },typing);
+    std::wstring result;
+    const bool resultOk=view->ExecuteScript(
+        L"return document.getElementById('editor').textContent.length;",&result,&error);
+    std::wcout<<std::fixed<<std::setprecision(3)
+        <<L"TWebFrame contenteditable benchmark (milliseconds)\n"
+        <<L"scenario,samples,mean,p50,p95,p99,max\n"
+        <<L"contenteditable_input,"<<sampleCount<<L','<<typing.mean<<L','<<typing.p50<<L','
+        <<typing.p95<<L','<<typing.p99<<L','<<typing.maximum<<L'\n';
+    view.reset();DestroyWindow(host);
+    if(!typingOk||!resultOk||result!=std::to_wstring(sampleCount+8)){
+        std::wcerr<<L"editing benchmark failed: "<<error<<L" result="<<result<<L'\n';return 1;
+    }
+    return 0;
+}
 }
 
 int wmain(int argc,wchar_t** argv) {
@@ -164,6 +244,9 @@ int wmain(int argc,wchar_t** argv) {
     const bool uninitializeCom=SUCCEEDED(comInitialization);
     if(argc>1&&_wcsicmp(argv[1],L"--benchmark")==0){
         const int result=RunFrameBenchmark();if(uninitializeCom)CoUninitialize();return result;
+    }
+    if(argc>1&&_wcsicmp(argv[1],L"--editing-benchmark")==0){
+        const int result=RunEditingBenchmark();if(uninitializeCom)CoUninitialize();return result;
     }
     FastMap<int, std::wstring, ConstantHash> fastMap;
     for (int i = 0; i < 64; ++i) fastMap[i] = std::to_wstring(i);
@@ -234,6 +317,28 @@ int wmain(int argc,wchar_t** argv) {
     Check(mutationJs.Execute(L"document.getElementById('scroll').setAttribute('ARIA-LIVE','polite');",nullptr,&error)&&
           mutationNotifications==1&&lastMutation.liveRegionMembershipChanged,
           L"aria-live membership changes are identified without a document-wide scan");
+    Document normalizeDoc;
+    Check(normalizeDoc.Parse(L"<body><div id='editor'>text</div></body>"),
+          L"DOM normalization fixture parses");
+    JavaScriptRuntime normalizeJs(normalizeDoc);int normalizeNotifications=0;
+    JavaScriptRuntime::Mutation normalizeMutation;
+    normalizeJs.SetMutationSink([&](const JavaScriptRuntime::Mutation& mutation){
+        normalizeMutation=mutation;++normalizeNotifications;
+    });
+    const auto normalizeReindexStart=normalizeDoc.FullReindexCount();
+    Check(normalizeJs.Execute(L"document.getElementById('editor').normalize();",nullptr,&error)&&
+          normalizeNotifications==0&&normalizeDoc.FullReindexCount()==normalizeReindexStart,
+          L"normalizing an already-normalized text subtree is mutation-free");
+    Check(normalizeJs.Execute(
+              L"const e=document.getElementById('editor');e.append(document.createTextNode('more'));",
+              nullptr,&error),L"adjacent normalization text fixture is created");
+    normalizeNotifications=0;
+    Check(normalizeJs.Execute(L"document.getElementById('editor').normalize();",nullptr,&error)&&
+          normalizeNotifications==1&&normalizeMutation.kind==JavaScriptRuntime::MutationKind::Tree&&
+          normalizeDoc.GetElementById(L"editor")->children.size()==1&&
+          normalizeDoc.GetElementById(L"editor")->InnerText()==L"textmore"&&
+          normalizeDoc.FullReindexCount()==normalizeReindexStart,
+          L"normalizing adjacent text nodes reports one tree change without reindexing elements");
     const auto incrementalIndexStart=mutationDoc.FullReindexCount();
     Check(mutationJs.Execute(L"const indexedChild=document.createElement('i');indexedChild.id='incremental-id';document.getElementById('scroll').appendChild(indexedChild);",nullptr,&error)&&
           mutationDoc.GetElementById(L"incremental-id")!=nullptr&&
