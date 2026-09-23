@@ -673,6 +673,16 @@ float LineHeight(const ComputedStyle& style){
     cached.lineHeightValid=true;return cached.lineHeight;
 }
 
+bool ParticipatesInEditableContent(const std::shared_ptr<Node>& node){
+    for(auto current=node;current;current=current->parent.lock()){
+        if(!current->attributes.count(L"contenteditable"))continue;
+        const auto value=ToLower(Trim(current->Attribute(L"contenteditable")));
+        if(value==L"false")return false;
+        if(value.empty()||value==L"true"||value==L"plaintext-only")return true;
+    }
+    return false;
+}
+
 IDWriteFactory* SharedWriteFactory();
 Microsoft::WRL::ComPtr<IDWriteTextFormat> TextFormat(IDWriteFactory* factory,
                                                       const ComputedStyle& style);
@@ -1794,7 +1804,16 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
             }
         }
         value+=padding.top+padding.bottom+border.top+border.bottom;
-    }else value=0;
+    }else{
+        // An empty non-replaced box still owns its padding and borders. Inside
+        // editable content it also reserves the line box that contains the
+        // caret, so formatting an empty block does not change height when the
+        // first character is typed.
+        const auto padding=EdgeValues(box.style,L"padding",availableWidth,availableWidth);
+        const auto border=BorderValues(box.style);
+        value=padding.top+padding.bottom+border.top+border.bottom+
+            (ParticipatesInEditableContent(box.node)?LineHeight(box.style):0.0f);
+    }
     // Percentage block-size constraints are indefinite during intrinsic
     // measurement. Resolve them later from a definite containing block rather
     // than from this routine's measurement fallback.

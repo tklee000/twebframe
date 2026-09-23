@@ -27,6 +27,13 @@ using namespace TWebFrame::Internal;
 
 namespace {
 int failures = 0;
+volatile LONG firstChanceCppExceptions = 0;
+LONG CALLBACK CountFirstChanceCppExceptions(EXCEPTION_POINTERS* exception) {
+    if(exception&&exception->ExceptionRecord&&
+       exception->ExceptionRecord->ExceptionCode==0xe06d7363UL)
+        InterlockedIncrement(&firstChanceCppExceptions);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 LRESULT resizeHostHit=HTCLIENT;
 WPARAM resizeHostButtonDown=0;
 LRESULT CALLBACK ResizeHostWindowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam){
@@ -344,6 +351,17 @@ int wmain(int argc,wchar_t** argv) {
         &semanticsResult,&error),error.c_str());
     Check(semanticsResult==L"AB|token-7",
           L"string, template and regular-expression literals decode JavaScript Unicode escapes");
+    const auto regexExceptionHandler=AddVectoredExceptionHandler(1,CountFirstChanceCppExceptions);
+    InterlockedExchange(&firstChanceCppExceptions,0);
+    Check(semanticsJs.Execute(
+        L"const localized=['&File','&\\uD30C\\uC77C','&\\u65E5\\u672C','&\\u0424\\u0430\\u0439\\u043B','&\\u6587\\u4EF6'];"
+        L"return localized.map((label)=>label.replace(/&(?=\\p{L})/u,'')).join('|');",
+        &semanticsResult,&error),error.c_str());
+    Check(semanticsResult==L"File|\uD30C\uC77C|\u65E5\u672C|\u0424\u0430\u0439\u043B|\u6587\u4EF6",
+          L"Unicode Letter property escapes match multilingual menu labels");
+    Check(InterlockedCompareExchange(&firstChanceCppExceptions,0,0)==0,
+          L"supported Unicode property escapes compile without first-chance C++ exceptions");
+    if(regexExceptionHandler)RemoveVectoredExceptionHandler(regexExceptionHandler);
     Check(semanticsJs.Execute(
         L"const fence=new RegExp('^ {0,3}```');const insensitive=RegExp('alpha','i');"
         L"const clone=new RegExp(insensitive);"
@@ -433,9 +451,9 @@ int wmain(int argc,wchar_t** argv) {
         L"const sortable=[{name:'beta'},{name:'alpha'}];sortable.sort((left,right)=>left.name.localeCompare(right.name));"
         L"const source={nested:{value:1}};const copied=structuredClone(source);copied.nested.value=9;"
         L"const parsedDate=new Date('2024-01-02T03:04:05.006Z');const relative=new Intl.RelativeTimeFormat('en-US',{numeric:'always'}).format(-2,'hour');"
-        L"return sortable.at(0).name+'|'+sortable.some((item)=>item.name==='beta')+'|'+[1,2].findIndex((item)=>item===2)+'|'+source.nested.value+'|'+parsedDate.toISOString()+'|'+Number.isNaN(new Date('invalid').getTime())+'|'+relative;",
+        L"return sortable.at(0).name+'|'+sortable.some((item)=>item.name==='beta')+'|'+[1,2].findIndex((item)=>item===2)+'|'+source.nested.value+'|'+parsedDate.toISOString()+'|'+Number.isNaN(new Date('invalid').getTime())+'|'+Number.isInteger(5)+'|'+Number.isInteger(5.5)+'|'+Number.isInteger('5')+'|'+relative;",
         &semanticsResult,&error),error.c_str());
-    Check(semanticsResult==L"alpha|true|1|1|2024-01-02T03:04:05.006Z|true|2 hours ago",
+    Check(semanticsResult==L"alpha|true|1|1|2024-01-02T03:04:05.006Z|true|true|false|false|2 hours ago",
           L"generic array, string, structured clone, Date and Intl APIs compose correctly");
     Check(semanticsJs.Execute(
         L"const splitLines='one\\r\\ntwo\\nthree'.split(/\\r?\\n/);"

@@ -1,14 +1,14 @@
 # TWebFrame
 
-**Current version: 0.6 (experimental)**
+**Current version: 0.8 (experimental)**
 
 See the [version history](docs/CHANGELOG.md) for cumulative release notes.
 
 TWebFrame is a small, Windows-native HTML UI frame for C and C++ applications. It provides an embeddable `HWND`, a C++ host API, and a shared HTML, DOM, CSS, layout, and JavaScript runtime implemented by this project.
 
-TWebFrame is **not a general-purpose web browser** and version 0.6 does **not** claim complete HTML, CSS, DOM, Web API, or ECMAScript conformance. Its current purpose is to render trusted, application-owned HTML user interfaces and connect them to a native C/C++ host without embedding Chromium, WebView2, CEF, or an external JavaScript engine.
+TWebFrame is **not a general-purpose web browser** and version 0.8 does **not** claim complete HTML, CSS, DOM, Web API, or ECMAScript conformance. Its current purpose is to render trusted, application-owned HTML user interfaces and connect them to a native C/C++ host without embedding Chromium, WebView2, CEF, or an external JavaScript engine.
 
-> TWebFrame 0.6 should be treated as an application UI runtime, not as a browser security boundary. Do not use it to display arbitrary or untrusted Internet content.
+> TWebFrame 0.8 should be treated as an application UI runtime, not as a browser security boundary. Do not use it to display arbitrary or untrusted Internet content.
 
 ## Project goals
 
@@ -61,7 +61,7 @@ view->ExecuteScript(L"return document.getElementById('run').textContent;",
 
 The host can send messages in the other direction with `PostWebMessageAsJson()` or `PostWebMessageAsString()`. The `window.chrome.webview` name is retained as a compatibility bridge for existing local application pages; TWebFrame does not use WebView2.
 
-## Version 0.6 architecture
+## Version 0.8 architecture
 
 | Component | Responsibility |
 | --- | --- |
@@ -77,7 +77,7 @@ HTML parsing, script execution, DOM mutation, style calculation, layout, paint, 
 
 ## Currently implemented
 
-The following list describes the tested version 0.6 implementation. It is a supported subset, not a standards-compliance statement.
+The following list describes the tested version 0.8 implementation. It is a supported subset, not a standards-compliance statement.
 
 ### HTML and DOM
 
@@ -180,7 +180,7 @@ Anything not listed above should be considered unsupported until it has both an 
 
 ### Platform and compatibility
 
-- Version 0.6 targets Windows and uses Win32, Direct2D, DirectWrite, IMM32, and UI Automation.
+- Version 0.8 targets Windows and uses Win32, Direct2D, DirectWrite, IMM32, and UI Automation.
 - The documented and continuously exercised build is Visual Studio 2019 with the v142 toolset, C++17, and x64.
 - The public API and behavior may change while the project remains in the 0.x series.
 
@@ -198,13 +198,15 @@ The root solution contains:
 - `TWebFrame` — reusable static library.
 - `TWebFrameTests` — self-contained regression tests for the shared HTML, DOM, CSS, layout, JavaScript, input, and accessibility paths.
 
+All test projects and test sources are maintained under `TWebFrame\tests`.
+
 ## Test
 
 ```powershell
-.\bin\x64\Release\TWebFrameTests.exe
+.\TWebFrame\tests\bin\x64\Release\TWebFrameTests.exe
 ```
 
-The tests construct their own fixtures and do not require application-specific HTML, CSS, or JavaScript files. At version 0.6, the regression suite is the most precise executable definition of supported behavior.
+The tests construct their own fixtures and do not require application-specific HTML, CSS, or JavaScript files. At version 0.8, the regression suite is the most precise executable definition of supported behavior.
 
 For screenshot comparisons:
 

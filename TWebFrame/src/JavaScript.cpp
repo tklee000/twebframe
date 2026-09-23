@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <deque>
@@ -49,6 +50,19 @@ int HexDigitValue(wchar_t character) {
     if(character>=L'a'&&character<=L'f')return character-L'a'+10;
     if(character>=L'A'&&character<=L'F')return character-L'A'+10;
     return -1;
+}
+
+bool TryParseDecimalIndex(const std::wstring& text,size_t& result) {
+    if(text.empty())return false;
+    size_t value=0;
+    constexpr auto maximum=(std::numeric_limits<size_t>::max)();
+    for(const auto character:text){
+        if(character<L'0'||character>L'9')return false;
+        const auto digit=static_cast<size_t>(character-L'0');
+        if(value>(maximum-digit)/10)return false;
+        value=value*10+digit;
+    }
+    result=value;return true;
 }
 
 void AppendCodePoint(std::wstring& output,std::uint32_t codePoint) {
@@ -103,6 +117,72 @@ std::wstring DecodeRegexUnicodeEscapes(const std::wstring& pattern) {
         output+=pattern[position++];
     }
     return output;
+}
+
+void AppendRegexClassCharacter(std::wstring& output,wchar_t character) {
+    if(std::wstring_view(L"\\]-^").find(character)!=std::wstring_view::npos)
+        output+=L'\\';
+    output+=character;
+}
+
+const std::wstring& UnicodeLetterClassRanges() {
+    static const std::wstring ranges=[](){
+        std::wstring result;
+        std::wstring characters(0x10000,L'\0');
+        for(unsigned value=0;value<characters.size();++value)
+            characters[value]=static_cast<wchar_t>(value);
+        std::vector<WORD> types(characters.size());
+        if(!GetStringTypeW(CT_CTYPE1,characters.data(),static_cast<int>(characters.size()),
+                           types.data()))return result;
+        const auto isLetter=[&](unsigned candidate){
+            return !(candidate>=0xd800&&candidate<=0xdfff)&&
+                   (types[candidate]&C1_ALPHA)!=0;
+        };
+        for(unsigned value=0;value<=0xffff;){
+            if(!isLetter(value)){++value;continue;}
+            const unsigned first=value;
+            while(value<0xffff&&isLetter(value+1))++value;
+            AppendRegexClassCharacter(result,static_cast<wchar_t>(first));
+            if(value!=first){
+                result+=L'-';
+                AppendRegexClassCharacter(result,static_cast<wchar_t>(value));
+            }
+            ++value;
+        }
+        return result;
+    }();
+    return ranges;
+}
+
+bool TranslateUnicodePropertyEscapes(const std::wstring& pattern,const std::wstring& flags,
+                                     std::wstring& output) {
+    output.clear();output.reserve(pattern.size());
+    const bool unicode=flags.find(L'u')!=std::wstring::npos||flags.find(L'v')!=std::wstring::npos;
+    bool characterClass=false;
+    for(size_t position=0;position<pattern.size();++position){
+        const wchar_t character=pattern[position];
+        if(character==L'\\'&&position+3<pattern.size()&&
+           (pattern[position+1]==L'p'||pattern[position+1]==L'P')&&
+           pattern[position+2]==L'{'){
+            const auto end=pattern.find(L'}',position+3);
+            if(!unicode||end==std::wstring::npos)return false;
+            const auto property=pattern.substr(position+3,end-(position+3));
+            if(property!=L"L"&&property!=L"Letter"&&
+               property!=L"General_Category=L"&&property!=L"General_Category=Letter"&&
+               property!=L"gc=L"&&property!=L"gc=Letter")return false;
+            const bool negated=pattern[position+1]==L'P';
+            if(characterClass&&negated)return false;
+            if(!characterClass)output+=negated?L"[^":L"[";
+            output+=UnicodeLetterClassRanges();
+            if(!characterClass)output+=L']';
+            position=end;continue;
+        }
+        output+=character;
+        if(character==L'\\'&&position+1<pattern.size())output+=pattern[++position];
+        else if(character==L'['&&!characterClass)characterClass=true;
+        else if(character==L']'&&characterClass)characterClass=false;
+    }
+    return true;
 }
 
 // A large share of split separators are finite regular expressions made from
@@ -281,7 +361,7 @@ struct PromiseReaction {
 };
 
 enum class PromiseState { Pending, Fulfilled, Rejected };
-enum class ObjectKind { Plain, Array, Map, Set, RegExp, Window, FrameWindow, Document, Node, ClassList, Style, Dataset, Event, WebView, Performance, Math, Json, ObjectConstructor, ArrayConstructor, StringConstructor, NumberConstructor, DateConstructor, Date, PromiseConstructor, ErrorConstructor, UrlSearchParams, Storage, MediaQuery, Response, Promise, Error, Location, CanvasContext2D, CanvasGradient };
+enum class ObjectKind { Plain, Array, Map, Set, RegExp, Window, FrameWindow, Document, Node, Range, Selection, ClassList, Style, Dataset, Event, WebView, Performance, Math, Json, ObjectConstructor, ArrayConstructor, StringConstructor, NumberConstructor, DateConstructor, Date, PromiseConstructor, ErrorConstructor, UrlSearchParams, Storage, MediaQuery, Response, Promise, Error, Location, CanvasContext2D, CanvasGradient };
 
 struct Object {
     ObjectKind kind = ObjectKind::Plain;
@@ -289,6 +369,10 @@ struct Object {
     std::vector<Value> items;
     std::vector<std::pair<Value, Value>> entries;
     std::shared_ptr<Node> node;
+    std::shared_ptr<Node> rangeStart;
+    std::shared_ptr<Node> rangeEnd;
+    size_t rangeStartOffset = 0;
+    size_t rangeEndOffset = 0;
     std::shared_ptr<CanvasGradient> canvasGradient;
     std::shared_ptr<Object> prototype;
     PromiseState promiseState = PromiseState::Pending;
@@ -1106,6 +1190,66 @@ std::wstring NumberString(double number) {
     return value;
 }
 
+void AppendEscapedHtml(std::wstring& output,const std::wstring& value,bool attribute=false){
+    for(const auto character:value){
+        if(character==L'&')output+=L"&amp;";
+        else if(character==L'<')output+=L"&lt;";
+        else if(character==L'>')output+=L"&gt;";
+        else if(attribute&&character==L'\"')output+=L"&quot;";
+        else output+=character;
+    }
+}
+
+bool IsVoidHtmlElement(const std::wstring& tag){
+    static constexpr const wchar_t* names[]={L"area",L"base",L"br",L"col",L"embed",L"hr",L"img",L"input",L"link",L"meta",L"param",L"source",L"track",L"wbr"};
+    return std::find(std::begin(names),std::end(names),tag)!=std::end(names);
+}
+
+void AppendOuterHtml(std::wstring& output,const std::shared_ptr<Node>& node){
+    if(!node)return;
+    if(node->type==NodeType::Text){AppendEscapedHtml(output,node->text);return;}
+    if(node->type==NodeType::Document){for(const auto& child:node->children)AppendOuterHtml(output,child);return;}
+    output+=L'<'+node->tag;
+    for(const auto& attribute:node->attributes){
+        output+=L' '+attribute.first;
+        output+=L"=\"";AppendEscapedHtml(output,attribute.second,true);output+=L'\"';
+    }
+    if(node->checked&&node->attributes.count(L"checked")==0)output+=L" checked=\"\"";
+    if(node->disabled&&node->attributes.count(L"disabled")==0)output+=L" disabled=\"\"";
+    output+=L'>';
+    if(IsVoidHtmlElement(node->tag))return;
+    for(const auto& child:node->children)AppendOuterHtml(output,child);
+    output+=L"</"+node->tag+L'>';
+}
+
+std::wstring InnerHtml(const std::shared_ptr<Node>& node){
+    std::wstring output;if(node)for(const auto& child:node->children)AppendOuterHtml(output,child);return output;
+}
+
+std::shared_ptr<Node> CloneDomNode(const std::shared_ptr<Node>& source,bool deep){
+    if(!source)return {};
+    auto clone=std::make_shared<Node>();clone->type=source->type;clone->tag=source->tag;clone->text=source->text;
+    clone->attributes=source->attributes;clone->inlineStyle=source->inlineStyle;clone->files=source->files;
+    clone->checked=source->checked;clone->indeterminate=source->indeterminate;clone->disabled=source->disabled;
+    clone->scrollLeft=source->scrollLeft;clone->scrollTop=source->scrollTop;
+    clone->selectionStart=source->selectionStart;clone->selectionEnd=source->selectionEnd;
+    if(deep)for(const auto& child:source->children){auto copied=CloneDomNode(child,true);copied->parent=clone;clone->children.push_back(std::move(copied));}
+    return clone;
+}
+
+void NormalizeDomNode(const std::shared_ptr<Node>& node){
+    if(!node||node->type==NodeType::Text)return;
+    for(auto& child:node->children)NormalizeDomNode(child);
+    for(size_t index=0;index<node->children.size();){
+        auto& child=node->children[index];
+        if(child->type==NodeType::Text&&child->text.empty()&&node->children.size()>1){child->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index));continue;}
+        if(index+1<node->children.size()&&child->type==NodeType::Text&&node->children[index+1]->type==NodeType::Text){
+            child->text+=node->children[index+1]->text;node->children[index+1]->parent.reset();node->children.erase(node->children.begin()+static_cast<std::ptrdiff_t>(index+1));continue;
+        }
+        ++index;
+    }
+}
+
 std::wstring CamelToKebab(const std::wstring& value){std::wstring out;for(wchar_t c:value){if(std::iswupper(c)){out+=L'-';out+=std::towlower(c);}else out+=c;}return out;}
 std::wstring DatasetAttributeName(const std::wstring& value){return L"data-"+CamelToKebab(value);}
 bool AttributeRequiresLayout(const std::wstring& name){
@@ -1143,6 +1287,8 @@ struct RuntimeCore {
     JavaScriptRuntime::FocusSink focusSink;
     JavaScriptRuntime::SelectionProvider selectionProvider;
     JavaScriptRuntime::SelectionSetter selectionSetter;
+    JavaScriptRuntime::DomSelectionProvider domSelectionProvider;
+    JavaScriptRuntime::DomSelectionSetter domSelectionSetter;
     std::wstring location;
     std::shared_ptr<Environment> global;
     std::shared_ptr<Module> module=std::make_shared<Module>();
@@ -1291,10 +1437,12 @@ struct RuntimeCore {
         const auto key=flags+L'\x1f'+pattern;
         const auto cached=regularExpressions.find(key);
         if(cached!=regularExpressions.end())return cached->second;
+        std::wstring compatiblePattern;
+        if(!TranslateUnicodePropertyEscapes(pattern,flags,compatiblePattern))return {};
         std::wregex::flag_type options=std::regex_constants::ECMAScript;
         if(flags.find(L'i')!=std::wstring::npos)options|=std::regex_constants::icase;
         try{
-            auto expression=std::make_shared<const std::wregex>(pattern,options);
+            auto expression=std::make_shared<const std::wregex>(compatiblePattern,options);
             if(regularExpressions.size()>=256)regularExpressions.clear();
             regularExpressions.emplace(key,expression);
             return expression;
@@ -1340,7 +1488,7 @@ struct RuntimeCore {
         const auto v=Deref(value);switch(v.type){case Value::Type::Undefined:case Value::Type::Null:return false;case Value::Type::Boolean:return v.boolean;case Value::Type::Number:return v.number!=0&&!std::isnan(v.number);case Value::Type::String:return !v.string.empty();default:return true;}
     }
     double Number(const Value& value){
-        const auto v=Deref(value);if(v.type==Value::Type::Number)return v.number;if(v.type==Value::Type::Boolean)return v.boolean?1:0;if(v.type==Value::Type::Null)return 0;if(v.type==Value::Type::String)try{return std::stod(v.string);}catch(...){return std::numeric_limits<double>::quiet_NaN();}if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Date&&v.object->props.count(L"$time"))return Number(v.object->props[L"$time"]);return std::numeric_limits<double>::quiet_NaN();
+        const auto v=Deref(value);if(v.type==Value::Type::Number)return v.number;if(v.type==Value::Type::Boolean)return v.boolean?1:0;if(v.type==Value::Type::Null)return 0;if(v.type==Value::Type::String){const auto text=Trim(v.string);if(text.empty())return 0;wchar_t* end=nullptr;const double number=std::wcstod(text.c_str(),&end);if(end==text.c_str()||!end||*end!=L'\0')return std::numeric_limits<double>::quiet_NaN();return number;}if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Date&&v.object->props.count(L"$time"))return Number(v.object->props[L"$time"]);return std::numeric_limits<double>::quiet_NaN();
     }
     std::uint32_t Uint32(const Value& value){
         const double number=Number(value);if(!std::isfinite(number)||number==0)return 0;
@@ -1352,14 +1500,14 @@ struct RuntimeCore {
         const auto value=Deref(input);
         if(value.type==Value::Type::String){
             if(key==L"length")return true;
-            try{size_t used=0;const auto index=std::stoull(key,&used);return used==key.size()&&index<value.string.size();}catch(...){return false;}
+            size_t index=0;return TryParseDecimalIndex(key,index)&&index<value.string.size();
         }
         if(value.type!=Value::Type::Object||!value.object)return false;
         const auto object=value.object;
         if(object->props.count(key)||object->props.count(L"$get:"+key))return true;
         if(object->kind==ObjectKind::Array){
             if(key==L"length")return true;
-            try{size_t used=0;const auto index=std::stoull(key,&used);if(used==key.size()&&index<object->items.size())return true;}catch(...){}
+            size_t index=0;if(TryParseDecimalIndex(key,index)&&index<object->items.size())return true;
         }
         for(auto prototype=object->prototype;prototype;prototype=prototype->prototype)
             if(prototype->props.count(key)||prototype->props.count(L"$get:"+key)||prototype->props.count(L"$method:"+key))return true;
@@ -1371,6 +1519,260 @@ struct RuntimeCore {
     Value NodeValue(const std::shared_ptr<Node>& node){
         if(!node)return Value::Null();auto found=nodeObjects.find(node.get());if(found!=nodeObjects.end())if(auto cached=found->second.lock())return Value::FromObject(cached);
         auto object=CreateObject(ObjectKind::Node);object->node=node;nodeObjects[node.get()]=object;return Value::FromObject(object);
+    }
+    Value RangeValue(const std::shared_ptr<Node>& start,size_t startOffset,
+                     const std::shared_ptr<Node>& end,size_t endOffset){
+        auto range=CreateObject(ObjectKind::Range);range->rangeStart=start;range->rangeStartOffset=startOffset;
+        range->rangeEnd=end;range->rangeEndOffset=endOffset;return Value::FromObject(range);
+    }
+    static std::shared_ptr<Node> CommonAncestor(std::shared_ptr<Node> first,
+                                                std::shared_ptr<Node> second){
+        std::vector<std::shared_ptr<Node>> ancestors;
+        for(auto current=first;current;current=current->parent.lock())ancestors.push_back(current);
+        for(auto current=second;current;current=current->parent.lock())
+            if(std::find(ancestors.begin(),ancestors.end(),current)!=ancestors.end())return current;
+        return {};
+    }
+    static size_t DomTextLength(const std::shared_ptr<Node>& node){
+        if(!node)return 0;if(node->type==NodeType::Text)return node->text.size();
+        size_t length=0;for(const auto& child:node->children)length+=DomTextLength(child);return length;
+    }
+    static bool BoundaryTextOffset(const std::shared_ptr<Node>& root,
+                                   const std::shared_ptr<Node>& container,size_t offset,
+                                   size_t& cursor,size_t& result){
+        if(!root)return false;
+        if(root==container){
+            if(root->type==NodeType::Text)result=cursor+std::min(offset,root->text.size());
+            else{
+                const size_t count=std::min(offset,root->children.size());
+                size_t local=0;for(size_t index=0;index<count;++index)local+=DomTextLength(root->children[index]);
+                result=cursor+local;
+            }
+            return true;
+        }
+        if(root->type==NodeType::Text){cursor+=root->text.size();return false;}
+        for(const auto& child:root->children)if(BoundaryTextOffset(child,container,offset,cursor,result))return true;
+        return false;
+    }
+    static std::wstring RangeText(const std::shared_ptr<Object>& range){
+        if(!range||!range->rangeStart||!range->rangeEnd)return {};
+        const auto root=CommonAncestor(range->rangeStart,range->rangeEnd);if(!root)return {};
+        size_t cursor=0,start=0,end=0;
+        if(!BoundaryTextOffset(root,range->rangeStart,range->rangeStartOffset,cursor,start))return {};
+        cursor=0;if(!BoundaryTextOffset(root,range->rangeEnd,range->rangeEndOffset,cursor,end))return {};
+        if(end<start)std::swap(start,end);const auto text=root->InnerText();
+        return text.substr(std::min(start,text.size()),std::min(end,text.size())-std::min(start,text.size()));
+    }
+    Value SelectionValue(){
+        auto selection=CreateObject(ObjectKind::Selection);JavaScriptRuntime::DomSelection current;
+        if(domSelectionProvider&&domSelectionProvider(current)&&current.anchorNode&&current.focusNode)
+            selection->props[L"$range"]=RangeValue(current.anchorNode,current.anchorOffset,
+                                                    current.focusNode,current.focusOffset);
+        return Value::FromObject(selection);
+    }
+    static std::shared_ptr<Node> EditableRoot(std::shared_ptr<Node> node){
+        std::shared_ptr<Node> result;
+        for(auto current=node;current;current=current->parent.lock()){
+            const auto editable=ToLower(Trim(current->Attribute(L"contenteditable")));
+            if(current->attributes.count(L"contenteditable")&&editable!=L"false")result=current;
+            else if(current->attributes.count(L"contenteditable")&&editable==L"false")break;
+        }
+        return result;
+    }
+    static bool IsEditingBlock(const std::wstring& tag){
+        return tag==L"address"||tag==L"blockquote"||tag==L"div"||tag==L"p"||tag==L"pre"||
+               tag==L"h1"||tag==L"h2"||tag==L"h3"||tag==L"h4"||tag==L"h5"||tag==L"h6";
+    }
+    bool QueryEditingCommandState(const std::wstring& rawCommand){
+        JavaScriptRuntime::DomSelection selection;
+        if(!domSelectionProvider||!domSelectionProvider(selection)||!selection.anchorNode)return false;
+        const auto command=ToLower(rawCommand);
+        for(auto current=selection.anchorNode;current;current=current->parent.lock()){
+            if(command==L"bold"&&(current->tag==L"b"||current->tag==L"strong"))return true;
+            if(command==L"italic"&&(current->tag==L"i"||current->tag==L"em"))return true;
+            if(command==L"strikethrough"&&(current->tag==L"s"||current->tag==L"strike"||current->tag==L"del"))return true;
+            if(EditableRoot(current)==current)break;
+        }
+        return false;
+    }
+    static bool IsInsertedBlock(const std::shared_ptr<Node>& node){
+        if(!node||node->type!=NodeType::Element)return false;
+        static constexpr const wchar_t* tags[]={
+            L"address",L"article",L"aside",L"blockquote",L"div",L"dl",L"fieldset",
+            L"footer",L"form",L"h1",L"h2",L"h3",L"h4",L"h5",L"h6",L"header",
+            L"hgroup",L"hr",L"main",L"menu",L"nav",L"ol",L"p",L"pre",L"section",
+            L"table",L"ul"};
+        return std::find(std::begin(tags),std::end(tags),node->tag)!=std::end(tags);
+    }
+    static std::shared_ptr<Node> EditingTextNode(const std::wstring& text,
+                                                 const std::shared_ptr<Node>& parent={}){
+        auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";
+        node->text=text;node->parent=parent;return node;
+    }
+    static std::shared_ptr<Node> LastEditingText(const std::shared_ptr<Node>& node){
+        if(!node)return {};
+        if(node->type==NodeType::Text)return node;
+        for(auto child=node->children.rbegin();child!=node->children.rend();++child)
+            if(auto text=LastEditingText(*child))return text;
+        return {};
+    }
+    static std::shared_ptr<Node> EnsureInsertedCaretText(
+        const std::vector<std::shared_ptr<Node>>& inserted){
+        if(inserted.empty())return {};
+        auto last=inserted.back();
+        if(auto text=LastEditingText(last))return text;
+        if(!last||last->type!=NodeType::Element||IsVoidHtmlElement(last->tag))return {};
+        // A trailing <p><br></p> is the conventional editable caret block.
+        // Back the caret with one persistent empty text node so DOM normalize()
+        // cannot detach the native editing selection immediately after insertion.
+        if(last->children.size()==1&&last->children.front()->type==NodeType::Element&&
+           last->children.front()->tag==L"br"){
+            last->children.front()->parent.reset();last->children.clear();
+        }
+        auto text=EditingTextNode(L"",last);last->children.push_back(text);return text;
+    }
+    bool InsertEditingHtml(const std::wstring& html){
+        JavaScriptRuntime::DomSelection selection;
+        if(!domSelectionProvider||!domSelectionProvider(selection)||
+           !selection.anchorNode||!selection.focusNode)return false;
+        auto root=EditableRoot(selection.anchorNode);
+        if(!root||EditableRoot(selection.focusNode)!=root)return false;
+        auto fragment=document.ParseFragment(html);
+        if(fragment.empty()&&!html.empty())return false;
+        bool indexOk=true;
+        std::shared_ptr<Node> caretText;
+        auto attach=[&](const std::shared_ptr<Node>& parent,size_t position,
+                        std::vector<std::shared_ptr<Node>>& nodes){
+            position=std::min(position,parent->children.size());
+            for(auto& node:nodes)node->parent=parent;
+            parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(position),
+                                    nodes.begin(),nodes.end());
+            for(const auto& node:nodes){
+                indexOk=document.IndexSubtree(node)&&indexOk;
+                ExecuteConnectedScripts(node);
+            }
+        };
+
+        if(selection.anchorNode==selection.focusNode&&
+           selection.anchorNode->type==NodeType::Text){
+            const auto textNode=selection.anchorNode;
+            const auto parent=textNode->parent.lock();if(!parent)return false;
+            const size_t start=std::min({selection.anchorOffset,selection.focusOffset,
+                                         textNode->text.size()});
+            const size_t end=std::min(std::max(selection.anchorOffset,selection.focusOffset),
+                                      textNode->text.size());
+            const auto before=textNode->text.substr(0,start),after=textNode->text.substr(end);
+            const bool insertsBlock=std::any_of(fragment.begin(),fragment.end(),IsInsertedBlock);
+            auto directBlock=parent;
+            while(directBlock&&directBlock->parent.lock()!=root)
+                directBlock=directBlock->parent.lock();
+            const bool splitSimpleBlock=insertsBlock&&directBlock&&
+                directBlock->parent.lock()==root&&directBlock->children.size()==1&&
+                directBlock->children.front()==textNode;
+            if(splitSimpleBlock){
+                const auto position=std::find(root->children.begin(),root->children.end(),directBlock);
+                if(position==root->children.end())return false;
+                const size_t offset=static_cast<size_t>(position-root->children.begin());
+                indexOk=document.UnindexSubtree(directBlock)&&indexOk;
+                root->children.erase(position);directBlock->parent.reset();
+                std::vector<std::shared_ptr<Node>> inserted;
+                if(!before.empty()){
+                    textNode->text=before;textNode->parent=directBlock;directBlock->children={textNode};
+                    inserted.push_back(directBlock);
+                }
+                inserted.insert(inserted.end(),fragment.begin(),fragment.end());
+                if(!after.empty()){
+                    auto trailing=CloneDomNode(directBlock,false);trailing->RemoveAttribute(L"id");
+                    auto trailingText=EditingTextNode(after,trailing);trailing->children={trailingText};
+                    inserted.push_back(trailing);caretText=trailingText;
+                }
+                if(!caretText)caretText=EnsureInsertedCaretText(inserted);
+                attach(root,offset,inserted);
+                if(!caretText){selection.anchorNode=selection.focusNode=root;
+                    selection.anchorOffset=selection.focusOffset=offset+inserted.size();}
+            }else{
+                const auto position=std::find(parent->children.begin(),parent->children.end(),textNode);
+                if(position==parent->children.end())return false;
+                const size_t offset=static_cast<size_t>(position-parent->children.begin());
+                indexOk=document.UnindexSubtree(textNode)&&indexOk;
+                parent->children.erase(position);textNode->parent.reset();
+                std::vector<std::shared_ptr<Node>> inserted;
+                if(!before.empty())inserted.push_back(EditingTextNode(before));
+                inserted.insert(inserted.end(),fragment.begin(),fragment.end());
+                if(!after.empty()){
+                    caretText=EditingTextNode(after);inserted.push_back(caretText);
+                }
+                if(!caretText)caretText=EnsureInsertedCaretText(inserted);
+                attach(parent,offset,inserted);
+                if(!caretText){selection.anchorNode=selection.focusNode=parent;
+                    selection.anchorOffset=selection.focusOffset=offset+inserted.size();}
+            }
+        }else if(selection.anchorNode==selection.focusNode&&
+                 selection.anchorNode->type!=NodeType::Text){
+            const auto parent=selection.anchorNode;
+            if(EditableRoot(parent)!=root&&parent!=root)return false;
+            const size_t start=std::min({selection.anchorOffset,selection.focusOffset,
+                                         parent->children.size()});
+            const size_t end=std::min(std::max(selection.anchorOffset,selection.focusOffset),
+                                      parent->children.size());
+            for(size_t index=start;index<end;++index)
+                indexOk=document.UnindexSubtree(parent->children[index])&&indexOk;
+            for(size_t index=start;index<end;++index)parent->children[index]->parent.reset();
+            parent->children.erase(parent->children.begin()+static_cast<std::ptrdiff_t>(start),
+                                   parent->children.begin()+static_cast<std::ptrdiff_t>(end));
+            caretText=EnsureInsertedCaretText(fragment);attach(parent,start,fragment);
+            if(!caretText){selection.anchorNode=selection.focusNode=parent;
+                selection.anchorOffset=selection.focusOffset=start+fragment.size();}
+        }else return false;
+
+        if(caretText){selection.anchorNode=selection.focusNode=caretText;
+            selection.anchorOffset=selection.focusOffset=caretText->text.size();}
+        Mutated(root,JavaScriptRuntime::MutationKind::Tree,!indexOk);
+        if(domSelectionSetter)domSelectionSetter(selection);
+        return true;
+    }
+    bool ExecuteEditingCommand(const std::wstring& rawCommand,const std::wstring& rawValue){
+        const auto command=ToLower(Trim(rawCommand));
+        if(command==L"inserthtml")return InsertEditingHtml(rawValue);
+        if(command!=L"formatblock")return false;
+        JavaScriptRuntime::DomSelection selection;
+        if(!domSelectionProvider||!domSelectionProvider(selection)||!selection.anchorNode)return false;
+        auto root=EditableRoot(selection.anchorNode);if(!root)return false;
+        auto tag=ToLower(Trim(rawValue));
+        if(tag.size()>2&&tag.front()==L'<'&&tag.back()==L'>')tag=tag.substr(1,tag.size()-2);
+        if(!IsEditingBlock(tag))return false;
+
+        std::shared_ptr<Node> block;
+        for(auto current=selection.anchorNode;current&&current!=root;current=current->parent.lock())
+            if(IsEditingBlock(current->tag)){block=current;break;}
+        bool indexOk=true;
+        if(block){
+            if(block->tag==tag)return true;
+            indexOk=document.UnindexSubtree(block);block->tag=tag;
+            indexOk=document.IndexSubtree(block)&&indexOk;
+        }else{
+            auto direct=selection.anchorNode;
+            if(direct==root){
+                const size_t index=std::min(selection.anchorOffset,root->children.size());
+                if(index<root->children.size())direct=root->children[index];
+                else if(!root->children.empty())direct=root->children.back();
+                else{
+                    direct=std::make_shared<Node>();direct->type=NodeType::Text;direct->tag=L"#text";
+                    direct->parent=root;root->children.push_back(direct);
+                    selection.anchorNode=selection.focusNode=direct;
+                    selection.anchorOffset=selection.focusOffset=0;
+                }
+            }
+            while(direct&&direct->parent.lock()!=root)direct=direct->parent.lock();
+            if(!direct)return false;
+            const auto position=std::find(root->children.begin(),root->children.end(),direct);
+            if(position==root->children.end())return false;
+            block=document.CreateElement(tag);block->parent=root;direct->parent=block;block->children.push_back(direct);
+            *position=block;indexOk=document.IndexSubtree(block);
+        }
+        Mutated(root,JavaScriptRuntime::MutationKind::Tree,!indexOk);
+        if(domSelectionSetter)domSelectionSetter(selection);
+        return true;
     }
     static unsigned CanvasDimension(const std::shared_ptr<Node>& node,const wchar_t* name,
                                     unsigned fallback){
@@ -1704,7 +2106,7 @@ struct RuntimeCore {
         }
         if(base.type==Value::Type::String){
             if(key==L"length")return Value::Number(static_cast<double>(base.string.size()));
-            try{size_t used=0;const auto index=std::stoul(key,&used);if(used==key.size()&&index<base.string.size())return Value::String(std::wstring(1,base.string[index]));}catch(...){}
+            size_t index=0;if(TryParseDecimalIndex(key,index)&&index<base.string.size())return Value::String(std::wstring(1,base.string[index]));
             if(key==L"indexOf")return Native([s=base.string](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto found=s.find(a.empty()?L"":r.String(a[0]));return Value::Number(found==std::wstring::npos?-1.0:static_cast<double>(found));});
             if(key==L"toLowerCase"||key==L"toLocaleLowerCase"||key==L"toUpperCase")return Native([s=base.string,key](RuntimeCore&,const Value&,const std::vector<Value>&){auto out=s;std::transform(out.begin(),out.end(),out.begin(),[&](wchar_t c){return key==L"toUpperCase"?std::towupper(c):std::towlower(c);});return Value::String(out);});
             if(key==L"trim")return Native([s=base.string](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::String(Trim(s));});
@@ -1964,7 +2366,7 @@ struct RuntimeCore {
                 }
                 return Value::String(std::move(out));
             });
-            try{size_t used=0;size_t index=std::stoul(key,&used);if(used==key.size()&&index<object->items.size())return object->items[index];}catch(...){}
+            size_t index=0;if(TryParseDecimalIndex(key,index)&&index<object->items.size())return object->items[index];
         }
         if(object->kind==ObjectKind::RegExp&&(key==L"test"||key==L"exec"))return Native([object,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
             const auto input=a.empty()?L"":r.String(a[0]),pattern=r.String(object->props[L"$pattern"]),flags=r.String(object->props[L"$flags"]);
@@ -2160,8 +2562,86 @@ struct RuntimeCore {
             if(key==L"querySelector"||key==L"querySelectorAll")return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"createElement")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(r.document.CreateElement(a.empty()?L"div":r.String(a[0])));});
             if(key==L"createTextNode")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto node=std::make_shared<Node>();node->type=NodeType::Text;node->tag=L"#text";node->text=a.empty()?L"":r.String(a[0]);return r.NodeValue(node);});
+            if(key==L"createRange")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){
+                const auto root=r.document.Root();return r.RangeValue(root,0,root,0);
+            });
+            if(key==L"execCommand")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto command=a.empty()?L"":r.String(a[0]);
+                const auto value=a.size()>2?r.String(a[2]):L"";
+                return Value::Bool(r.ExecuteEditingCommand(command,value));
+            });
+            if(key==L"queryCommandState")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                return Value::Bool(!a.empty()&&r.QueryEditingCommandState(r.String(a[0])));
+            });
+            if(key==L"queryCommandSupported")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Bool(false);
+                const auto command=ToLower(r.String(a[0]));
+                return Value::Bool(command==L"formatblock"||command==L"inserthtml");
+            });
             if(key==L"addEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.AddEventListener(r.documentListeners,a);return Value::Undefined();});
             if(key==L"removeEventListener")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.RemoveEventListener(r.documentListeners,a);return Value::Undefined();});
+        }
+        if(object->kind==ObjectKind::Range){
+            if(key==L"startContainer")return NodeValue(object->rangeStart);
+            if(key==L"endContainer")return NodeValue(object->rangeEnd);
+            if(key==L"startOffset")return Value::Number(static_cast<double>(object->rangeStartOffset));
+            if(key==L"endOffset")return Value::Number(static_cast<double>(object->rangeEndOffset));
+            if(key==L"collapsed")return Value::Bool(object->rangeStart==object->rangeEnd&&object->rangeStartOffset==object->rangeEndOffset);
+            if(key==L"commonAncestorContainer")return NodeValue(CommonAncestor(object->rangeStart,object->rangeEnd));
+            if(key==L"cloneRange")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){
+                return r.RangeValue(object->rangeStart,object->rangeStartOffset,object->rangeEnd,object->rangeEndOffset);
+            });
+            if(key==L"setStart"||key==L"setEnd")return Native([object,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.size()<2)return Value::Undefined();const auto value=r.Deref(a[0]);
+                if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node)return Value::Undefined();
+                const auto offset=static_cast<size_t>(std::max(0.0,r.Number(a[1])));
+                if(key==L"setStart"){object->rangeStart=value.object->node;object->rangeStartOffset=offset;}
+                else{object->rangeEnd=value.object->node;object->rangeEndOffset=offset;}
+                return Value::Undefined();
+            });
+            if(key==L"setStartAfter"||key==L"setEndAfter")return Native([object,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Undefined();const auto value=r.Deref(a[0]);
+                if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node||!value.object->node)return Value::Undefined();
+                const auto parent=value.object->node->parent.lock();if(!parent)return Value::Undefined();
+                const auto found=std::find(parent->children.begin(),parent->children.end(),value.object->node);
+                const size_t offset=found==parent->children.end()?parent->children.size():static_cast<size_t>(found-parent->children.begin())+1;
+                if(key==L"setStartAfter"){object->rangeStart=parent;object->rangeStartOffset=offset;}
+                else{object->rangeEnd=parent;object->rangeEndOffset=offset;}
+                return Value::Undefined();
+            });
+            if(key==L"collapse")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty()||r.Truth(a[0])){object->rangeEnd=object->rangeStart;object->rangeEndOffset=object->rangeStartOffset;}
+                else{object->rangeStart=object->rangeEnd;object->rangeStartOffset=object->rangeEndOffset;}
+                return Value::Undefined();
+            });
+            if(key==L"toString")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::String(RangeText(object));});
+        }
+        if(object->kind==ObjectKind::Selection){
+            const auto stored=object->props.find(L"$range");
+            const auto range=stored!=object->props.end()&&stored->second.type==Value::Type::Object?stored->second.object:std::shared_ptr<Object>{};
+            if(key==L"rangeCount")return Value::Number(range?1:0);
+            if(key==L"anchorNode")return NodeValue(range?range->rangeStart:std::shared_ptr<Node>{});
+            if(key==L"focusNode")return NodeValue(range?range->rangeEnd:std::shared_ptr<Node>{});
+            if(key==L"anchorOffset")return Value::Number(static_cast<double>(range?range->rangeStartOffset:0));
+            if(key==L"focusOffset")return Value::Number(static_cast<double>(range?range->rangeEndOffset:0));
+            if(key==L"isCollapsed")return Value::Bool(!range||(range->rangeStart==range->rangeEnd&&range->rangeStartOffset==range->rangeEndOffset));
+            if(key==L"getRangeAt")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                const auto found=object->props.find(L"$range");
+                if(a.empty()||r.Number(a[0])!=0||found==object->props.end())return Value::Undefined();return found->second;
+            });
+            if(key==L"removeAllRanges")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){object->props.erase(L"$range");return Value::Undefined();});
+            if(key==L"addRange")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Undefined();const auto value=r.Deref(a[0]);
+                if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Range)return Value::Undefined();
+                object->props[L"$range"]=value;
+                if(r.domSelectionSetter){JavaScriptRuntime::DomSelection selection;
+                    selection.anchorNode=value.object->rangeStart;selection.anchorOffset=value.object->rangeStartOffset;
+                    selection.focusNode=value.object->rangeEnd;selection.focusOffset=value.object->rangeEndOffset;
+                    r.domSelectionSetter(selection);
+                }
+                return Value::Undefined();
+            });
+            if(key==L"toString")return Native([range](RuntimeCore&,const Value&,const std::vector<Value>&){return Value::String(RangeText(range));});
         }
         if(object->kind==ObjectKind::Node){
             auto node=object->node;if(!node)return Value::Undefined();
@@ -2175,6 +2655,9 @@ struct RuntimeCore {
             if(key==L"id")return Value::String(node->Attribute(L"id"));
             if(key==L"className")return Value::String(node->Attribute(L"class"));
             if(key==L"value")return Value::String(node->Attribute(L"value"));
+            if(key==L"nodeType")return Value::Number(node->type==NodeType::Element?1:node->type==NodeType::Text?3:9);
+            if(key==L"nodeValue")return node->type==NodeType::Text?Value::String(node->text):Value::Null();
+            if(key==L"tagName"){auto tag=node->type==NodeType::Element?node->tag:L"";std::transform(tag.begin(),tag.end(),tag.begin(),[](wchar_t character){return static_cast<wchar_t>(std::towupper(character));});return Value::String(std::move(tag));}
             if(key==L"selectionStart"||key==L"selectionEnd"){
                 size_t start=node->selectionStart,end=node->selectionEnd;
                 if(selectionProvider)selectionProvider(node,start,end);
@@ -2214,10 +2697,13 @@ struct RuntimeCore {
                 return rect;
             });
             if(key==L"innerText"||key==L"textContent")return Value::String(node->InnerText());
-            if(key==L"innerHTML")return Value::String(node->InnerText());
+            if(key==L"innerHTML")return Value::String(InnerHtml(node));
             if(key==L"content"&&node->tag==L"template")return NodeValue(node);
             if(key==L"children"){
                 std::vector<Value> out;for(const auto& child:node->children)if(child->type==NodeType::Element)out.push_back(NodeValue(child));return ArrayValue(out);
+            }
+            if(key==L"childNodes"){
+                std::vector<Value> out;for(const auto& child:node->children)out.push_back(NodeValue(child));return ArrayValue(out);
             }
             if(key==L"childElementCount"){
                 size_t count=0;for(const auto& child:node->children)if(child->type==NodeType::Element)++count;return Value::Number(static_cast<double>(count));
@@ -2231,7 +2717,15 @@ struct RuntimeCore {
             if(key==L"style"){auto o=CreateObject(ObjectKind::Style);o->node=node;return Value::FromObject(o);}
             if(key==L"dataset"){auto o=CreateObject(ObjectKind::Dataset);o->node=node;return Value::FromObject(o);}
             if(key==L"cells"){std::vector<Value> out;for(auto& c:node->children)if(c->tag==L"td"||c->tag==L"th")out.push_back(NodeValue(c));return ArrayValue(out);}
-            if(key==L"parentNode"||key==L"parentElement")return NodeValue(node->parent.lock());
+            if(key==L"parentNode")return NodeValue(node->parent.lock());
+            if(key==L"parentElement"){const auto parent=node->parent.lock();return NodeValue(parent&&parent->type==NodeType::Element?parent:std::shared_ptr<Node>{});}
+            if(key==L"firstChild"||key==L"lastChild")return NodeValue(node->children.empty()?std::shared_ptr<Node>{}:(key==L"firstChild"?node->children.front():node->children.back()));
+            if(key==L"nextSibling"||key==L"previousSibling"){
+                const auto parent=node->parent.lock();if(!parent)return Value::Null();
+                const auto found=std::find(parent->children.begin(),parent->children.end(),node);if(found==parent->children.end())return Value::Null();
+                if(key==L"nextSibling")return NodeValue(found+1==parent->children.end()?std::shared_ptr<Node>{}:*(found+1));
+                return NodeValue(found==parent->children.begin()?std::shared_ptr<Node>{}:*(found-1));
+            }
             if(key==L"nextElementSibling"){
                 auto parent=node->parent.lock();if(!parent)return Value::Null();bool found=false;for(const auto& sibling:parent->children){if(sibling==node){found=true;continue;}if(found&&sibling->type==NodeType::Element)return NodeValue(sibling);}return Value::Null();
             }
@@ -2311,6 +2805,12 @@ struct RuntimeCore {
                 }
                 return Value::Undefined();
             });
+            if(key==L"toggleAttribute")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(a.empty())return Value::Bool(false);const auto name=ToLower(r.String(a[0]));
+                const bool present=node->attributes.count(name)!=0;const bool enabled=a.size()>1?r.Truth(a[1]):!present;
+                if(enabled&&!present)node->SetAttribute(name,L"");else if(!enabled&&present)node->RemoveAttribute(name);
+                r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Bool(enabled);
+            });
             if(key==L"remove")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(auto parent=node->parent.lock()){const bool indexOk=r.document.UnindexSubtree(node);parent->children.erase(std::remove(parent->children.begin(),parent->children.end(),node),parent->children.end());node->parent.reset();r.Mutated(parent,JavaScriptRuntime::MutationKind::Tree,!indexOk);}return Value::Undefined();});
             if(key==L"replaceWith")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 auto parent=node->parent.lock();if(!parent)return Value::Undefined();auto position=std::find(parent->children.begin(),parent->children.end(),node);if(position==parent->children.end())return Value::Undefined();
@@ -2318,6 +2818,8 @@ struct RuntimeCore {
                 for(const auto& input:a){auto value=r.Deref(input);std::shared_ptr<Node> replacement;if(value.type==Value::Type::Object&&value.object&&value.object->kind==ObjectKind::Node)replacement=value.object->node;else{replacement=std::make_shared<Node>();replacement->type=NodeType::Text;replacement->tag=L"#text";replacement->text=r.String(value);}auto old=replacement->parent.lock();indexOk=r.document.UnindexSubtree(replacement)&&indexOk;if(old){old->children.erase(std::remove(old->children.begin(),old->children.end(),replacement),old->children.end());r.Mutated(old,JavaScriptRuntime::MutationKind::Tree);}replacement->parent=parent;parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(insert++),replacement);indexOk=r.document.IndexSubtree(replacement)&&indexOk;r.ExecuteConnectedScripts(replacement);}
                 r.Mutated(parent,JavaScriptRuntime::MutationKind::Tree,!indexOk);return Value::Undefined();
             });
+            if(key==L"cloneNode")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(CloneDomNode(node,!a.empty()&&r.Truth(a[0])));});
+            if(key==L"normalize")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){NormalizeDomNode(node);r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,true);return Value::Undefined();});
             if(key==L"focus")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>&){if(r.focusSink)r.focusSink(node);else{node->focused=true;r.Mutated(node,JavaScriptRuntime::MutationKind::Style);}return Value::Undefined();});
             if(key==L"setSelectionRange")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
                 const auto length=node->Attribute(L"value").size();
@@ -2440,7 +2942,17 @@ struct RuntimeCore {
         }
         if(object->kind==ObjectKind::Json&&(key==L"stringify"||key==L"parse"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"stringify")return Value::String(a.empty()?L"undefined":r.Json(a[0]));if(a.empty())return Value::Undefined();try{Compiler parser(r.module,r.String(a[0]));return r.Run(parser.CompileExpressionOnly(),r.global);}catch(...){return Value::Undefined();}});
         if(object->kind==ObjectKind::ArrayConstructor&&(key==L"from"||key==L"isArray"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(key==L"isArray")return Value::Bool(!a.empty()&&r.Deref(a[0]).type==Value::Type::Object&&r.Deref(a[0]).object->kind==ObjectKind::Array);if(a.empty())return r.ArrayValue({});auto v=r.Deref(a[0]);std::vector<Value> values;if(v.type==Value::Type::Object&&v.object&&v.object->kind==ObjectKind::Array)values=v.object->items;else if(v.type==Value::Type::Object&&v.object){const auto length=v.object->props.find(L"length");const auto count=length==v.object->props.end()?0:static_cast<size_t>(std::max(0.0,r.Number(length->second)));values.resize(count,Value::Undefined());}if(a.size()>1)for(size_t i=0;i<values.size();++i)values[i]=r.Deref(r.Call(a[1],Value::Undefined(),{values[i],Value::Number(static_cast<double>(i))}));return r.ArrayValue(values);});
-        if(object->kind==ObjectKind::NumberConstructor&&(key==L"isFinite"||key==L"isNaN"))return Native([key](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto value=a.empty()?Value::Undefined():r.Deref(a[0]);return Value::Bool(key==L"isFinite"?value.type==Value::Type::Number&&std::isfinite(value.number):value.type==Value::Type::Number&&std::isnan(value.number));});
+        if(object->kind==ObjectKind::NumberConstructor&&
+           (key==L"isFinite"||key==L"isNaN"||key==L"isInteger"))
+            return Native([key](RuntimeCore& r,const Value&,
+                                const std::vector<Value>& arguments){
+                const auto value=arguments.empty()?Value::Undefined():r.Deref(arguments[0]);
+                if(value.type!=Value::Type::Number)return Value::Bool(false);
+                if(key==L"isFinite")return Value::Bool(std::isfinite(value.number));
+                if(key==L"isNaN")return Value::Bool(std::isnan(value.number));
+                return Value::Bool(std::isfinite(value.number)&&
+                                   std::trunc(value.number)==value.number);
+            });
         return Value::Undefined();
     }
     struct ParsedEventListenerOptions { bool capture=false,once=false,passive=false; };
@@ -2502,7 +3014,7 @@ struct RuntimeCore {
     }
     void SetProperty(const Value& input,const std::wstring& key,const Value& value){
         auto base=Deref(input);if(base.type!=Value::Type::Object||!base.object)return;auto object=base.object;auto v=Deref(value);
-        if(object->kind==ObjectKind::Array){try{size_t used=0;size_t i=std::stoul(key,&used);if(used==key.size()){if(i>=object->items.size())object->items.resize(i+1);object->items[i]=v;return;}}catch(...){} }
+        if(object->kind==ObjectKind::Array){size_t i=0;if(TryParseDecimalIndex(key,i)){if(i>=object->items.size())object->items.resize(i+1);object->items[i]=v;return;}}
         if(object->kind==ObjectKind::Location&&key==L"hash"){
             auto hash=String(v);if(!hash.empty()&&hash.front()!=L'#')hash.insert(hash.begin(),L'#');
             const auto found=object->props.find(L"hash");const auto previous=found==object->props.end()?L"":String(found->second);
@@ -2773,6 +3285,11 @@ struct RuntimeCore {
         global->values[L"Infinity"]=Value::Number(std::numeric_limits<double>::infinity());
         global->values[L"NaN"]=Value::Number(std::numeric_limits<double>::quiet_NaN());
         auto window=CreateObject(ObjectKind::Window);auto chrome=CreateObject(ObjectKind::Plain);const auto hostBridge=ObjectValue(ObjectKind::WebView);chrome->props[L"webview"]=hostBridge;window->props[L"chrome"]=Value::FromObject(chrome);window->props[L"twebframe"]=hostBridge;global->values[L"window"]=Value::FromObject(window);
+        const auto getSelection=Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){return r.SelectionValue();});
+        global->values[L"getSelection"]=getSelection;window->props[L"getSelection"]=getSelection;
+        auto nodeConstants=ObjectValue(ObjectKind::Plain);nodeConstants.object->props[L"ELEMENT_NODE"]=Value::Number(1);
+        nodeConstants.object->props[L"TEXT_NODE"]=Value::Number(3);nodeConstants.object->props[L"DOCUMENT_NODE"]=Value::Number(9);
+        global->values[L"Node"]=nodeConstants;window->props[L"Node"]=nodeConstants;
         const auto customEvent=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){
             auto event=r.CreateObject(ObjectKind::Event);event->props[L"type"]=Value::String(a.empty()?L"":r.String(a[0]));
             event->props[L"detail"]=Value::Null();event->props[L"bubbles"]=Value::Bool(false);
@@ -3054,12 +3571,21 @@ struct RuntimeCore {
         auto event=CreateObject(ObjectKind::Event);event->props[L"type"]=Value::String(eventName);
         event->props[L"target"]=NodeValue(node);event->props[L"currentTarget"]=NodeValue(node);
         event->props[L"key"]=Value::String(init.key);event->props[L"button"]=Value::Number(init.button);
+        event->props[L"buttons"]=Value::Number(init.buttons);
+        event->props[L"clientX"]=Value::Number(init.clientX);event->props[L"clientY"]=Value::Number(init.clientY);
+        event->props[L"x"]=Value::Number(init.clientX);event->props[L"y"]=Value::Number(init.clientY);
+        event->props[L"pageX"]=Value::Number(init.pageX);event->props[L"pageY"]=Value::Number(init.pageY);
+        event->props[L"screenX"]=Value::Number(init.screenX);event->props[L"screenY"]=Value::Number(init.screenY);
+        event->props[L"movementX"]=Value::Number(init.movementX);event->props[L"movementY"]=Value::Number(init.movementY);
+        event->props[L"relatedTarget"]=NodeValue(init.relatedTarget);
+        event->props[L"pointerId"]=Value::Number(1);event->props[L"pointerType"]=Value::String(L"mouse");
+        event->props[L"isPrimary"]=Value::Bool(true);
         event->props[L"data"]=Value::String(init.data);event->props[L"inputType"]=Value::String(init.inputType);
         event->props[L"detail"]=Value::Number(init.detail);event->props[L"ctrlKey"]=Value::Bool(init.ctrlKey);
         event->props[L"shiftKey"]=Value::Bool(init.shiftKey);event->props[L"altKey"]=Value::Bool(init.altKey);
         event->props[L"metaKey"]=Value::Bool(init.metaKey);event->props[L"isComposing"]=Value::Bool(init.isComposing);
         event->props[L"defaultPrevented"]=Value::Bool(false);event->props[L"isTrusted"]=Value::Bool(true);
-        event->props[L"bubbles"]=Value::Bool(true);event->props[L"cancelable"]=Value::Bool(true);event->props[L"eventPhase"]=Value::Number(0);
+        event->props[L"bubbles"]=Value::Bool(init.bubbles);event->props[L"cancelable"]=Value::Bool(init.cancelable);event->props[L"eventPhase"]=Value::Number(0);
         if(droppedFiles){auto transfer=ObjectValue(ObjectKind::Plain);transfer.object->props[L"files"]=FileListValue(*droppedFiles);
             event->props[L"dataTransfer"]=transfer;}
         auto eventValue=Value::FromObject(event);global->values[L"event"]=eventValue;
@@ -3082,14 +3608,14 @@ struct RuntimeCore {
                 if(!stopped(L"$immediateStopped")){event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);DispatchInlineEventHandler(node,eventName,eventValue,event);}
                 if(!stopped(L"$immediateStopped")&&found!=listeners.end())invoke(found->second.events,target,false,2);
             }
-            if(!stopped(L"$propagationStopped"))for(const auto& current:ancestors){
+            if(init.bubbles&&!stopped(L"$propagationStopped"))for(const auto& current:ancestors){
                 const auto target=NodeValue(current);event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(3);
                 DispatchInlineEventHandler(current,eventName,eventValue,event);
                 if(!stopped(L"$immediateStopped")){auto found=listeners.find(current.get());if(found!=listeners.end())invoke(found->second.events,target,false,3);}
                 if(stopped(L"$propagationStopped"))break;
             }
-            if(!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,false,3);
-            if(!stopped(L"$propagationStopped"))invoke(windowListeners,windowTarget,false,3);
+            if(init.bubbles&&!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,false,3);
+            if(init.bubbles&&!stopped(L"$propagationStopped"))invoke(windowListeners,windowTarget,false,3);
         }else{
             event->props[L"target"]=documentTarget;
             invoke(windowListeners,windowTarget,true,1);
@@ -3146,6 +3672,8 @@ void JavaScriptRuntime::SetParentMessageSink(ParentMessageSink sink){impl_->core
 void JavaScriptRuntime::SetFocusSink(FocusSink sink){impl_->core.focusSink=std::move(sink);}
 void JavaScriptRuntime::SetSelectionProvider(SelectionProvider provider){impl_->core.selectionProvider=std::move(provider);}
 void JavaScriptRuntime::SetSelectionSetter(SelectionSetter setter){impl_->core.selectionSetter=std::move(setter);}
+void JavaScriptRuntime::SetDomSelectionProvider(DomSelectionProvider provider){impl_->core.domSelectionProvider=std::move(provider);}
+void JavaScriptRuntime::SetDomSelectionSetter(DomSelectionSetter setter){impl_->core.domSelectionSetter=std::move(setter);}
 void JavaScriptRuntime::SetViewportSize(double width,double height){
     impl_->core.viewportWidth=std::max(0.0,width);impl_->core.viewportHeight=std::max(0.0,height);
     const auto widthValue=Value::Number(impl_->core.viewportWidth),heightValue=Value::Number(impl_->core.viewportHeight);

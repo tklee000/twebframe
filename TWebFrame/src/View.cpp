@@ -14,6 +14,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -24,12 +25,15 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 namespace TWebFrame {
 using Microsoft::WRL::ComPtr;
@@ -42,6 +46,7 @@ constexpr UINT_PTR kJavaScriptTimer = 0x5747;
 constexpr UINT_PTR kCssTransitionTimer = 0x5748;
 constexpr UINT_PTR kCaretBlinkTimer = 0x5749;
 constexpr UINT kAnimationFrameFallbackMessage = WM_APP + 0x57;
+constexpr UINT_PTR kTooltipToolId = 0x5750;
 
 std::wstring Utf8ToWide(const std::string& value) {
     if(value.empty())return {};int count=MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),nullptr,0);std::wstring out(count,L'\0');MultiByteToWideChar(CP_UTF8,0,value.data(),static_cast<int>(value.size()),out.data(),count);return out;
@@ -281,8 +286,17 @@ struct View::Impl {
     bool layoutDirty=true;
     bool viewportOnlyDirty=false;
     bool trackingMouseLeave=false;
+    bool hasPointerPosition=false;
+    float pointerX=0;
+    float pointerY=0;
     bool cssTransitionTimerActive=false;
     std::chrono::steady_clock::time_point cssTransitionTick{};
+    HWND tooltip=nullptr;
+    HFONT tooltipFont=nullptr;
+    TOOLINFOW tooltipTool{};
+    std::shared_ptr<Node> tooltipOwner;
+    std::wstring tooltipText;
+    bool tooltipVisible=false;
     TextInput textInput;
 
     Impl():textInput(TextInput::Client{
@@ -323,6 +337,109 @@ struct View::Impl {
     }
     float PixelToDip(float value)const{return value/DpiScale();}
     LONG DipToPixel(float value)const{return static_cast<LONG>(std::lround(value*DpiScale()));}
+    void UpdateTooltipMetrics(){
+        if(!tooltip)return;
+        if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}
+        tooltipFont=CreateFontW(-DipToPixel(12.0f),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+            DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+            DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
+        if(tooltipFont)SendMessageW(tooltip,WM_SETFONT,reinterpret_cast<WPARAM>(tooltipFont),FALSE);
+        RECT margin{DipToPixel(6.0f),DipToPixel(3.0f),DipToPixel(6.0f),DipToPixel(3.0f)};
+        SendMessageW(tooltip,TTM_SETMARGIN,0,reinterpret_cast<LPARAM>(&margin));
+        SendMessageW(tooltip,TTM_SETTIPBKCOLOR,RGB(255,255,255),0);
+        SendMessageW(tooltip,TTM_SETTIPTEXTCOLOR,RGB(0,0,0),0);
+        SendMessageW(tooltip,TTM_SETMAXTIPWIDTH,0,DipToPixel(360.0f));
+    }
+    bool InitializeTooltip(HINSTANCE instance){
+        INITCOMMONCONTROLSEX commonControls{sizeof(commonControls),ICC_WIN95_CLASSES};
+        InitCommonControlsEx(&commonControls);
+        tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,
+            WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,
+            CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,instance,nullptr);
+        if(!tooltip)return false;
+        SetWindowPos(tooltip,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        // Chromium's plain title tooltip is rectangular and uses the page's
+        // neutral white palette instead of the themed Windows help balloon.
+        SetWindowTheme(tooltip,L"",L"");
+        // The host application may use either comctl32 v5 or v6. V2 is the
+        // newest TOOLINFO layout accepted by both versions on supported Windows.
+        tooltipTool.cbSize=TTTOOLINFOW_V2_SIZE;
+        tooltipTool.uFlags=TTF_TRACK|TTF_ABSOLUTE|TTF_TRANSPARENT;
+        tooltipTool.hwnd=hwnd;tooltipTool.uId=kTooltipToolId;
+        GetClientRect(hwnd,&tooltipTool.rect);
+        tooltipTool.lpszText=const_cast<LPWSTR>(L" ");
+        if(!SendMessageW(tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tooltipTool))){
+            DestroyWindow(tooltip);tooltip=nullptr;return false;
+        }
+        UpdateTooltipMetrics();return true;
+    }
+    void CancelTooltipHover(){
+        if(!hwnd)return;
+        TRACKMOUSEEVENT cancel{sizeof(cancel),TME_CANCEL|TME_HOVER,hwnd,0};
+        TrackMouseEvent(&cancel);
+    }
+    void HideTooltip(bool clearTarget=true){
+        CancelTooltipHover();
+        if(tooltip&&tooltipVisible)
+            SendMessageW(tooltip,TTM_TRACKACTIVATE,FALSE,reinterpret_cast<LPARAM>(&tooltipTool));
+        tooltipVisible=false;
+        if(clearTarget){tooltipOwner.reset();tooltipText.clear();}
+    }
+    static std::pair<std::shared_ptr<Node>,std::wstring> TooltipForNode(
+        const std::shared_ptr<Node>& node){
+        for(auto current=node;current;current=current->parent.lock()){
+            if(current->attributes.count(L"title")){
+                const auto text=current->Attribute(L"title");
+                // An explicitly empty title suppresses a title inherited from
+                // an ancestor, matching the HTML title advisory-text rule.
+                return text.empty()?std::pair<std::shared_ptr<Node>,std::wstring>{}:
+                    std::make_pair(current,text);
+            }
+        }
+        return {};
+    }
+    void UpdateTooltipTarget(const std::shared_ptr<Node>& hit){
+        const auto candidate=TooltipForNode(hit);
+        if(candidate.first==tooltipOwner&&candidate.second==tooltipText)return;
+        HideTooltip(false);tooltipOwner=candidate.first;tooltipText=candidate.second;
+        if(!tooltipOwner||tooltipText.empty())return;
+        TRACKMOUSEEVENT hover{sizeof(hover),TME_HOVER,hwnd,HOVER_DEFAULT};
+        TrackMouseEvent(&hover);
+    }
+    void ShowTooltipAt(LPARAM position){
+        if(!tooltip||!tooltipOwner||tooltipText.empty())return;
+        const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(position)));
+        const float y=PixelToDip(static_cast<float>(GET_Y_LPARAM(position)));
+        if(layoutDirty)Rebuild();
+        const auto hit=layout.HitTest(x,y);const auto candidate=TooltipForNode(hit);
+        if(candidate.first!=tooltipOwner||candidate.second!=tooltipText){
+            UpdateTooltipTarget(hit);return;
+        }
+        POINT screenPoint{GET_X_LPARAM(position),GET_Y_LPARAM(position)};
+        ClientToScreen(hwnd,&screenPoint);
+        const UINT dpi=GetDpiForWindow(hwnd);
+        const int pointerOffset=std::max(1,GetSystemMetricsForDpi(SM_CYCURSOR,dpi)/2);
+        const POINT pointer=screenPoint;screenPoint.y+=pointerOffset;
+        tooltipTool.lpszText=const_cast<LPWSTR>(tooltipText.c_str());
+        SendMessageW(tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&tooltipTool));
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        const HMONITOR monitor=MonitorFromPoint(pointer,MONITOR_DEFAULTTONEAREST);
+        const bool hasMonitor=monitor&&GetMonitorInfoW(monitor,&monitorInfo);
+        SendMessageW(tooltip,TTM_TRACKPOSITION,0,MAKELPARAM(screenPoint.x,screenPoint.y));
+        SendMessageW(tooltip,TTM_TRACKACTIVATE,TRUE,reinterpret_cast<LPARAM>(&tooltipTool));
+        RECT tooltipBounds{};
+        if(hasMonitor&&GetWindowRect(tooltip,&tooltipBounds)){
+            const RECT& work=monitorInfo.rcWork;
+            const int tooltipWidth=tooltipBounds.right-tooltipBounds.left;
+            const int tooltipHeight=tooltipBounds.bottom-tooltipBounds.top;
+            screenPoint.x=std::max(work.left,std::min(screenPoint.x,work.right-tooltipWidth));
+            if(screenPoint.y+tooltipHeight>work.bottom)
+                screenPoint.y=pointer.y-pointerOffset-tooltipHeight;
+            screenPoint.y=std::max(work.top,std::min(screenPoint.y,work.bottom-tooltipHeight));
+            SendMessageW(tooltip,TTM_TRACKPOSITION,0,MAKELPARAM(screenPoint.x,screenPoint.y));
+        }
+        tooltipVisible=true;
+    }
     static void IncludeBounds(LayoutRect& bounds,bool& initialized,const LayoutRect& item){
         if(item.width<=0||item.height<=0)return;
         if(!initialized){bounds=item;initialized=true;return;}
@@ -355,6 +472,7 @@ struct View::Impl {
     bool Initialize(HWND parent,const RECT& bounds){
         auto instance=reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(parent,GWLP_HINSTANCE));if(!instance)instance=GetModuleHandleW(nullptr);if(!EnsureWindowClass(instance,kWindowClass,&Impl::WindowProc)){lastError=L"Failed to register TWebFrame window class";return false;}
         hwnd=CreateWindowExW(0,kWindowClass,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS|WS_CLIPCHILDREN,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,parent,nullptr,instance,this);if(!hwnd){lastError=L"Failed to create TWebFrame child window";return false;}
+        InitializeTooltip(instance);
         DragAcceptFiles(hwnd,TRUE);
         HRESULT hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,d2dFactory.ReleaseAndGetAddressOf());if(FAILED(hr)){lastError=L"D2D1CreateFactory failed";return false;}
         hr=DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf()));if(FAILED(hr)){lastError=L"DWriteCreateFactory failed";return false;}
@@ -373,6 +491,26 @@ struct View::Impl {
             if(node!=focused||!IsTextControl(node))return;editingNode=node;
             const auto length=node->Attribute(L"value").size();selectionAnchor=std::min(start,length);
             caretPosition=std::min(end,length);ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);
+        });
+        javascript.SetDomSelectionProvider([this](JavaScriptRuntime::DomSelection& selection){
+            if(!focused||!editingNode||(!IsTextControl(focused)&&!IsContentEditable(focused)))return false;
+            selection.anchorNode=editingNode;selection.anchorOffset=std::min(selectionAnchor,EditingValue().size());
+            selection.focusNode=editingNode;selection.focusOffset=std::min(caretPosition,EditingValue().size());
+            return true;
+        });
+        javascript.SetDomSelectionSetter([this](const JavaScriptRuntime::DomSelection& selection){
+            if(!selection.anchorNode||!selection.focusNode)return;
+            const auto root=IsTextControl(selection.anchorNode)?selection.anchorNode:EditableRoot(selection.anchorNode);
+            if(!root)return;
+            SetFocusedNode(root,true,true);
+            auto target=selection.anchorNode;
+            if(target->type!=NodeType::Text&&target!=root)target=EnsureEditableTextNode(target);
+            if(target==root&&IsContentEditable(root))target=EnsureEditableTextNode(root);
+            if(!target)return;
+            editingNode=target;const auto length=EditingValue().size();
+            selectionAnchor=std::min(selection.anchorOffset,length);
+            caretPosition=selection.focusNode==target?std::min(selection.focusOffset,length):selectionAnchor;
+            StoreControlSelection();ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);
         });
         javascript.SetFrameScheduler([this]{
             if(!SetTimer(hwnd,kAnimationFrameTimer,16,nullptr))
@@ -801,6 +939,10 @@ struct View::Impl {
         accessibilityTreeDirty=true;if(accessibility)accessibility->Invalidate();
         if(canTarget&&!layoutDirty&&hasDirtyBounds)InvalidateDipBounds(dirtyBounds);
         else InvalidateRect(hwnd,nullptr,FALSE);
+        if(hovered){
+            if(IsConnectedToDocument(hovered))UpdateTooltipTarget(hovered);
+            else UpdateTooltipTarget({});
+        }
         NotifyAccessibilityMutation(mutation);
     }
     void RestyleDocument(){
@@ -1127,6 +1269,58 @@ struct View::Impl {
             *dirtyBounds=dirty;*dirtyBoundsValid=true;
         }
         return layoutChanged;
+    }
+    JavaScriptRuntime::EventInit PointerEventAt(WPARAM keyState,float x,float y,
+                                                 int button=-1,int detail=0)const{
+        JavaScriptRuntime::EventInit event{};
+        event.clientX=x;event.clientY=y;event.pageX=x;event.pageY=y;
+        POINT screenPoint{DipToPixel(x),DipToPixel(y)};ClientToScreen(hwnd,&screenPoint);
+        const float scale=DpiScale();
+        event.screenX=static_cast<double>(screenPoint.x)/scale;
+        event.screenY=static_cast<double>(screenPoint.y)/scale;
+        event.button=button;event.detail=detail;
+        if(keyState&MK_LBUTTON)event.buttons|=1;
+        if(keyState&MK_RBUTTON)event.buttons|=2;
+        if(keyState&MK_MBUTTON)event.buttons|=4;
+        if(keyState&MK_XBUTTON1)event.buttons|=8;
+        if(keyState&MK_XBUTTON2)event.buttons|=16;
+        event.ctrlKey=(keyState&MK_CONTROL)!=0;
+        event.shiftKey=(keyState&MK_SHIFT)!=0;
+        event.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;
+        event.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||
+                      (GetKeyState(VK_RWIN)&0x8000)!=0;
+        return event;
+    }
+    static std::vector<std::shared_ptr<Node>> PointerPath(const std::shared_ptr<Node>& node){
+        std::vector<std::shared_ptr<Node>> path;
+        for(auto current=node;current;current=current->parent.lock())
+            if(current->type!=NodeType::Document)path.push_back(current);
+        return path;
+    }
+    void DispatchPointerTransition(const std::shared_ptr<Node>& previous,
+                                   const std::shared_ptr<Node>& next,
+                                   const JavaScriptRuntime::EventInit& base){
+        if(previous==next)return;
+        const auto previousPath=PointerPath(previous),nextPath=PointerPath(next);
+        size_t previousUnique=previousPath.size(),nextUnique=nextPath.size();
+        while(previousUnique&&nextUnique&&
+              previousPath[previousUnique-1]==nextPath[nextUnique-1]){
+            --previousUnique;--nextUnique;
+        }
+        if(previous){
+            auto out=base;out.relatedTarget=next;
+            javascript.DispatchNodeEvent(previous,L"pointerout",out);
+            out.bubbles=false;out.cancelable=false;
+            for(size_t index=0;index<previousUnique;++index)
+                javascript.DispatchNodeEvent(previousPath[index],L"pointerleave",out);
+        }
+        if(next){
+            auto over=base;over.relatedTarget=previous;
+            javascript.DispatchNodeEvent(next,L"pointerover",over);
+            over.bubbles=false;over.cancelable=false;
+            for(size_t index=nextUnique;index>0;--index)
+                javascript.DispatchNodeEvent(nextPath[index-1],L"pointerenter",over);
+        }
     }
     void SetFocusedNode(const std::shared_ptr<Node>& node,bool focusVisible=false,
                         bool openTextEditor=false){
@@ -1700,8 +1894,8 @@ struct View::Impl {
         case WM_SETFOCUS:textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();return 0;
         case WM_TIMER:if(wParam==kAnimationFrameTimer){KillTimer(hwnd,kAnimationFrameTimer);javascript.RunAnimationFrame();return 0;}if(wParam==kJavaScriptTimer){KillTimer(hwnd,kJavaScriptTimer);javascript.RunTimers();return 0;}if(wParam==kCssTransitionTimer){const auto now=std::chrono::steady_clock::now();const float elapsed=std::max(1.0f,std::chrono::duration<float,std::milli>(now-cssTransitionTick).count());cssTransitionTick=now;if(layoutDirty)Rebuild();const bool remains=layout.AdvanceTransitions(elapsed);UpdateFrameBounds();InvalidateRect(hwnd,nullptr,FALSE);if(!remains){KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;}return 0;}if(wParam==kCaretBlinkTimer){if(CanBlinkCaret()){caretVisible=!caretVisible;InvalidateCaret();}else StopCaretBlink();return 0;}break;
         case kAnimationFrameFallbackMessage:javascript.RunAnimationFrame();return 0;
-        case WM_SIZE:{const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
-        case WM_DPICHANGED:{const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+        case WM_SIZE:{HideTooltip();const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+        case WM_DPICHANGED:{HideTooltip();UpdateTooltipMetrics();const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
         case WM_DROPFILES:{
             const auto drop=reinterpret_cast<HDROP>(wParam);
             POINT point{};DragQueryPoint(drop,&point);
@@ -1723,6 +1917,7 @@ struct View::Impl {
             return 0;
         }
         case WM_LBUTTONDOWN:{
+            HideTooltip();
             POINT screenPoint{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ClientToScreen(hwnd,&screenPoint);
             const LRESULT resizeHit=ParentResizeHit(screenPoint);if(resizeHit>=HTLEFT&&resizeHit<=HTBOTTOMRIGHT){ReleaseCapture();PostMessageW(GetParent(hwnd),WM_NCLBUTTONDOWN,static_cast<WPARAM>(resizeHit),MAKELPARAM(static_cast<WORD>(screenPoint.x),static_cast<WORD>(screenPoint.y)));return 0;}
             const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();
@@ -1751,14 +1946,14 @@ struct View::Impl {
                 CloseSelectPopup();
             }
             if(layout.BeginScrollbarInteraction(x,y,scrollbarDragNode,scrollbarDragOffset,scrollbarDragHorizontal)){if(scrollbarDragNode)SetCapture(hwnd);else javascript.DispatchNodeEvent(layout.HitTest(x,y),L"scroll");if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);return 0;}
-            SetFocus(hwnd);auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=1;if(javascript.DispatchNodeEvent(target,L"pointerdown",pointer))return 0;Activate(target,x,y);
+            SetFocus(hwnd);auto target=layout.HitTest(x,y);auto pointer=PointerEventAt(wParam,x,y,0,1);if(javascript.DispatchNodeEvent(target,L"pointerdown",pointer))return 0;Activate(target,x,y);
             if(editingNode&&focused&&FocusTarget(target)==focused&&
                (IsTextControl(focused)||IsContentEditable(focused))){
                 textSelectionDragging=true;SetCapture(hwnd);
             }
             return 0;
         }
-        case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);JavaScriptRuntime::EventInit pointer{};pointer.button=0;pointer.detail=2;javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
+        case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);auto pointer=PointerEventAt(wParam,x,y,0,2);javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
         case WM_LBUTTONUP:
             if(selectPopupScrollDragging){selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
             if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
@@ -1769,14 +1964,16 @@ struct View::Impl {
                 if(GetCapture()==hwnd)ReleaseCapture();return 0;
             }
             break;
-        case WM_CAPTURECHANGED:textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;return 0;
+        case WM_CAPTURECHANGED:HideTooltip();textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;return 0;
         case WM_MOUSEWHEEL:{
+            HideTooltip();
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
             if(openSelectPopup){SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y)){ScrollSelectPopup(-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/WHEEL_DELTA*popup.rowHeight*3.0f);return 0;}CloseSelectPopup();}
             std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
         case WM_MOUSEHWHEEL:{
+            HideTooltip();
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
             std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled,true)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
@@ -1784,22 +1981,34 @@ struct View::Impl {
         case WM_MOUSEMOVE:{
             if(!trackingMouseLeave){TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};trackingMouseLeave=TrackMouseEvent(&tracking)!=FALSE;}
             const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));
-            if(selectPopupScrollDragging){SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)){
+            if(selectPopupScrollDragging){HideTooltip();SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)){
                 const float thumbHeight=std::max(20.0f,popup.viewportHeight*popup.viewportHeight/popup.contentHeight);
                 const float travel=std::max(0.0f,popup.viewportHeight-thumbHeight),maximum=std::max(0.0f,popup.contentHeight-popup.viewportHeight);
                 const float thumbTop=std::max(0.0f,std::min(travel,y-(popup.bounds.y+popup.borderWidth)-selectPopupScrollDragOffset));
                 const float previous=selectPopupScrollOffset;selectPopupScrollOffset=travel>0?thumbTop/travel*maximum:0;
                 if(std::abs(previous-selectPopupScrollOffset)>0.01f)InvalidateRect(hwnd,nullptr,FALSE);
             }return 0;}
-            if(scrollbarDragNode){if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
-            if(textSelectionDragging){UpdateTextSelectionAt(x,y);return 0;}
-            if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y))return 0;}
-            auto n=layout.HitTest(x,y);if(n!=hovered){LayoutRect dirty{};bool targeted=false;layoutDirty=SetHoveredNode(n,&dirty,&targeted);if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+            if(scrollbarDragNode){HideTooltip();if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
+            if(textSelectionDragging){HideTooltip();UpdateTextSelectionAt(x,y);return 0;}
+            if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y)){HideTooltip();return 0;}}
+            auto n=layout.HitTest(x,y);UpdateTooltipTarget(n);
+            auto pointer=PointerEventAt(wParam,x,y);if(hasPointerPosition){pointer.movementX=x-pointerX;pointer.movementY=y-pointerY;}
+            const auto previous=hovered;LayoutRect dirty{};bool targeted=false;
+            if(n!=previous){const bool hoverLayoutChanged=SetHoveredNode(n,&dirty,&targeted);layoutDirty=layoutDirty||hoverLayoutChanged;DispatchPointerTransition(previous,n,pointer);}
+            if(n)javascript.DispatchNodeEvent(n,L"pointermove",pointer);
+            pointerX=x;pointerY=y;hasPointerPosition=true;
+            if(n!=previous){if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
-        case WM_MOUSELEAVE:trackingMouseLeave=false;if(hovered){LayoutRect dirty{};bool targeted=false;layoutDirty=SetHoveredNode({},&dirty,&targeted);if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+        case WM_MOUSEHOVER:ShowTooltipAt(lParam);return 0;
+        case WM_MOUSELEAVE:{trackingMouseLeave=false;HideTooltip();const auto previous=hovered;if(previous){
+            auto pointer=PointerEventAt(0,pointerX,pointerY);LayoutRect dirty{};bool targeted=false;
+            const bool hoverLayoutChanged=SetHoveredNode({},&dirty,&targeted);layoutDirty=layoutDirty||hoverLayoutChanged;
+            DispatchPointerTransition(previous,{},pointer);
+            if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);
+        }hasPointerPosition=false;return 0;}
         case WM_GETDLGCODE:return DLGC_WANTTAB|DLGC_WANTARROWS|
             ((CanEditText()||focused&&focused->tag==L"select")?DLGC_WANTCHARS:0);
-        case WM_KEYDOWN:{JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
+        case WM_KEYDOWN:{HideTooltip();JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
         if(textInput.IsComposing())break;
         if(openSelectPopup){
             if(wParam==VK_ESCAPE||wParam==VK_F4){CloseSelectPopup();return 0;}
@@ -1844,13 +2053,13 @@ struct View::Impl {
         case WM_UNDO:ApplyHistory(false);return 0;
         case WM_CHAR:if(textInput.IsComposing())return 0;else if(CanEditText()){if(wParam==VK_BACK)Backspace();else if(wParam==L'\r'){if(!IsTextInput(focused))ReplaceSelection(L"\n",L"insertLineBreak");}else if(wParam>=32&&wParam!=127)ReplaceSelection(std::wstring(1,static_cast<wchar_t>(wParam)));return 0;}break;
         case WM_UNICHAR:if(wParam==UNICODE_NOCHAR)return TRUE;else if(CanEditText()&&wParam>=32&&wParam<=0x10ffff){std::wstring text;if(wParam<=0xffff)text.push_back(static_cast<wchar_t>(wParam));else{const auto value=static_cast<unsigned>(wParam)-0x10000;text.push_back(static_cast<wchar_t>(0xd800+(value>>10)));text.push_back(static_cast<wchar_t>(0xdc00+(value&0x3ff)));}ReplaceSelection(text);return 0;}break;
-        case WM_KILLFOCUS:textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();InvalidateRect(hwnd,nullptr,FALSE);return 0;
+        case WM_KILLFOCUS:HideTooltip();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();InvalidateRect(hwnd,nullptr,FALSE);return 0;
         case WM_SETCURSOR:{POINT screenPoint{};GetCursorPos(&screenPoint);const LRESULT parentHit=ParentResizeHit(screenPoint);if(const HCURSOR resize=ResizeCursor(parentHit)){SetCursor(resize);return TRUE;}const UINT hit=LOWORD(lParam);
             if(const HCURSOR resize=ResizeCursor(hit)){SetCursor(resize);return TRUE;}
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
-        case WM_DESTROY:KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
+        case WM_DESTROY:HideTooltip();if(tooltip){DestroyWindow(tooltip);tooltip=nullptr;}if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
-        lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        HideTooltip();lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();hasPointerPosition=false;pointerX=pointerY=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();
         for(const auto& link:document.QuerySelectorAll(L"link[rel='stylesheet']")){
             std::wstring external;if(LoadTextResource(link->Attribute(L"href"),external))css+=external+L"\n";
@@ -1905,7 +2114,7 @@ View::~View(){
 std::unique_ptr<View> View::Create(HWND parent,const RECT& bounds){auto impl=std::make_unique<Impl>();if(!impl->Initialize(parent,bounds))return {};return std::unique_ptr<View>(new View(std::move(impl)));}
 HWND View::Window()const noexcept{return impl_->hwnd;}
 void View::SetBounds(const RECT& bounds){MoveWindow(impl_->hwnd,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,TRUE);}
-void View::SetVisible(bool visible){ShowWindow(impl_->hwnd,visible?SW_SHOW:SW_HIDE);}
+void View::SetVisible(bool visible){if(!visible)impl_->HideTooltip();ShowWindow(impl_->hwnd,visible?SW_SHOW:SW_HIDE);}
 void View::SetMessageHandler(MessageHandler handler){impl_->messageHandler=std::move(handler);}
 void View::SetLoadHandler(LoadHandler handler){impl_->loadHandler=std::move(handler);}
 void View::SetResourceLoader(ResourceLoader loader){impl_->resourceLoader=std::move(loader);}

@@ -27,17 +27,37 @@ public:
     using FocusSink = std::function<void(const std::shared_ptr<Node>&)>;
     using SelectionProvider = std::function<bool(const std::shared_ptr<Node>&, size_t&, size_t&)>;
     using SelectionSetter = std::function<void(const std::shared_ptr<Node>&, size_t, size_t)>;
+    struct DomSelection {
+        std::shared_ptr<Node> anchorNode;
+        size_t anchorOffset = 0;
+        std::shared_ptr<Node> focusNode;
+        size_t focusOffset = 0;
+    };
+    using DomSelectionProvider = std::function<bool(DomSelection&)>;
+    using DomSelectionSetter = std::function<void(const DomSelection&)>;
     struct EventInit {
         std::wstring key;
         std::wstring data;
         std::wstring inputType;
+        std::shared_ptr<Node> relatedTarget;
+        double clientX = 0;
+        double clientY = 0;
+        double pageX = 0;
+        double pageY = 0;
+        double screenX = 0;
+        double screenY = 0;
+        double movementX = 0;
+        double movementY = 0;
         int button = 0;
+        int buttons = 0;
         int detail = 0;
         bool ctrlKey = false;
         bool shiftKey = false;
         bool altKey = false;
         bool metaKey = false;
         bool isComposing = false;
+        bool bubbles = true;
+        bool cancelable = true;
     };
     struct NodeGeometry {
         double x=0,y=0,width=0,height=0;
@@ -65,6 +85,8 @@ public:
     void SetFocusSink(FocusSink sink);
     void SetSelectionProvider(SelectionProvider provider);
     void SetSelectionSetter(SelectionSetter setter);
+    void SetDomSelectionProvider(DomSelectionProvider provider);
+    void SetDomSelectionSetter(DomSelectionSetter setter);
     void SetViewportSize(double width, double height);
     void SetDevicePixelRatio(double ratio);
     void SetLocation(const std::wstring& location);

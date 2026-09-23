@@ -2,6 +2,25 @@
 
 This document records user-visible changes cumulatively by released version. Add each new release above the previous entries.
 
+## 0.8 - 2026-09-23
+
+### Added
+
+- Added shared pointer transition events with CSS-pixel coordinates, related targets, and 100%/150% DPI regression coverage.
+- Added DOM range and selection support plus `document.execCommand('insertHTML')` for block-aware editable HTML insertion.
+- Added native title tooltips and focused pointer, editing-command, and tooltip regression projects under `TWebFrame/tests`.
+
+### Improved
+
+- Extended the common JavaScript runtime with `Number.isInteger()` and Unicode Letter property escapes used by multilingual regular expressions.
+- Made array/string index parsing and numeric conversion exception-free during normal JavaScript property access and conversion.
+
+### Fixed
+
+- Preserved JavaScript-triggered layout invalidation across hover transitions and kept pointer hit testing DPI-independent.
+- Fixed editable table insertion at stored selections, including empty editors, paragraph splitting, and a trailing editable paragraph.
+- Prevented supported Unicode property expressions from raising first-chance `std::regex_error` exceptions.
+
 ## 0.7 - 2026-09-23
 
 ### Added
