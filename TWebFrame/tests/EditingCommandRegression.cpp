@@ -47,6 +47,27 @@ bool ScriptPoint(TWebFrame::View& view, const wchar_t* id, float& x, float& y) {
     }
 }
 
+bool ScriptSelectorPoint(TWebFrame::View& view, const wchar_t* selector,
+                         float& x, float& y) {
+    std::wstring result, error;
+    const std::wstring script =
+        L"const r=document.querySelector('" + std::wstring(selector) +
+        L"').getBoundingClientRect();return (r.x+r.width/2)+','+(r.y+r.height/2);";
+    if (!view.ExecuteScript(script, &result, &error)) {
+        std::wcerr << error << L'\n';
+        return false;
+    }
+    const auto comma = result.find(L',');
+    if (comma == std::wstring::npos) return false;
+    try {
+        x = std::stof(result.substr(0, comma));
+        y = std::stof(result.substr(comma + 1));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void Click(TWebFrame::View& view, const wchar_t* id, float scale) {
     float x = 0, y = 0;
     Check(ScriptPoint(view, id, x, y), L"a generic DOM target exposes click geometry");
@@ -54,6 +75,41 @@ void Click(TWebFrame::View& view, const wchar_t* id, float scale) {
                                     static_cast<int>(std::lround(y * scale)));
     SendMessageW(view.Window(), WM_LBUTTONDOWN, MK_LBUTTON, point);
     SendMessageW(view.Window(), WM_LBUTTONUP, 0, point);
+}
+
+void ClickSelector(TWebFrame::View& view, const wchar_t* selector, float scale) {
+    float x = 0, y = 0;
+    Check(ScriptSelectorPoint(view, selector, x, y),
+          L"a generic selector target exposes click geometry");
+    const LPARAM point = MAKELPARAM(static_cast<int>(std::lround(x * scale)),
+                                    static_cast<int>(std::lround(y * scale)));
+    SendMessageW(view.Window(), WM_LBUTTONDOWN, MK_LBUTTON, point);
+    SendMessageW(view.Window(), WM_LBUTTONUP, 0, point);
+}
+
+void DragSelectorText(TWebFrame::View& view, const wchar_t* selector,
+                      float startInset, float endInset, float scale) {
+    std::wstring result, error;
+    const std::wstring script =
+        L"const r=document.querySelector('" + std::wstring(selector) +
+        L"').getBoundingClientRect();return (r.x+" + std::to_wstring(startInset) +
+        L")+','+(r.x+" + std::to_wstring(endInset) +
+        L")+','+(r.y+r.height/2);";
+    Check(view.ExecuteScript(script, &result, &error),
+          L"a generic editable run exposes drag geometry");
+    const auto first=result.find(L','),second=result.find(L',',first+1);
+    if(first==std::wstring::npos||second==std::wstring::npos)return;
+    try{
+        const auto physical=[scale](const std::wstring& value){
+            return static_cast<int>(std::lround(std::stof(value)*scale));
+        };
+        const int startX=physical(result.substr(0,first));
+        const int endX=physical(result.substr(first+1,second-first-1));
+        const int y=physical(result.substr(second+1));
+        SendMessageW(view.Window(),WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(startX,y));
+        SendMessageW(view.Window(),WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(endX,y));
+        SendMessageW(view.Window(),WM_LBUTTONUP,0,MAKELPARAM(endX,y));
+    }catch(...){Check(false,L"editable drag geometry uses numeric CSS coordinates");}
 }
 
 UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
@@ -82,6 +138,11 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
                     * { box-sizing: border-box; margin: 0; padding: 0; }
                     #editor { display: block; width: 320px; height: 80px; padding: 10px; font: 16px/24px "Segoe UI"; }
                     #editor pre { padding: 10px 12px; background: #162033; }
+                    #editor table { width: 100%; border-collapse: collapse; }
+                    #editor th, #editor td { height: 28px; padding: 4px; border: 1px solid #ccd2da; }
+                    #editor th.is-active-cell, #editor td.is-active-cell {
+                      box-shadow: inset 0 0 0 2px #ff694a; background: #fff0ec;
+                    }
                     #picker { position: absolute; left: 8px; top: 96px; width: 150px; }
                     button { display: block; width: 140px; height: 32px; }
                     #menu { position: absolute; left: 0; top: 32px; width: 140px; }
@@ -101,6 +162,16 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
                     const selection = window.getSelection();
                     if (selection && selection.rangeCount) remembered = selection.getRangeAt(0).cloneRange();
                   }
+                  document.getElementById('editor').addEventListener('mouseup', () => {
+                    const editor = document.getElementById('editor');
+                    editor.querySelectorAll('.is-active-cell').forEach(cell =>
+                      cell.classList.remove('is-active-cell'));
+                    const selection = window.getSelection();
+                    let node = selection && selection.rangeCount ? selection.anchorNode : null;
+                    if (node && !node.tagName) node = node.parentElement;
+                    const cell = node?.closest?.('th, td');
+                    if (cell && editor.contains(cell)) cell.classList.add('is-active-cell');
+                  });
                   document.querySelectorAll('#picker button').forEach(button =>
                     button.addEventListener('pointerdown', rememberSelection));
                   document.getElementById('open').addEventListener('click', () => {
@@ -240,6 +311,24 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
             Check(message.find(L"<table><thead><tr><th>Column 1</th><th>Column 2</th>")!=
                       std::wstring::npos,
                   L"insertHTML preserves the table fragment structure and cell content");
+            ClickSelector(*view, L"tbody td", scale);
+            const bool selectedEmptyCell=view->ExecuteScript(
+                      L"const cell=document.querySelector('tbody td');const s=getSelection();"
+                      L"return (s.anchorNode===cell)+'|'+s.anchorOffset+'|' +"
+                      L"cell.classList.contains('is-active-cell')+'|' +"
+                      L"getComputedStyle(cell).boxShadow;",
+                      &result, &error) && result.find(L"true|0|true|")==0 &&
+                      result.find(L"#ff694a")!=std::wstring::npos;
+            if(!selectedEmptyCell)std::wcerr<<L"empty cell selection state: "<<result<<L'\n';
+            Check(selectedEmptyCell,
+                  L"clicking an empty body cell exposes its DOM boundary and applies the shared active-cell style");
+            SendMessageW(view->Window(), WM_CHAR, static_cast<WPARAM>(L'B'), 1);
+            Check(view->ExecuteScript(
+                      L"const cell=document.querySelector('tbody td');const s=getSelection();"
+                      L"return cell.textContent+'|'+(cell.querySelector('br')===null)+'|' +"
+                      L"(s.anchorNode.parentElement===cell)+'|'+s.anchorOffset;",
+                      &result, &error) && result==L"B|true|true|1",
+                  L"typing in an empty body cell replaces its placeholder break and keeps the caret in that cell");
 
             Check(view->ExecuteScript(
                       L"const editor=document.getElementById('editor');editor.innerHTML='';"
@@ -260,6 +349,138 @@ UINT CheckFormatBlockAtDpi(DPI_AWARENESS_CONTEXT context) {
             UpdateWindow(view->Window());
             Check(InterlockedCompareExchange(&firstChanceCppExceptions, 0, 0) == 0,
                   L"successful editing commands do not use C++ exceptions for normal dispatch");
+
+            const wchar_t* inlineFormattingHtml=LR"HTML(
+                <style>
+                  * { box-sizing: border-box; margin: 0; padding: 0; }
+                  #format-editor { display: block; width: 320px; height: 48px; padding: 10px;
+                                   font: 20px/28px Consolas; border: 1px solid #88909a; }
+                  #bold-button { position: absolute; left: 8px; top: 70px; width: 44px; height: 30px; }
+                </style>
+                <article id="format-editor" contenteditable="true"></article>
+                <button id="bold-button" type="button">B</button>
+                <script>
+                  const formatEditor = document.getElementById('format-editor');
+                  const boldButton = document.getElementById('bold-button');
+                  let savedFormattingRange = null;
+                  boldButton.addEventListener('pointerdown', () => {
+                    const selection = getSelection();
+                    if (selection && selection.rangeCount)
+                      savedFormattingRange = selection.getRangeAt(0).cloneRange();
+                  });
+                  boldButton.addEventListener('click', () => {
+                    formatEditor.focus();
+                    if (savedFormattingRange) {
+                      const selection = getSelection();
+                      selection.removeAllRanges();
+                      selection.addRange(savedFormattingRange);
+                    }
+                    window.boldCommandResult = document.execCommand('bold', false);
+                  });
+                </script>
+            )HTML";
+            Check(view->NavigateToString(inlineFormattingHtml),
+                  L"generic inline-formatting fixture loads");
+            Click(*view,L"format-editor",scale);
+            for(const auto character:std::wstring(L"Formatting sample"))
+                SendMessageW(view->Window(),WM_CHAR,static_cast<WPARAM>(character),1);
+            DragSelectorText(*view,L"#format-editor",11.0f,95.0f,scale);
+            std::wstring draggedText;
+            Check(view->ExecuteScript(L"return getSelection().toString();",&draggedText,&error)&&
+                      !draggedText.empty(),
+                  L"mouse dragging selects entered contenteditable text");
+            Click(*view,L"bold-button",scale);
+            std::wstring boldState;
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('format-editor');"
+                      L"const strong=editor.querySelector('strong, b');"
+                      L"return window.boldCommandResult+'|'+(strong?strong.textContent:'')+'|' +"
+                      L"editor.textContent+'|'+document.queryCommandState('bold')+'|' +"
+                      L"(strong?getComputedStyle(strong).fontWeight:'');",
+                      &boldState,&error)&&
+                      boldState==L"true|"+draggedText+L"|Formatting sample|true|700",
+                  L"the shared bold command formats a dragged DOM range and retains its selection at 100 and 150 percent DPI");
+
+            const wchar_t* undoHistoryHtml=LR"HTML(
+                <style>
+                  * { box-sizing: border-box; margin: 0; padding: 0; }
+                  #history-editor { display: block; width: 320px; min-height: 48px; padding: 10px;
+                                    font: 20px/28px Consolas; border: 1px solid #88909a; }
+                  #undo-button { position: absolute; left: 8px; top: 70px; width: 80px; height: 30px; }
+                </style>
+                <article id="history-editor" contenteditable="true"></article>
+                <button id="undo-button" type="button" disabled>Undo</button>
+                <script>
+                  const historyEditor = document.getElementById('history-editor');
+                  const undoButton = document.getElementById('undo-button');
+                  const undoHistory = [];
+                  const redoHistory = [];
+                  // Document loads commonly clear existing stacks this way.
+                  // The next push must update the same observable length.
+                  undoHistory.length = 0;
+                  redoHistory.length = 0;
+                  function selectionOffsets() {
+                    const selection = getSelection();
+                    if (!selection?.rangeCount) return null;
+                    const selected = selection.getRangeAt(0);
+                    if (!historyEditor.contains(selected.startContainer) ||
+                        !historyEditor.contains(selected.endContainer)) return null;
+                    const prefix = document.createRange();
+                    prefix.setStart(historyEditor, 0);
+                    prefix.setEnd(selected.startContainer, selected.startOffset);
+                    return { start: prefix.toString().length, end: prefix.toString().length };
+                  }
+                  function snapshot() {
+                    const clone = historyEditor.cloneNode(true);
+                    const boxes = [...historyEditor.querySelectorAll('input[type="checkbox"]')];
+                    [...clone.querySelectorAll('input[type="checkbox"]')].forEach((box, index) =>
+                      box.toggleAttribute('checked', Boolean(boxes[index]?.checked)));
+                    return { text: historyEditor.textContent, html: clone.innerHTML,
+                             selection: selectionOffsets() };
+                  }
+                  function same(left, right) {
+                    return Boolean(left && right) && left.text === right.text;
+                  }
+                  function updateUndoButton() {
+                    document.queryCommandState('bold');
+                    undoButton.disabled = undoHistory.length === 0;
+                  }
+                  historyEditor.addEventListener('beforeinput', event => {
+                    historyEditor.dataset.before = event.inputType + '|' + event.isTrusted;
+                    const saved = snapshot();
+                    if (!same(undoHistory.at(-1), saved)) undoHistory.push(saved);
+                    redoHistory.length = 0;
+                  });
+                  historyEditor.addEventListener('input', event => {
+                    historyEditor.dataset.input = event.inputType + '|' + event.isTrusted;
+                    updateUndoButton();
+                  });
+                  undoButton.addEventListener('click', () => {
+                    const saved = undoHistory.pop();
+                    if (saved) historyEditor.innerHTML = saved.html;
+                    updateUndoButton();
+                  });
+                </script>
+            )HTML";
+            Check(view->NavigateToString(undoHistoryHtml),
+                  L"generic beforeinput undo-history fixture loads");
+            Click(*view,L"history-editor",scale);
+            SendMessageW(view->Window(),WM_CHAR,static_cast<WPARAM>(L'U'),1);
+            std::wstring undoState;
+            Check(view->ExecuteScript(
+                      L"const editor=document.getElementById('history-editor');"
+                      L"const undo=document.getElementById('undo-button');"
+                      L"return editor.textContent+'|'+editor.dataset.before+'|' +"
+                      L"editor.dataset.input+'|'+undo.disabled+'|'+undoHistory.length;",
+                      &undoState,&error)&&undoState==L"U|insertText|true|insertText|true|false|1",
+                  L"trusted text input records its pre-edit DOM snapshot and enables a generic undo button at 100 and 150 percent DPI");
+            Click(*view,L"undo-button",scale);
+            Check(view->ExecuteScript(
+                      L"return document.getElementById('history-editor').textContent+'|' +"
+                      L"document.getElementById('undo-button').disabled+'|'+undoHistory.length;",
+                      &undoState,&error)&&undoState==L"|true|0",
+                  L"clicking the enabled generic undo button restores the pre-edit DOM snapshot");
+
         }
         DestroyWindow(host);
     }

@@ -7,11 +7,15 @@
 #include <dwrite_1.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace TWebFrame::Internal {
+
+struct RasterImageFrame;
+struct RasterImage;
 
 struct LayoutRect {
     float x = 0, y = 0, width = 0, height = 0;
@@ -78,8 +82,11 @@ struct StyleTransition {
 
 class LayoutEngine {
 public:
+    using RasterImageResolver = std::function<std::shared_ptr<RasterImage>(const std::wstring&)>;
+
     LayoutEngine(Document& document, StyleSheet& styleSheet);
     ~LayoutEngine();
+    void SetRasterImageResolver(RasterImageResolver resolver);
     void Layout(float width, float height, float deviceScale = 1.0f);
     // Reuse the current style/layout tree for viewport-only changes. A media
     // query boundary crossing automatically falls back to a full rebuild.
@@ -101,6 +108,10 @@ public:
     std::shared_ptr<Node> HitTest(float x, float y) const;
     bool HitTestText(const std::shared_ptr<Node>& scope, float x, float y,
                      std::shared_ptr<Node>& textNode, size_t& textOffset);
+    bool VerticalCaretPosition(const std::shared_ptr<Node>& scope,
+                               const std::shared_ptr<Node>& currentNode,
+                               size_t currentOffset, float preferredX, bool upward,
+                               std::shared_ptr<Node>& targetNode, size_t& targetOffset);
     bool TextCaretRect(const std::shared_ptr<Node>& textNode, size_t textOffset,
                        LayoutRect& caretRect);
     std::wstring DumpJson() const;
@@ -110,6 +121,7 @@ public:
     bool HasActiveTransitions() const;
     bool AdvanceTransitions(float milliseconds);
     void ClearTransitions();
+    void DiscardDeviceResources();
 
 private:
     std::unique_ptr<LayoutBox> Build(const std::shared_ptr<Node>& node,
@@ -126,8 +138,11 @@ private:
     void LayoutTable(LayoutBox& box);
     void UpdateTraversalMetadata(LayoutBox& box);
     void UpdateStackingContexts(LayoutBox& scope);
+    void UpdateTopLayer();
     void PaintStackingContext(ID2D1RenderTarget* target, IDWriteFactory* factory,
                               LayoutBox& box, const LayoutRect& clipBounds);
+    void PaintDialogBackdrop(ID2D1RenderTarget* target, const LayoutBox& dialog,
+                             const LayoutRect& clipBounds);
     void PaintBox(ID2D1RenderTarget* target, IDWriteFactory* factory, LayoutBox& box,
                   const LayoutRect& clipBounds,
                   const std::vector<LayoutBox*>* deferredContexts = nullptr);
@@ -158,6 +173,9 @@ private:
     float viewportWidth_ = 0;
     float viewportHeight_ = 0;
     float deviceScale_ = 1.0f;
+    std::vector<LayoutBox*> modalBoxes_;
+    const LayoutBox* paintingTopLayer_ = nullptr;
+    const LayoutBox* canvasBackgroundBox_ = nullptr;
     ID2D1RenderTarget* brushCacheTarget_ = nullptr;
     FastMap<unsigned int, Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>> brushCache_;
     ID2D1Factory* geometryFactory_ = nullptr;
@@ -166,6 +184,11 @@ private:
     Microsoft::WRL::ComPtr<ID2D1PathGeometry> horizontalArrowGeometry_;
     FastMap<std::wstring, Microsoft::WRL::ComPtr<ID2D1PathGeometry>> svgGeometryCache_;
     FastMap<std::wstring, std::shared_ptr<Node>> svgBackgroundCache_;
+    RasterImageResolver rasterImageResolver_;
+    ID2D1RenderTarget* imageBitmapCacheTarget_ = nullptr;
+    FastMap<const RasterImageFrame*, Microsoft::WRL::ComPtr<ID2D1Bitmap>> imageBitmapCache_;
+    ID2D1RenderTarget* shadowBitmapCacheTarget_ = nullptr;
+    FastMap<std::wstring, Microsoft::WRL::ComPtr<ID2D1Bitmap>> shadowBitmapCache_;
 };
 
 } // namespace TWebFrame::Internal

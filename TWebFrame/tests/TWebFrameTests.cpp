@@ -436,6 +436,15 @@ int wmain(int argc,wchar_t** argv) {
     eventJs.DispatchNodeEvent(eventDoc.GetElementById(L"event-button"),L"keydown",keyInit);
     Check(eventJs.Execute(L"return eventLog;",&eventResult,&error),error.c_str());
     Check(eventResult==L"0:2|b:true:true",L"pointer and keyboard metadata bubble with propagation controls");
+    bool nativePointerCaptured=false;eventJs.SetPointerCaptureSink([&](bool captured){nativePointerCaptured=captured;});
+    Check(eventJs.Execute(L"b.addEventListener('pointerdown',event=>b.setPointerCapture(event.pointerId),{once:true});",nullptr,&error),error.c_str());
+    eventJs.DispatchNodeEvent(eventDoc.GetElementById(L"event-button"),L"pointerdown",pointerInit);
+    Check(nativePointerCaptured&&eventJs.CapturedPointerTarget()==eventDoc.GetElementById(L"event-button")&&
+          eventJs.Execute(L"return b.hasPointerCapture(1);",&eventResult,&error)&&eventResult==L"true",
+          L"pointer capture routes through the common DOM and native capture bridge");
+    Check(eventJs.Execute(L"b.releasePointerCapture(1);return b.hasPointerCapture(1);",&eventResult,&error)&&
+          eventResult==L"false"&&!nativePointerCaptured&&!eventJs.CapturedPointerTarget(),
+          L"releasing pointer capture clears both DOM and native capture state");
     Check(!eventJs.DispatchNodeEvent(eventDoc.GetElementById(L"compat-button"),L"pointerdown",pointerInit),
           L"an uncanceled pointer press keeps its native default action");
     Check(eventJs.Execute(L"return compatLog;",&eventResult,&error)&&eventResult==L"pointer:0:2|mouse:0:2",
@@ -464,6 +473,23 @@ int wmain(int argc,wchar_t** argv) {
         &semanticsResult,&error),error.c_str());
     Check(semanticsResult==L"one|two|three|alpha|beta|gamma|a|b|12|34|0|abc|null",
           L"Array slice and String split and match apply reusable collection and regular-expression semantics");
+    Check(semanticsJs.Execute(
+        L"const matches=[...String('**bold** and `code`').matchAll(/(\\*\\*[^*]+\\*\\*)|(`[^`]+`)/g)];"
+        L"const frozen=Object.freeze({alpha:1});const filled=Array(3).fill('x').join('');"
+        L"return Object.hasOwn(frozen,'alpha')+'|'+filled+'|'+[1,3,2,3].findLastIndex(value=>value===3)+'|'+'  value'.trimStart()+'|'+'suffix'.endsWith('fix')+'|'+'ab'.repeat(2)+'|'+'\\nalpha'.lastIndexOf('\\n',-1)+'|'+matches.length+'|'+matches[1].index+'|'+encodeURIComponent(decodeURIComponent('a%20b%2Fc'))+'|'+parseFloat('12.5px');",
+        &semanticsResult,&error),error.c_str());
+    Check(semanticsResult==L"true|xxx|3|value|true|abab|0|2|13|a%20b%2Fc|12.5",
+          L"MdViewer modern Object, Array and String helpers preserve browser semantics");
+    Check(semanticsJs.Execute(
+        L"const documentHistory=[{text:'stale'}];documentHistory.length=0;"
+        L"const appendedLength=documentHistory.push({text:'current'});"
+        L"documentHistory.length=3;const expandedSlot=documentHistory[2]===undefined;"
+        L"documentHistory.length=1;let invalidLength=false;"
+        L"try{documentHistory.length=-1;}catch(error){invalidLength=error.name==='RangeError';}"
+        L"return appendedLength+'|'+documentHistory.length+'|'+documentHistory[0].text+'|'+expandedSlot+'|'+invalidLength;",
+        &semanticsResult,&error),error.c_str());
+    Check(semanticsResult==L"1|1|current|true|true",
+          L"Array length assignment clears, expands and truncates shared JavaScript history stacks");
     Check(eventJs.Execute(L"let intervalRuns=0;const intervalId=setInterval(()=>{intervalRuns++;if(intervalRuns===2)clearInterval(intervalId);},0);",nullptr,&error),error.c_str());
     eventJs.RunTimers();eventJs.RunTimers();eventJs.RunTimers();
     Check(eventJs.Execute(L"return intervalRuns;",&eventResult,&error)&&eventResult==L"2",
@@ -478,12 +504,43 @@ int wmain(int argc,wchar_t** argv) {
     Check(modernDomJs.Execute(L"return opened+'|'+dialog.open+'|'+dialog.returnValue+'|'+submitted+'|'+closed+'|'+direct;",&modernDomResult,&error),error.c_str());
     Check(modernDomResult==L"true|false|accepted|true|true|1",
           L"dialog, form submission and scoped selectors use reusable DOM behavior");
+    Document appDomDoc;Check(appDomDoc.Parse(
+        L"<div id='root'><span id='replace' class='alpha beta'>ab</span><em>cd</em></div>"
+        L"<input id='source' value='abcdef'><button id='activate'>go</button>"
+        L"<table id='table'><thead><tr><th>H</th></tr></thead><tbody><tr><td>A</td></tr></tbody></table>",
+        &error),L"MdViewer DOM compatibility fixture parses");
+    JavaScriptRuntime appDomJs(appDomDoc);std::wstring appDomResult;
+    Check(appDomJs.Execute(
+        L"const root=document.getElementById('root');const replaced=document.getElementById('replace');"
+        L"replaced.classList.remove('alpha');const classCount=replaced.classList.length;"
+        L"const fragment=document.createDocumentFragment();fragment.append(document.createTextNode('X'),document.createTextNode('Y'));replaced.replaceWith(fragment);root.normalize();"
+        L"const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let walked='',text;while(text=walker.nextNode())walked+=text.nodeValue+':'+text.length+';';"
+        L"const contents=document.createRange();contents.selectNodeContents(root);const selected=contents.toString();"
+        L"const edit=document.createRange();edit.setStart(root.firstChild,1);edit.setEnd(root.firstChild,2);edit.deleteContents();const inserted=document.createTextNode('Z');edit.insertNode(inserted);edit.setStartAfter(inserted);edit.collapse(true);"
+        L"const source=document.getElementById('source');source.setRangeText('ZZ',1,3,'select');source.setSelectionRange(1,3,'backward');const editedValue=source.value,selectionState=source.selectionStart+'-'+source.selectionEnd+'-'+source.selectionDirection;source.contentEditable='false';source.required=true;const missingBefore=source.reportValidity();source.value='';const missingAfter=source.reportValidity();source.setCustomValidity('bad');const customError=source.reportValidity();source.setCustomValidity('');"
+        L"let clicks=0;const activate=document.getElementById('activate');activate.addEventListener('click',()=>clicks++);activate.click();"
+        L"const table=document.getElementById('table').cloneNode(true);const body=table.tBodies[0];const row=body.insertRow(0);row.insertCell().append(document.createElement('br'));body.deleteRow(1);row.insertCell().textContent='B';row.deleteCell(0);"
+        L"return classCount+'|'+fragment.nodeType+'|'+walked+'|'+selected+'|'+root.textContent+'|'+editedValue+'|'+selectionState+'|'+source.contentEditable+'|'+missingBefore+'-'+missingAfter+'-'+customError+'|'+clicks+'|'+table.rows.length+'-'+body.rows.length+'-'+row.cells.length;",
+        &appDomResult,&error),error.c_str());
+    Check(appDomResult==L"1|11|XY:2;cd:2;|XYcd|XZcd|aZZdef|1-3-backward|false|true-false-false|1|2-1-1",
+          L"tree walking, fragments, ranges, form controls, activation and table DOM APIs compose for MdViewer editing");
     Document dialogDisplayDoc;Check(dialogDisplayDoc.Parse(L"<body><dialog id='closed' class='modal'></dialog><dialog id='opened' class='modal' open></dialog><div id='hidden' hidden></div></body>",&error),L"dialog display fixture parses");
     StyleSheet dialogDisplayCss;Check(dialogDisplayCss.Parse(L".modal{width:300px}",&error),L"dialog display CSS parses");
     LayoutEngine dialogDisplayLayout(dialogDisplayDoc,dialogDisplayCss);dialogDisplayLayout.Layout(800,600);
     const auto* closedDialog=FindLayout(dialogDisplayLayout.Root(),L"closed");const auto* openedDialog=FindLayout(dialogDisplayLayout.Root(),L"opened");const auto* hiddenElement=FindLayout(dialogDisplayLayout.Root(),L"hidden");
     Check(closedDialog&&!closedDialog->visible&&openedDialog&&openedDialog->visible&&openedDialog->style.Is(L"position",L"fixed")&&hiddenElement&&!hiddenElement->visible,
           L"closed dialogs and hidden elements skip layout while open dialogs enter the fixed top layer");
+    JavaScriptRuntime dialogRuntime(dialogDisplayDoc);std::wstring dialogResult;
+    Check(dialogRuntime.Execute(
+          L"const dialog=document.getElementById('closed');dialog.showModal();return dialog.open;",
+          &dialogResult,&error)&&dialogResult==L"true"&&
+          dialogDisplayDoc.GetElementById(L"closed")->modal,
+          L"showModal records modal top-layer state separately from the open attribute");
+    Check(dialogRuntime.Execute(
+          L"const dialog=document.getElementById('closed');dialog.close('done');dialog.show();return dialog.open+'|'+dialog.returnValue;",
+          &dialogResult,&error)&&dialogResult==L"true|done"&&
+          !dialogDisplayDoc.GetElementById(L"closed")->modal,
+          L"close removes modal state while non-modal show does not create a backdrop");
     Check(eventJs.Execute(L"const timer= setTimeout(()=>timerLog='wrong',0);clearTimeout(timer);",nullptr,&error),error.c_str());
     eventJs.RunTimers();
     Check(eventJs.Execute(L"return timerLog;",&eventResult,&error)&&eventResult==L"ran",
@@ -851,6 +908,123 @@ int wmain(int argc,wchar_t** argv) {
               trailingTextBox->rect.y+trailingTextBox->rect.height*0.5f,hitText,hitTextOffset)&&
           hitText==trailingText&&hitTextOffset>0&&hitTextOffset<trailingText->text.size(),
           L"contenteditable pointer placement selects the nearest DOM text offset before the first paint");
+
+    Document paragraphFlowDoc;
+    Check(paragraphFlowDoc.Parse(
+        L"<style>*{box-sizing:border-box;margin:0}article{display:block;width:320px;padding:12px;font:16px/24px 'Segoe UI'}p{display:block;margin:0}</style>"
+        L"<article contenteditable='true'><p id='line-before'>hello</p><p id='line-after'></p></article>",
+        &error),L"contenteditable paragraph flow fixture parses");
+    StyleSheet paragraphFlowCss;
+    Check(paragraphFlowCss.Parse(paragraphFlowDoc.StyleText(),&error),
+          L"contenteditable paragraph flow CSS parses");
+    LayoutEngine paragraphFlowLayout(paragraphFlowDoc,paragraphFlowCss);
+    paragraphFlowLayout.Layout(360,160,1.0f);
+    const auto* paragraphBefore100=paragraphFlowLayout.BoxFor(
+        paragraphFlowDoc.GetElementById(L"line-before"));
+    const auto* paragraphAfter100=paragraphFlowLayout.BoxFor(
+        paragraphFlowDoc.GetElementById(L"line-after"));
+    const float paragraphBeforeY100=paragraphBefore100?paragraphBefore100->rect.y:0.0f;
+    const float paragraphBeforeHeight100=paragraphBefore100?paragraphBefore100->rect.height:0.0f;
+    const float paragraphAfterY100=paragraphAfter100?paragraphAfter100->rect.y:0.0f;
+    const float paragraphAfterHeight100=paragraphAfter100?paragraphAfter100->rect.height:0.0f;
+    paragraphFlowLayout.Layout(360,160,1.5f);
+    const auto* paragraphBefore150=paragraphFlowLayout.BoxFor(
+        paragraphFlowDoc.GetElementById(L"line-before"));
+    const auto* paragraphAfter150=paragraphFlowLayout.BoxFor(
+        paragraphFlowDoc.GetElementById(L"line-after"));
+    Check(paragraphBefore100&&paragraphAfter100&&paragraphBefore150&&paragraphAfter150&&
+          paragraphAfterY100>=paragraphBeforeY100+paragraphBeforeHeight100-0.01f&&
+          paragraphAfter150->rect.y>=paragraphBefore150->rect.y+paragraphBefore150->rect.height-0.01f&&
+          paragraphAfterHeight100>0&&paragraphAfter150->rect.height>0&&
+          std::abs(paragraphBeforeY100-paragraphBefore150->rect.y)<0.01f&&
+          std::abs(paragraphAfterY100-paragraphAfter150->rect.y)<0.01f&&
+          std::abs(paragraphAfterHeight100-paragraphAfter150->rect.height)<0.01f,
+          L"an empty editable paragraph reserves the same distinct CSS line box at 100 and 150 percent DPI");
+    const auto paragraphRoot=paragraphFlowDoc.GetElementById(L"line-before")->parent.lock();
+    const auto paragraphText=paragraphFlowDoc.GetElementById(L"line-before")->children.front();
+    const auto paragraphEmpty=paragraphFlowDoc.GetElementById(L"line-after");
+    const auto verifyVerticalCaret=[&](float scale){
+        paragraphFlowLayout.Layout(360,160,scale);
+        LayoutRect start{};std::shared_ptr<Node> downTarget,upTarget;
+        size_t downOffset=0,upOffset=0;
+        if(!paragraphFlowLayout.TextCaretRect(paragraphText,3,start))return false;
+        if(!paragraphFlowLayout.VerticalCaretPosition(paragraphRoot,paragraphText,3,start.x,
+                false,downTarget,downOffset))return false;
+        if(downTarget!=paragraphEmpty||downOffset!=0)return false;
+        if(!paragraphFlowLayout.VerticalCaretPosition(paragraphRoot,downTarget,downOffset,start.x,
+                true,upTarget,upOffset))return false;
+        return upTarget==paragraphText&&upOffset==3;
+    };
+    Check(verifyVerticalCaret(1.0f)&&verifyVerticalCaret(1.5f),
+          L"vertical caret hit testing crosses between text and an empty paragraph at the same visual column at 100 and 150 percent DPI");
+
+    Document wrappedCaretDoc;
+    Check(wrappedCaretDoc.Parse(
+        L"<style>*{box-sizing:border-box;margin:0}article{display:block;width:90px;font:16px/24px 'Segoe UI'}</style>"
+        L"<article id='wrapped-editor' contenteditable='true'>alpha beta gamma delta epsilon</article>",
+        &error),L"wrapped contenteditable caret fixture parses");
+    StyleSheet wrappedCaretCss;
+    Check(wrappedCaretCss.Parse(wrappedCaretDoc.StyleText(),&error),
+          L"wrapped contenteditable caret CSS parses");
+    LayoutEngine wrappedCaretLayout(wrappedCaretDoc,wrappedCaretCss);
+    const auto wrappedEditor=wrappedCaretDoc.GetElementById(L"wrapped-editor");
+    const auto wrappedText=wrappedEditor->children.front();
+    const auto verifyWrappedCaret=[&](float scale){
+        wrappedCaretLayout.Layout(180,180,scale);
+        LayoutRect start{},downCaret{};std::shared_ptr<Node> downTarget,upTarget;
+        size_t downOffset=0,upOffset=0;
+        if(!wrappedCaretLayout.TextCaretRect(wrappedText,2,start))return false;
+        if(!wrappedCaretLayout.VerticalCaretPosition(wrappedEditor,wrappedText,2,start.x,
+                false,downTarget,downOffset)||downTarget!=wrappedText||downOffset<=2)return false;
+        if(!wrappedCaretLayout.TextCaretRect(downTarget,downOffset,downCaret)||
+           downCaret.y<=start.y)return false;
+        if(!wrappedCaretLayout.VerticalCaretPosition(wrappedEditor,downTarget,downOffset,start.x,
+                true,upTarget,upOffset))return false;
+        return upTarget==wrappedText&&upOffset==2;
+    };
+    Check(verifyWrappedCaret(1.0f)&&verifyWrappedCaret(1.5f),
+          L"vertical caret hit testing follows visual lines created by text wrapping at 100 and 150 percent DPI");
+
+    Document atomicCaretDoc;
+    Check(atomicCaretDoc.Parse(
+        L"<style>*{box-sizing:border-box;margin:0}article{display:block;width:320px;min-height:100px;padding:12px;font:16px/24px 'Segoe UI'}p{display:block;margin:0}img{width:40px;height:30px}</style>"
+        L"<article contenteditable='true'><p id='atomic-line'>alpha<img id='atomic-image'>Z</p></article>",
+        &error),L"atomic contenteditable caret fixture parses");
+    StyleSheet atomicCaretCss;
+    Check(atomicCaretCss.Parse(atomicCaretDoc.StyleText(),&error),
+          L"atomic contenteditable caret CSS parses");
+    LayoutEngine atomicCaretLayout(atomicCaretDoc,atomicCaretCss);
+    const auto atomicLine=atomicCaretDoc.GetElementById(L"atomic-line");
+    const auto atomicImage=atomicCaretDoc.GetElementById(L"atomic-image");
+    const auto atomicTrailingText=atomicLine&&!atomicLine->children.empty()?
+        atomicLine->children.back():std::shared_ptr<Node>{};
+    LayoutRect atomicCaret100{},atomicCaret150{},typedCaret100{},typedCaret150{};
+    atomicCaretLayout.Layout(360,160,1.0f);
+    const auto* atomicImage100=atomicCaretLayout.BoxFor(atomicImage);
+    const bool hasAtomicImage100=atomicImage100!=nullptr;
+    const float atomicImageRight100=atomicImage100?
+        atomicImage100->rect.x+atomicImage100->rect.width:0.0f;
+    const bool resolvedAtomic100=atomicCaretLayout.TextCaretRect(
+        atomicLine,2,atomicCaret100);
+    const bool resolvedTyped100=atomicCaretLayout.TextCaretRect(
+        atomicTrailingText,0,typedCaret100);
+    atomicCaretLayout.Layout(360,160,1.5f);
+    const auto* atomicImage150=atomicCaretLayout.BoxFor(atomicImage);
+    const bool resolvedAtomic150=atomicCaretLayout.TextCaretRect(
+        atomicLine,2,atomicCaret150);
+    const bool resolvedTyped150=atomicCaretLayout.TextCaretRect(
+        atomicTrailingText,0,typedCaret150);
+    Check(resolvedAtomic100&&resolvedAtomic150&&resolvedTyped100&&resolvedTyped150&&
+          hasAtomicImage100&&atomicImage150&&
+          std::abs(atomicCaret100.x-atomicImageRight100)<0.01f&&
+          std::abs(atomicCaret150.x-(atomicImage150->rect.x+atomicImage150->rect.width))<0.01f&&
+          std::abs(atomicCaret100.y-typedCaret100.y)<0.01f&&
+          std::abs(atomicCaret150.y-typedCaret150.y)<0.01f&&
+          std::abs(atomicCaret100.height-typedCaret100.height)<0.01f&&
+          std::abs(atomicCaret150.height-typedCaret150.height)<0.01f&&
+          std::abs(atomicCaret100.width-1.0f)<0.01f&&
+          std::abs(atomicCaret150.width-(2.0f/3.0f))<0.01f,
+          L"a DOM boundary after an atomic inline element matches the following text caret position with a one-physical-pixel caret at 100 and 150 percent DPI");
 
     Document emptyEditableDoc;
     Check(emptyEditableDoc.Parse(
@@ -1764,6 +1938,26 @@ int wmain(int argc,wchar_t** argv) {
     Check(fileJs.Execute(L"document.getElementById('file').addEventListener('drop',event=>window.chrome.webview.postMessage(event.type+'|'+event.dataTransfer.files[0].name));",nullptr,&error),error.c_str());
     fileJs.DispatchFileDrop(selectedFile,{{L"dropped.csv",L"text/csv",L"",100}});
     Check(droppedName==L"drop|dropped.csv",L"file drop events expose a standard dataTransfer file list");
+    Check(fileJs.Execute(L"document.getElementById('file').addEventListener('paste',event=>{const item=event.clipboardData.items[0];const file=item.getAsFile();window.chrome.webview.postMessage(event.clipboardData.getData('text/plain')+'|'+event.clipboardData.types.includes('Files')+'|'+item.kind+'|'+file.name+'|'+file.type);event.preventDefault();});",nullptr,&error),error.c_str());
+    Check(fileJs.DispatchClipboardEvent(selectedFile,L"paste",L"plain text",{{L"image.png",L"image/png",L"C:\\image.png",321}})&&
+          droppedName==L"plain text|true|file|image.png|image/png",
+          L"clipboard events expose text, file types and DataTransferItem files");
+    wchar_t temporaryDirectory[MAX_PATH]{},temporaryFile[MAX_PATH]{};
+    const DWORD temporaryLength=GetTempPathW(MAX_PATH,temporaryDirectory);
+    Check(temporaryLength>0&&temporaryLength<MAX_PATH&&GetTempFileNameW(temporaryDirectory,L"twf",0,temporaryFile)!=0,
+          L"FileReader test creates a temporary file");
+    if(temporaryFile[0]){
+        const HANDLE file=CreateFileW(temporaryFile,GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_TEMPORARY,nullptr);
+        const char bytes[]={'a','b','c'};DWORD written=0;
+        Check(file!=INVALID_HANDLE_VALUE&&WriteFile(file,bytes,sizeof(bytes),&written,nullptr)&&written==sizeof(bytes),
+              L"FileReader test writes its binary fixture");
+        if(file!=INVALID_HANDLE_VALUE)CloseHandle(file);
+        selectedFile->files={{L"image.png",L"image/png",temporaryFile,sizeof(bytes)}};
+        Check(fileJs.Execute(L"let dataUrl='';const reader=new FileReader();reader.addEventListener('load',()=>dataUrl=reader.result,{once:true});reader.readAsDataURL(document.getElementById('file').files[0]);return dataUrl;",&fileResult,&error)&&
+              fileResult==L"data:image/png;base64,YWJj",
+              L"FileReader produces an image data URL from a selected file");
+        DeleteFileW(temporaryFile);
+    }
 
     Document iconButtonDoc;
     Check(iconButtonDoc.Parse(L"<style>*{box-sizing:border-box}button{display:flex;align-items:center;gap:10px;padding:0 12px}svg{width:20px;height:20px}</style><div style='display:flex;width:500px'><button id='icon-button'><svg viewBox='0 0 24 24'><path d='M4 4h16v16H4z'/></svg>Sample label</button></div>",&error),L"icon button fixture parses");
@@ -1901,6 +2095,101 @@ int wmain(int argc,wchar_t** argv) {
                 L"clicking a later inline text run inserts at its pointed offset instead of a text-node boundary");
             Check(GetWindow(inputWindow,GW_CHILD)==nullptr,
                   L"contenteditable pointer editing remains in the childless common input path");
+            const wchar_t* paragraphInputHtml=LR"HTML(<style>*{box-sizing:border-box;margin:0}article{display:block;width:280px;min-height:90px;padding:10px;font:16px/24px "Segoe UI"}p{display:block;margin:0}</style><article id="paragraph-editor" contenteditable="true"><p>helloworld</p></article>)HTML";
+            Check(inputView->NavigateToString(paragraphInputHtml),
+                  L"contenteditable paragraph input fixture loads in a real view");
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');"
+                L"e.addEventListener('beforeinput',function(event){this.setAttribute('data-before',event.inputType);});"
+                L"e.addEventListener('input',function(event){this.setAttribute('data-input',event.inputType);});"
+                L"e.focus();const r=document.createRange();r.setStart(e.firstChild.firstChild,5);r.collapse(true);"
+                L"const s=getSelection();s.removeAllRanges();s.addRange(r);",
+                nullptr,&selectionError),selectionError.c_str());
+            SetFocus(inputWindow);SendMessageW(inputWindow,WM_CHAR,VK_RETURN,1);
+            std::wstring paragraphResult;
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const s=getSelection();"
+                L"return e.children.length+'|'+e.children[0].textContent+'|'+e.children[1].textContent+'|'"
+                L"+(s.anchorNode===e.children[1])+'|'+s.anchorOffset+'|'"
+                L"+e.getAttribute('data-before')+'|'+e.getAttribute('data-input');",
+                &paragraphResult,&selectionError)&&
+                paragraphResult==L"2|hello|world|true|0|insertParagraph|insertParagraph",
+                L"Enter splits a contenteditable block at the DOM caret and dispatches standard paragraph input events");
+            SendMessageW(inputWindow,WM_CHAR,static_cast<WPARAM>(L'X'),1);
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');return e.children[0].textContent+'|'+e.children[1].textContent;",
+                &paragraphResult,&selectionError)&&paragraphResult==L"hello|Xworld",
+                L"typing after Enter continues at the start of the newly created paragraph");
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const t=e.children[1].firstChild;"
+                L"const r=document.createRange();r.setStart(t,t.length);r.collapse(true);"
+                L"const s=getSelection();s.removeAllRanges();s.addRange(r);",
+                nullptr,&selectionError),selectionError.c_str());
+            SendMessageW(inputWindow,WM_CHAR,VK_RETURN,1);
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const s=getSelection();"
+                L"const previous=e.children[1].getBoundingClientRect();const empty=e.children[2].getBoundingClientRect();"
+                L"return e.children.length+'|'+e.children[2].textContent+'|'"
+                L"+(s.anchorNode===e.children[2])+'|'+s.anchorOffset+'|'"
+                L"+(empty.y>=previous.y+previous.height-0.01)+'|'+(empty.height>0);",
+                &paragraphResult,&selectionError)&&paragraphResult==L"3||true|0|true|true",
+                L"Enter at the end creates a visible empty line and places the caret on that line");
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const t=e.children[0].firstChild;"
+                L"const r=document.createRange();r.setStart(t,3);r.collapse(true);"
+                L"const s=getSelection();s.removeAllRanges();s.addRange(r);",
+                nullptr,&selectionError),selectionError.c_str());
+            SendMessageW(inputWindow,WM_KEYDOWN,VK_DOWN,1);
+            std::wstring firstDown;
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const s=getSelection();"
+                L"return (s.anchorNode===e.children[1].firstChild)+'|'+s.anchorOffset;",
+                &firstDown,&selectionError)&&firstDown.rfind(L"true|",0)==0,
+                L"Down Arrow moves the DOM caret from one editable paragraph to the next visual line");
+            SendMessageW(inputWindow,WM_KEYDOWN,VK_DOWN,1);
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const s=getSelection();"
+                L"return (s.anchorNode===e.children[2])+'|'+s.anchorOffset;",
+                &paragraphResult,&selectionError)&&paragraphResult==L"true|0",
+                L"Down Arrow reaches an empty editable paragraph using its DOM boundary");
+            SendMessageW(inputWindow,WM_KEYDOWN,VK_UP,1);
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('paragraph-editor');const s=getSelection();"
+                L"return (s.anchorNode===e.children[1].firstChild)+'|'+s.anchorOffset;",
+                &paragraphResult,&selectionError)&&paragraphResult==firstDown,
+                L"Up Arrow returns to the previous line while preserving the preferred visual column");
+            const wchar_t* atomicSelectionHtml=LR"HTML(<style>*{box-sizing:border-box;margin:0}article{display:block;width:280px;min-height:90px;padding:10px;font:16px/24px "Segoe UI"}p{display:block;margin:0}img{width:32px;height:24px}</style><article id="image-editor" contenteditable="true"><p id="image-line">alpha</p></article>)HTML";
+            Check(inputView->NavigateToString(atomicSelectionHtml),
+                  L"atomic contenteditable selection fixture loads in a real view");
+            std::wstring atomicSelection;
+            Check(inputView->ExecuteScript(
+                L"const e=document.getElementById('image-editor');const p=document.getElementById('image-line');"
+                L"e.focus();const r=document.createRange();r.setStart(p.firstChild,p.firstChild.length);r.collapse(true);"
+                L"const s=getSelection();s.removeAllRanges();s.addRange(r);"
+                L"document.execCommand('insertHTML',false,'<img src=\"missing.png\" alt=\"sample\">');"
+                L"e.normalize();const current=getSelection();"
+                L"return (current.anchorNode===p)+'|'+current.anchorOffset+'|'+current.isCollapsed;",
+                &atomicSelection,&selectionError)&&atomicSelection==L"true|2|true",
+                L"normalizing an editable tree preserves its collapsed DOM boundary immediately after an inserted image");
+            SetFocus(inputWindow);
+            for(const auto character:std::wstring(L"world"))
+                SendMessageW(inputWindow,WM_CHAR,static_cast<WPARAM>(character),1);
+            std::wstring atomicHtml;
+            Check(inputView->ExecuteScript(
+                L"return document.getElementById('image-line').innerHTML;",
+                &atomicHtml,&selectionError)&&atomicHtml.find(L"<img")!=std::wstring::npos&&
+                atomicHtml.size()>=5&&atomicHtml.substr(atomicHtml.size()-5)==L"world",
+                L"typing at an image boundary materializes text after the image without an element-specific workaround");
+            for(int index=0;index<6;++index)SendMessageW(inputWindow,WM_KEYDOWN,VK_LEFT,1);
+            Check(inputView->ExecuteScript(
+                L"const s=getSelection();return s.anchorNode.nodeValue+'|'+s.anchorOffset;",
+                &atomicSelection,&selectionError)&&atomicSelection==L"alpha|5",
+                L"left-arrow navigation crosses an atomic inline image from the following text node");
+            SendMessageW(inputWindow,WM_KEYDOWN,VK_RIGHT,1);
+            Check(inputView->ExecuteScript(
+                L"const s=getSelection();return s.anchorNode.nodeValue+'|'+s.anchorOffset;",
+                &atomicSelection,&selectionError)&&atomicSelection==L"world|0",
+                L"right-arrow navigation crosses an atomic inline image from the preceding text node");
             const wchar_t* emptyInputsHtml=LR"HTML(<style>*{margin:0;padding:0;box-sizing:border-box}body{font:13px/1.42 "Segoe UI Variable","Segoe UI",sans-serif}input{display:block;width:120px;height:32px;padding:0 4px;border:1px solid #ccc;font:inherit}</style><input type="text"><input type="password"><input type="number">)HTML";
             Check(inputView->NavigateToString(emptyInputsHtml),L"empty input types fixture loads in a real view");
             for(int index=0;index<3;++index){

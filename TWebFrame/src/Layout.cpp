@@ -1,7 +1,9 @@
 #include "Layout.h"
 #include "Canvas.h"
+#include "RasterImage.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwctype>
 #include <functional>
@@ -121,7 +123,7 @@ struct HorizontalScrollbarMetrics {
 
 Edges BorderValues(const ComputedStyle& style);
 
-LayoutRect ScrollbarPaddingBox(const LayoutBox& box) {
+LayoutRect PaddingBox(const LayoutBox& box) {
     const auto border=BorderValues(box.style);
     return {box.rect.x+border.left,box.rect.y+border.top,
         std::max(0.0f,box.rect.width-border.left-border.right),
@@ -196,7 +198,7 @@ bool VerticalScrollbarFor(const LayoutBox& box,const StyleSheet& styleSheet,Vert
     const auto metrics=VerticalScrollbarMetricsFor(box,styleSheet);
     const float trackWidth=metrics.width;
     if(trackWidth<=0)return false;
-    const auto paddingBox=ScrollbarPaddingBox(box);
+    const auto paddingBox=PaddingBox(box);
     const auto overflowX=box.style.Get(L"overflow-x",box.style.Get(L"overflow",L"visible"));
     const bool horizontal=(overflowX==L"auto"||overflowX==L"scroll")&&box.scrollWidth>box.content.width+1;
     const float horizontalHeight=horizontal?HorizontalScrollbarMetricsFor(box,styleSheet).height:0;
@@ -226,7 +228,7 @@ bool HorizontalScrollbarFor(const LayoutBox& box,const StyleSheet& styleSheet,Ho
        box.scrollWidth<=box.content.width+1)return false;
     const auto metrics=HorizontalScrollbarMetricsFor(box,styleSheet);
     const float trackHeight=metrics.height;if(trackHeight<=0)return false;
-    const auto paddingBox=ScrollbarPaddingBox(box);
+    const auto paddingBox=PaddingBox(box);
     const auto overflowY=box.style.Get(L"overflow-y",box.style.Get(L"overflow",L"visible"));
     const bool vertical=(overflowY==L"auto"||overflowY==L"scroll")&&box.scrollHeight>box.content.height+1;
     const float verticalWidth=vertical?VerticalScrollbarMetricsFor(box,styleSheet).width:0;
@@ -316,14 +318,14 @@ LayoutRect IntersectRects(const LayoutRect& left,const LayoutRect& right) {
 LayoutRect StackingContextClip(const LayoutBox& context,const LayoutBox& scope,
                                LayoutRect clip) {
     for(auto* ancestor=context.parent;ancestor&&ancestor!=&scope;ancestor=ancestor->parent)
-        if(ClipsOverflow(*ancestor))clip=IntersectRects(clip,ancestor->content);
+        if(ClipsOverflow(*ancestor))clip=IntersectRects(clip,PaddingBox(*ancestor));
     return clip;
 }
 
 bool StackingContextAllowsPoint(const LayoutBox& context,const LayoutBox& scope,
                                 float x,float y) {
     for(auto* ancestor=context.parent;ancestor&&ancestor!=&scope;ancestor=ancestor->parent)
-        if(ClipsOverflow(*ancestor)&&!ancestor->content.Contains(x,y))return false;
+        if(ClipsOverflow(*ancestor)&&!PaddingBox(*ancestor).Contains(x,y))return false;
     return true;
 }
 
@@ -917,6 +919,36 @@ float TextBaselineOffset(const ComputedStyle& style) {
     cache.emplace(std::move(key),result);return result;
 }
 
+struct TextCaretLineMetrics {
+    float topInset=0;
+    float height=0;
+};
+
+TextCaretLineMetrics CaretLineMetrics(const ComputedStyle& style) {
+    static thread_local FastMap<std::wstring,TextCaretLineMetrics> cache;
+    std::wstring key=FontFamily(style);key+=L'\x1f';key+=NumberText(FontSize(style));
+    key+=L'\x1f';key+=std::to_wstring(FontWeight(style));key+=L'\x1f';
+    key+=style.Get(L"font-style");key+=L'\x1f';key+=style.Get(L"line-height");
+    if(const auto found=cache.find(key);found!=cache.end())return found->second;
+    if(cache.size()>=256)cache.clear();
+    const float lineHeight=std::max(1.0f,LineHeight(style));
+    TextCaretLineMetrics result{0,lineHeight};
+    if(auto* factory=SharedWriteFactory()){
+        auto format=TextFormat(factory,style);
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        constexpr wchar_t sample[]=L"Hg";
+        if(format&&SUCCEEDED(factory->CreateTextLayout(sample,2,format.Get(),
+            100000.0f,100000.0f,&layout))){
+            DWRITE_LINE_METRICS metrics{};UINT32 count=0;
+            if(SUCCEEDED(layout->GetLineMetrics(&metrics,1,&count))&&count){
+                result.height=std::max(1.0f,metrics.height);
+                result.topInset=std::max(0.0f,(lineHeight-result.height)/2.0f);
+            }
+        }
+    }
+    cache.emplace(std::move(key),result);return result;
+}
+
 const ComputedStyle* FirstFlexBaselineStyle(const LayoutBox& box) {
     if(box.node&&box.node->type==NodeType::Text)return &box.style;
     for(const auto& child:box.children){
@@ -1305,6 +1337,20 @@ float ConstrainIntrinsicHeight(const ComputedStyle& style,float value,float view
     return value;
 }
 
+float ConstrainIntrinsicWidth(const ComputedStyle& style,float value,float viewport){
+    // Percentage inline-size constraints depend on the containing block. They
+    // are indefinite while collecting max-content contributions and must be
+    // resolved later by the formatting context that knows the real width.
+    const auto minimum=style.Get(L"min-width");
+    if(!minimum.empty()&&minimum!=L"auto"&&minimum.find(L'%')==std::wstring::npos)
+        value=std::max(value,StyleSheet::Length(minimum,500,viewport,value));
+    const auto maximum=style.Get(L"max-width");
+    if(!maximum.empty()&&maximum!=L"none"&&maximum!=L"auto"&&
+       maximum.find(L'%')==std::wstring::npos)
+        value=std::min(value,StyleSheet::Length(maximum,500,viewport,value));
+    return value;
+}
+
 float NaturalWidth(const LayoutBox& box);
 
 float BlockOuterWidth(const LayoutBox& box,float availableWidth,float viewportWidth){
@@ -1497,6 +1543,20 @@ float NaturalWidth(const LayoutBox& box){
     }
     else if(box.node->tag==L"canvas")
         value=StyleSheet::Length(box.node->Attribute(L"width"),500,500,300);
+    else if(box.node->tag==L"img"){
+        const auto authoredWidth=Trim(box.node->Attribute(L"width"));
+        const auto authoredHeight=Trim(box.node->Attribute(L"height"));
+        if(!authoredWidth.empty())value=StyleSheet::Length(authoredWidth,500,500,0);
+        else if(box.node->image){
+            const auto cssHeight=Trim(box.style.Get(L"height"));
+            const auto ratioHeight=!cssHeight.empty()&&cssHeight!=L"auto"?
+                cssHeight:authoredHeight;
+            if(!ratioHeight.empty()&&box.node->image->height)
+                value=StyleSheet::Length(ratioHeight,500,500,0)*
+                    box.node->image->width/box.node->image->height;
+            else value=static_cast<float>(box.node->image->width);
+        }
+    }
     else if(box.node->tag==L"svg"){
         const auto viewBox=SvgNumbers(box.node->Attribute(L"viewbox"));
         const auto height=box.style.Get(L"height",box.node->Attribute(L"height"));
@@ -1551,7 +1611,7 @@ float NaturalWidth(const LayoutBox& box){
         if(flex&&horizontal)value+=GapValue(box.style,true,500,500)*std::max(0,visible-1);
         auto padding=EdgeValues(box.style,L"padding",500,500);auto border=BorderValues(box.style);value+=padding.left+padding.right+border.left+border.right;
     }
-    value=Constrain(box.style,L"min-width",L"max-width",value,500,500);auto margin=EdgeValues(box.style,L"margin",500,500);return remember(value+margin.left+margin.right);
+    value=ConstrainIntrinsicWidth(box.style,value,500);auto margin=EdgeValues(box.style,L"margin",500,500);return remember(value+margin.left+margin.right);
 }
 
 std::vector<float> ResolveTableColumns(const LayoutBox& table,const TableGridModel& model,
@@ -1652,7 +1712,8 @@ float MinContentWidth(const LayoutBox& box){
         float longest=1;for(const auto& word:Words(text))longest=std::max(longest,TextWidth(word,box.style));return remember(longest);
     }
     if(box.node->tag==L"br")return remember(0.0f);
-    if(box.node->tag==L"input"||box.node->tag==L"select"||box.node->tag==L"button")return remember(NaturalWidth(box));
+    if(box.node->tag==L"input"||box.node->tag==L"select"||box.node->tag==L"button"||
+       box.node->tag==L"img")return remember(NaturalWidth(box));
     const auto display=box.style.Get(L"display");const bool flex=display==L"flex"||display==L"inline-flex";
     const bool horizontal=IsInlineLevel(display)||display==L"table-row"||(flex&&!IsColumnFlexDirection(box.style));
     const auto flexWrap=ToLower(Trim(box.style.Get(L"flex-wrap",L"nowrap")));
@@ -1702,6 +1763,20 @@ float NaturalHeight(const LayoutBox& box,float availableWidth=500){
     }
     else if(box.node->tag==L"canvas")
         value=StyleSheet::Length(box.node->Attribute(L"height"),availableWidth,availableWidth,150);
+    else if(box.node->tag==L"img"){
+        const auto authoredHeight=Trim(box.node->Attribute(L"height"));
+        if(!authoredHeight.empty())
+            value=StyleSheet::Length(authoredHeight,availableWidth,availableWidth,0);
+        else if(box.node->image&&box.node->image->width){
+            const auto padding=EdgeValues(box.style,L"padding",availableWidth,availableWidth);
+            const auto border=BorderValues(box.style);
+            const auto margin=EdgeValues(box.style,L"margin",availableWidth,availableWidth);
+            const float contentWidth=std::max(0.0f,availableWidth-padding.left-padding.right-
+                border.left-border.right-margin.left-margin.right);
+            value=contentWidth*box.node->image->height/box.node->image->width;
+            value+=padding.top+padding.bottom+border.top+border.bottom;
+        }
+    }
     else if(box.node->tag==L"svg"){
         const auto viewBox=SvgNumbers(box.node->Attribute(L"viewbox"));
         if(viewBox.size()==4&&viewBox[2]>0)value=availableWidth*viewBox[3]/viewBox[2];
@@ -2409,7 +2484,7 @@ float NaturalGridHeight(const LayoutBox& box,float availableWidth) {
             return PreventsTextWrapping(item.style.Get(L"white-space"));
         }
         if(item.node->tag==L"input"||item.node->tag==L"select"||item.node->tag==L"button"||item.node->tag==L"br")return true;
-        if(item.node->tag==L"svg")return false;
+        if(item.node->tag==L"svg"||item.node->tag==L"img")return false;
         for(const auto& child:item.children)
             if(child->visible&&!child->style.Is(L"position",L"absolute")&&
                !child->style.Is(L"position",L"fixed")&&!widthIndependentHeight(*child))return false;
@@ -2455,6 +2530,15 @@ unsigned int BackgroundColor(const ComputedStyle& style) {
         const auto color=StyleSheet::Color(token,invalid);if(color!=invalid)return color;
     }
     return 0;
+}
+
+bool HasCanvasBackground(const ComputedStyle& style){
+    if((BackgroundColor(style)>>24)!=0)return true;
+    const auto image=ToLower(Trim(style.Get(L"background-image")));
+    if(!image.empty()&&image!=L"none")return true;
+    const auto shorthand=ToLower(style.Get(L"background"));
+    return shorthand.find(L"gradient(")!=std::wstring::npos||
+           shorthand.find(L"url(")!=std::wstring::npos;
 }
 
 unsigned int DeclarationColor(const std::wstring& value,unsigned int fallback){
@@ -2634,25 +2718,154 @@ void FillShadowShape(ID2D1RenderTarget* target,ID2D1SolidColorBrush* brush,
     else target->FillRectangle(rect,brush);
 }
 
+std::array<int,3> GaussianBoxWidths(float sigma){
+    if(sigma<=0.01f)return {1,1,1};
+    constexpr int count=3;
+    const float ideal=std::sqrt(12.0f*sigma*sigma/count+1.0f);
+    int lower=static_cast<int>(std::floor(ideal));if((lower&1)==0)--lower;
+    lower=std::max(1,lower);const int upper=lower+2;
+    const int lowerCount=std::max(0,std::min(count,static_cast<int>(std::lround(
+        (12.0f*sigma*sigma-count*lower*lower-4.0f*count*lower-3.0f*count)/
+        (-4.0f*lower-4.0f)))));
+    return {lowerCount>0?lower:upper,lowerCount>1?lower:upper,
+            lowerCount>2?lower:upper};
+}
+
+void BoxBlurHorizontal(const std::vector<float>& source,std::vector<float>& target,
+                       UINT width,UINT height,int radius){
+    if(radius<=0){target=source;return;}
+    const float inverse=1.0f/(radius*2+1);
+    for(UINT y=0;y<height;++y){
+        const size_t row=static_cast<size_t>(y)*width;float sum=0;
+        for(int x=0;x<=radius&&x<static_cast<int>(width);++x)sum+=source[row+x];
+        for(UINT x=0;x<width;++x){
+            target[row+x]=sum*inverse;
+            const int remove=static_cast<int>(x)-radius;
+            const int append=static_cast<int>(x)+radius+1;
+            if(remove>=0)sum-=source[row+static_cast<size_t>(remove)];
+            if(append<static_cast<int>(width))sum+=source[row+static_cast<size_t>(append)];
+        }
+    }
+}
+
+void BoxBlurVertical(const std::vector<float>& source,std::vector<float>& target,
+                     UINT width,UINT height,int radius){
+    if(radius<=0){target=source;return;}
+    const float inverse=1.0f/(radius*2+1);
+    for(UINT x=0;x<width;++x){
+        float sum=0;for(int y=0;y<=radius&&y<static_cast<int>(height);++y)
+            sum+=source[static_cast<size_t>(y)*width+x];
+        for(UINT y=0;y<height;++y){
+            target[static_cast<size_t>(y)*width+x]=sum*inverse;
+            const int remove=static_cast<int>(y)-radius;
+            const int append=static_cast<int>(y)+radius+1;
+            if(remove>=0)sum-=source[static_cast<size_t>(remove)*width+x];
+            if(append<static_cast<int>(height))sum+=source[static_cast<size_t>(append)*width+x];
+        }
+    }
+}
+
+bool RoundedRectContains(float x,float y,float left,float top,float right,float bottom,
+                         float radiusX,float radiusY){
+    if(x<left||x>=right||y<top||y>=bottom)return false;
+    radiusX=std::max(0.0f,std::min(radiusX,(right-left)/2.0f));
+    radiusY=std::max(0.0f,std::min(radiusY,(bottom-top)/2.0f));
+    if(radiusX<=0||radiusY<=0)return true;
+    const float centerX=std::max(left+radiusX,std::min(right-radiusX,x));
+    const float centerY=std::max(top+radiusY,std::min(bottom-radiusY,y));
+    const float dx=(x-centerX)/radiusX,dy=(y-centerY)/radiusY;
+    return dx*dx+dy*dy<=1.0f;
+}
+
+bool PaintBlurredShadow(ID2D1RenderTarget* target,const LayoutRect& rect,
+                        const CornerRadii& radius,const BoxShadow& shadow,float deviceScale,
+                        ID2D1RenderTarget*& cacheTarget,
+                        FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1Bitmap>>& cache){
+    if(!target||shadow.blur<=0.01f||(shadow.color>>24)==0)return false;
+    FLOAT dpiX=USER_DEFAULT_SCREEN_DPI,dpiY=USER_DEFAULT_SCREEN_DPI;
+    target->GetDpi(&dpiX,&dpiY);const float scale=dpiX>0?dpiX/USER_DEFAULT_SCREEN_DPI:deviceScale;
+    if(scale<=0.01f)return false;
+    const float sigma=shadow.blur*scale*0.5f;
+    const auto widths=GaussianBoxWidths(sigma);
+    int padding=0;for(const auto width:widths)padding+=(width-1)/2;
+    const float sourceLeft=(rect.x+shadow.offsetX-shadow.spread)*scale;
+    const float sourceTop=(rect.y+shadow.offsetY-shadow.spread)*scale;
+    const float sourceRight=(rect.x+rect.width+shadow.offsetX+shadow.spread)*scale;
+    const float sourceBottom=(rect.y+rect.height+shadow.offsetY+shadow.spread)*scale;
+    if(sourceRight<=sourceLeft||sourceBottom<=sourceTop)return true;
+    const int left=static_cast<int>(std::floor(sourceLeft-padding));
+    const int top=static_cast<int>(std::floor(sourceTop-padding));
+    const int right=static_cast<int>(std::ceil(sourceRight+padding));
+    const int bottom=static_cast<int>(std::ceil(sourceBottom+padding));
+    if(right<=left||bottom<=top||right-left>8192||bottom-top>8192)return false;
+    const UINT bitmapWidth=static_cast<UINT>(right-left),bitmapHeight=static_cast<UINT>(bottom-top);
+    std::wostringstream key;key<<std::fixed<<std::setprecision(4)<<bitmapWidth<<L'x'<<bitmapHeight
+        <<L':'<<sourceLeft-left<<L','<<sourceTop-top<<L','<<sourceRight-left<<L','<<sourceBottom-top
+        <<L':'<<radius.x*scale<<L','<<radius.y*scale<<L':'<<shadow.color<<L':'
+        <<widths[0]<<L','<<widths[1]<<L','<<widths[2]<<L':'<<scale;
+    if(cacheTarget!=target){cache.clear();cacheTarget=target;}
+    auto found=cache.find(key.str());
+    if(found==cache.end()){
+        const size_t count=static_cast<size_t>(bitmapWidth)*bitmapHeight;
+        std::vector<float> mask(count),temporary(count);
+        const float radiusX=std::max(0.0f,(radius.x+shadow.spread)*scale);
+        const float radiusY=std::max(0.0f,(radius.y+shadow.spread)*scale);
+        constexpr std::array<float,2> samples{0.25f,0.75f};
+        for(UINT y=0;y<bitmapHeight;++y)for(UINT x=0;x<bitmapWidth;++x){
+            float coverage=0;for(const float sy:samples)for(const float sx:samples)
+                if(RoundedRectContains(left+x+sx,top+y+sy,sourceLeft,sourceTop,
+                                       sourceRight,sourceBottom,radiusX,radiusY))coverage+=0.25f;
+            mask[static_cast<size_t>(y)*bitmapWidth+x]=coverage;
+        }
+        for(const auto width:widths){const int blurRadius=(width-1)/2;
+            BoxBlurHorizontal(mask,temporary,bitmapWidth,bitmapHeight,blurRadius);
+            BoxBlurVertical(temporary,mask,bitmapWidth,bitmapHeight,blurRadius);
+        }
+        const unsigned char colorAlpha=static_cast<unsigned char>(shadow.color>>24);
+        const unsigned char colorRed=static_cast<unsigned char>(shadow.color>>16);
+        const unsigned char colorGreen=static_cast<unsigned char>(shadow.color>>8);
+        const unsigned char colorBlue=static_cast<unsigned char>(shadow.color);
+        std::vector<unsigned char> pixels(count*4);
+        for(size_t index=0;index<count;++index){
+            const auto alpha=static_cast<unsigned char>(std::lround(
+                std::max(0.0f,std::min(1.0f,mask[index]))*colorAlpha));
+            pixels[index*4]=static_cast<unsigned char>((colorBlue*alpha+127)/255);
+            pixels[index*4+1]=static_cast<unsigned char>((colorGreen*alpha+127)/255);
+            pixels[index*4+2]=static_cast<unsigned char>((colorRed*alpha+127)/255);
+            pixels[index*4+3]=alpha;
+        }
+        Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
+        const auto properties=D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),
+            USER_DEFAULT_SCREEN_DPI*scale,USER_DEFAULT_SCREEN_DPI*scale);
+        if(FAILED(target->CreateBitmap(D2D1::SizeU(bitmapWidth,bitmapHeight),pixels.data(),
+                bitmapWidth*4,properties,&bitmap)))return false;
+        if(cache.size()>=64)cache.clear();found=cache.emplace(key.str(),std::move(bitmap)).first;
+    }
+    target->DrawBitmap(found->second.Get(),
+        D2D1::RectF(left/scale,top/scale,right/scale,bottom/scale),1.0f,
+        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+        D2D1::RectF(0,0,static_cast<float>(bitmapWidth),static_cast<float>(bitmapHeight)));
+    return true;
+}
+
 void PaintOuterBoxShadows(ID2D1RenderTarget* target,const ComputedStyle& style,
-                          const LayoutRect& rect,const CornerRadii& radius,float viewport) {
+                          const LayoutRect& rect,const CornerRadii& radius,float viewport,
+                          float deviceScale,ID2D1RenderTarget*& cacheTarget,
+                          FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1Bitmap>>& cache) {
     auto shadows=BoxShadows(style,viewport);const auto base=PixelAlignedRect(rect);
     // CSS paints the first listed shadow closest to the element.
     for(auto it=shadows.rbegin();it!=shadows.rend();++it){
         const auto& shadow=*it;if(shadow.inset||(shadow.color>>24)==0)continue;
+        if(PaintBlurredShadow(target,rect,radius,shadow,deviceScale,cacheTarget,cache))continue;
         Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
         if(shadow.blur<=0.01f){
             target->CreateSolidColorBrush(D2DColor(shadow.color),&brush);
             FillShadowShape(target,brush.Get(),base,radius,shadow,shadow.spread);
             continue;
         }
-        // ID2D1RenderTarget has no effect graph. Layer progressively expanded
-        // silhouettes to approximate the CSS Gaussian falloff consistently.
-        const int steps=std::max(2,static_cast<int>(std::ceil(shadow.blur*1.5f)));
-        // Half of a Gaussian kernel lies outside the source edge. Distribute
-        // that exterior opacity across the silhouettes; using the full alpha
-        // here compounds every layer and makes a CSS blur roughly twice as dark.
-        auto color=D2DColor(shadow.color);color.a/=steps*4.0f;
+        const int steps=std::max(2,static_cast<int>(std::ceil(shadow.blur)));
+        auto color=D2DColor(shadow.color);color.a/=steps;
         target->CreateSolidColorBrush(color,&brush);
         for(int step=steps;step>=1;--step){
             const float expansion=shadow.spread+shadow.blur*step/steps;
@@ -2691,6 +2904,51 @@ void PaintInsetBoxShadows(ID2D1RenderTarget* target,const ComputedStyle& style,
         }
     }
     target->PopAxisAlignedClip();
+}
+
+void PaintOutline(ID2D1RenderTarget* target,const ComputedStyle& style,
+                  const LayoutRect& rect,const CornerRadii& radius,float viewport){
+    const auto outlineStyle=ToLower(Trim(style.Get(L"outline-style")));
+    if(outlineStyle.empty()||outlineStyle==L"none"||outlineStyle==L"hidden")return;
+    const auto rawWidth=ToLower(Trim(style.Get(L"outline-width",L"medium")));
+    float width=0;
+    if(rawWidth==L"thin")width=1;
+    else if(rawWidth==L"medium")width=3;
+    else if(rawWidth==L"thick")width=5;
+    else width=StyleSheet::Length(rawWidth,rect.width,viewport,0);
+    if(width<=0)return;
+    const float offset=StyleSheet::Length(style.Get(L"outline-offset",L"0"),
+                                          rect.width,viewport,0);
+    const auto currentColor=StyleSheet::Color(style.Get(L"color",L"#000"),0xff000000);
+    const auto rawColor=ToLower(Trim(style.Get(L"outline-color",L"currentcolor")));
+    const auto color=rawColor==L"currentcolor"||rawColor==L"invert"?
+        currentColor:StyleSheet::Color(rawColor,currentColor);
+    if((color>>24)==0)return;
+
+    const float expansion=offset+width/2.0f;
+    auto outline=PixelAlignedRect(rect);
+    outline.left-=expansion;outline.top-=expansion;
+    outline.right+=expansion;outline.bottom+=expansion;
+    if(outline.right<=outline.left||outline.bottom<=outline.top)return;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+    if(FAILED(target->CreateSolidColorBrush(D2DColor(color),&brush)))return;
+    Microsoft::WRL::ComPtr<ID2D1StrokeStyle> stroke;
+    if(outlineStyle==L"dashed"||outlineStyle==L"dotted"){
+        Microsoft::WRL::ComPtr<ID2D1Factory> strokeFactory;target->GetFactory(&strokeFactory);
+        if(strokeFactory){
+            auto properties=D2D1::StrokeStyleProperties();
+            properties.dashStyle=outlineStyle==L"dotted"?
+                D2D1_DASH_STYLE_DOT:D2D1_DASH_STYLE_DASH;
+            if(outlineStyle==L"dotted")properties.dashCap=D2D1_CAP_STYLE_ROUND;
+            strokeFactory->CreateStrokeStyle(properties,nullptr,0,&stroke);
+        }
+    }
+    const float radiusX=std::max(0.0f,radius.x+expansion);
+    const float radiusY=std::max(0.0f,radius.y+expansion);
+    if(radiusX>0&&radiusY>0)
+        target->DrawRoundedRectangle(D2D1::RoundedRect(outline,radiusX,radiusY),
+                                     brush.Get(),width,stroke.Get());
+    else target->DrawRectangle(outline,brush.Get(),width,stroke.Get());
 }
 
 std::wstring EscapeJson(const std::wstring& value){std::wstring o;for(wchar_t c:value){if(c==L'\\'||c==L'"')o+=L'\\';if(c==L'\n')o+=L"\\n";else o+=c;}return o;}
@@ -3010,6 +3268,21 @@ std::wstring DecodeSvgDataUrl(const std::wstring& cssUrl){
     return decoded;
 }
 
+std::wstring CssUrlReference(const std::wstring& cssUrl){
+    auto value=Trim(cssUrl);const auto lowered=ToLower(value);
+    if(lowered.rfind(L"url(",0)!=0||value.size()<5||value.back()!=L')')return {};
+    value=Trim(value.substr(4,value.size()-5));
+    if(value.size()>=2&&((value.front()==L'"'&&value.back()==L'"')||
+                         (value.front()==L'\''&&value.back()==L'\'')))
+        value=value.substr(1,value.size()-2);
+    std::wstring result;result.reserve(value.size());
+    for(size_t index=0;index<value.size();++index){
+        if(value[index]==L'\\'&&index+1<value.size())++index;
+        result.push_back(value[index]);
+    }
+    return result;
+}
+
 float BackgroundPosition(const std::wstring& token,float freeSpace,float viewport){
     const auto value=ToLower(Trim(token));
     if(value==L"right"||value==L"bottom")return freeSpace;
@@ -3018,11 +3291,38 @@ float BackgroundPosition(const std::wstring& token,float freeSpace,float viewpor
     return StyleSheet::Length(value,freeSpace,viewport,0);
 }
 
-void PaintSvgBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& style,
-                         const LayoutRect& box,const CornerRadii& radius,float viewport,
-                         Document& document,StyleSheet& styleSheet,
-                         FastMap<std::wstring,std::shared_ptr<Node>>& imageCache,
-                         FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1PathGeometry>>& geometryCache){
+ID2D1Bitmap* RasterBitmap(ID2D1RenderTarget* target,const std::shared_ptr<RasterImage>& image,
+                          ID2D1RenderTarget*& cacheTarget,
+                          FastMap<const RasterImageFrame*,Microsoft::WRL::ComPtr<ID2D1Bitmap>>& cache){
+    if(!image||image->frames.empty()||image->frameIndex>=image->frames.size()||
+       !image->width||!image->height)return nullptr;
+    const auto& frame=image->frames[image->frameIndex];
+    const auto required=static_cast<std::size_t>(image->width)*image->height*4;
+    if(frame.pixels.size()<required)return nullptr;
+    if(cacheTarget!=target){cache.clear();cacheTarget=target;}
+    auto cached=cache.find(&frame);
+    if(cached==cache.end()){
+        Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;
+        // Decoded image pixels are CSS-pixel resources. A 96-DPI bitmap is 1:1
+        // at 100% and Direct2D applies the target DPI exactly once above that.
+        const auto properties=D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),
+            USER_DEFAULT_SCREEN_DPI,USER_DEFAULT_SCREEN_DPI);
+        if(FAILED(target->CreateBitmap(D2D1::SizeU(image->width,image->height),
+                frame.pixels.data(),image->width*4,properties,&bitmap)))return nullptr;
+        cached=cache.emplace(&frame,std::move(bitmap)).first;
+    }
+    return cached->second.Get();
+}
+
+void PaintImageBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& style,
+                           const LayoutRect& box,const CornerRadii& radius,float viewport,
+                           Document& document,StyleSheet& styleSheet,
+                           FastMap<std::wstring,std::shared_ptr<Node>>& svgCache,
+                           FastMap<std::wstring,Microsoft::WRL::ComPtr<ID2D1PathGeometry>>& geometryCache,
+                           const LayoutEngine::RasterImageResolver& rasterResolver,
+                           ID2D1RenderTarget*& bitmapCacheTarget,
+                           FastMap<const RasterImageFrame*,Microsoft::WRL::ComPtr<ID2D1Bitmap>>& bitmapCache){
     const auto images=CommaSeparated(style.Get(L"background-image"));
     if(images.empty())return;
     const auto positions=CommaSeparated(style.Get(L"background-position",L"0% 0%"));
@@ -3048,35 +3348,49 @@ void PaintSvgBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& style,
     if(!roundedClip)target->PushAxisAlignedClip(PixelAlignedRect(box),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
     for(size_t reversed=images.size();reversed>0;--reversed){
-        const size_t index=reversed-1;const auto source=DecodeSvgDataUrl(images[index]);
-        if(source.empty())continue;
-        auto found=imageCache.find(source);
-        if(found==imageCache.end()){
-            std::shared_ptr<Node> svg;
-            for(const auto& node:document.ParseFragment(source))if(node&&node->tag==L"svg"){svg=node;break;}
-            if(imageCache.size()>=128)imageCache.clear();
-            found=imageCache.emplace(source,std::move(svg)).first;
+        const size_t index=reversed-1;std::shared_ptr<Node> svg;
+        std::shared_ptr<RasterImage> raster;
+        const auto svgSource=DecodeSvgDataUrl(images[index]);
+        if(!svgSource.empty()){
+            auto found=svgCache.find(svgSource);
+            if(found==svgCache.end()){
+                for(const auto& node:document.ParseFragment(svgSource))if(node&&node->tag==L"svg"){svg=node;break;}
+                if(svgCache.size()>=128)svgCache.clear();
+                found=svgCache.emplace(svgSource,std::move(svg)).first;
+            }
+            svg=found->second;
+        }else if(rasterResolver){
+            const auto reference=CssUrlReference(images[index]);
+            if(!reference.empty())raster=rasterResolver(reference);
         }
-        const auto& svg=found->second;if(!svg)continue;
-        const auto viewBox=SvgNumbers(svg->Attribute(L"viewbox"));
-        float intrinsicWidth=viewBox.size()==4?viewBox[2]:
-            StyleSheet::Length(svg->Attribute(L"width"),box.width,viewport,box.width);
-        float intrinsicHeight=viewBox.size()==4?viewBox[3]:
-            StyleSheet::Length(svg->Attribute(L"height"),box.height,viewport,box.height);
+        float intrinsicWidth=0,intrinsicHeight=0;
+        if(svg){
+            const auto viewBox=SvgNumbers(svg->Attribute(L"viewbox"));
+            intrinsicWidth=viewBox.size()==4?viewBox[2]:
+                StyleSheet::Length(svg->Attribute(L"width"),box.width,viewport,box.width);
+            intrinsicHeight=viewBox.size()==4?viewBox[3]:
+                StyleSheet::Length(svg->Attribute(L"height"),box.height,viewport,box.height);
+        }else if(raster){
+            intrinsicWidth=static_cast<float>(raster->width);
+            intrinsicHeight=static_cast<float>(raster->height);
+        }else continue;
         if(intrinsicWidth<=0||intrinsicHeight<=0)continue;
 
         const auto sizeValue=ToLower(Trim(layerValue(sizes,index,L"auto")));
         float width=intrinsicWidth,height=intrinsicHeight;
-        if(sizeValue==L"contain"||sizeValue==L"cover"||sizeValue==L"auto"){
+        if(sizeValue==L"contain"||sizeValue==L"cover"){
             const float fit=sizeValue==L"cover"?
                 std::max(box.width/intrinsicWidth,box.height/intrinsicHeight):
                 std::min(box.width/intrinsicWidth,box.height/intrinsicHeight);
             width=intrinsicWidth*fit;height=intrinsicHeight*fit;
         }else{
             const auto words=Words(sizeValue);
-            if(!words.empty()&&words[0]!=L"auto")width=StyleSheet::Length(words[0],box.width,viewport,width);
-            if(words.size()>1&&words[1]!=L"auto")height=StyleSheet::Length(words[1],box.height,viewport,height);
-            else if(intrinsicWidth>0)height=width*intrinsicHeight/intrinsicWidth;
+            const bool autoWidth=words.empty()||words[0]==L"auto";
+            const bool autoHeight=words.size()<2||words[1]==L"auto";
+            if(!autoWidth)width=StyleSheet::Length(words[0],box.width,viewport,width);
+            if(!autoHeight)height=StyleSheet::Length(words[1],box.height,viewport,height);
+            if(autoWidth&&!autoHeight)width=height*intrinsicWidth/intrinsicHeight;
+            else if(!autoWidth&&autoHeight)height=width*intrinsicHeight/intrinsicWidth;
         }
         if(width<=0||height<=0)continue;
 
@@ -3090,17 +3404,34 @@ void PaintSvgBackgrounds(ID2D1RenderTarget* target,const ComputedStyle& style,
         const float left=box.x+BackgroundPosition(horizontal,box.width-width,viewport);
         const float top=box.y+BackgroundPosition(vertical,box.height-height,viewport);
         const auto repeat=ToLower(Trim(layerValue(repeats,index,L"repeat")));
-        const bool repeatX=repeat==L"repeat"||repeat==L"repeat-x";
-        const bool repeatY=repeat==L"repeat"||repeat==L"repeat-y";
+        const auto repeatWords=Words(repeat);
+        bool repeatX=true,repeatY=true;
+        if(repeat==L"repeat-x")repeatY=false;
+        else if(repeat==L"repeat-y")repeatX=false;
+        else if(repeat==L"no-repeat")repeatX=repeatY=false;
+        else if(!repeatWords.empty()){
+            repeatX=repeatWords[0]!=L"no-repeat";
+            repeatY=(repeatWords.size()>1?repeatWords[1]:repeatWords[0])!=L"no-repeat";
+        }
         float firstX=left,firstY=top;
         if(repeatX)while(firstX>box.x)firstX-=width;
         if(repeatY)while(firstY>box.y)firstY-=height;
         size_t painted=0;
         for(float y=firstY;y<box.y+box.height&&painted<4096;y+=repeatY?height:box.height+height){
             for(float x=firstX;x<box.x+box.width&&painted<4096;x+=repeatX?width:box.width+width){
-                LayoutBox image;image.node=svg;image.style=style;
-                image.rect=image.content={x,y,width,height};
-                PaintSvg(target,image,styleSheet,geometryCache);++painted;
+                if(svg){
+                    LayoutBox image;image.node=svg;image.style=style;
+                    image.rect=image.content={x,y,width,height};
+                    PaintSvg(target,image,styleSheet,geometryCache);
+                }else if(auto* bitmap=RasterBitmap(target,raster,bitmapCacheTarget,bitmapCache)){
+                    const auto interpolation=style.Is(L"image-rendering",L"pixelated")||
+                        style.Is(L"image-rendering",L"crisp-edges")?
+                        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR:
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+                    target->DrawBitmap(bitmap,D2D1::RectF(x,y,x+width,y+height),1.0f,interpolation,
+                        D2D1::RectF(0,0,intrinsicWidth,intrinsicHeight));
+                }
+                ++painted;
                 if(!repeatX)break;
             }
             if(!repeatY)break;
@@ -3201,6 +3532,68 @@ struct CanvasFont {
     float size=10.0f;
     DWRITE_FONT_WEIGHT weight=DWRITE_FONT_WEIGHT_NORMAL;
 };
+
+float ImagePositionOffset(const std::wstring& token,float freeSpace,bool horizontal){
+    const auto value=ToLower(Trim(token));
+    if(value.empty()||value==L"center")return freeSpace*0.5f;
+    if(value==(horizontal?L"left":L"top"))return 0;
+    if(value==(horizontal?L"right":L"bottom"))return freeSpace;
+    if(!value.empty()&&value.back()==L'%'){
+        try{return freeSpace*std::stof(value.substr(0,value.size()-1))/100.0f;}catch(...){}
+    }
+    return StyleSheet::Length(value,std::abs(freeSpace),std::abs(freeSpace),0);
+}
+
+void PaintRasterImage(ID2D1RenderTarget* target,const LayoutBox& box,
+                      ID2D1RenderTarget*& cacheTarget,
+                      FastMap<const RasterImageFrame*,Microsoft::WRL::ComPtr<ID2D1Bitmap>>& cache){
+    const auto image=box.node?box.node->image:nullptr;
+    if(!image||image->frames.empty()||image->frameIndex>=image->frames.size()||
+       !image->width||!image->height||box.content.width<=0||box.content.height<=0)return;
+    auto* bitmap=RasterBitmap(target,image,cacheTarget,cache);if(!bitmap)return;
+
+    const float naturalWidth=static_cast<float>(image->width);
+    const float naturalHeight=static_cast<float>(image->height);
+    float width=box.content.width,height=box.content.height;
+    const auto fit=ToLower(Trim(box.style.Get(L"object-fit",L"fill")));
+    if(fit==L"contain"||fit==L"cover"||fit==L"none"||fit==L"scale-down"){
+        const float containScale=std::min(box.content.width/naturalWidth,
+                                          box.content.height/naturalHeight);
+        if(fit==L"none") { width=naturalWidth;height=naturalHeight; }
+        else if(fit==L"scale-down"){
+            const float scale=std::min(1.0f,containScale);
+            width=naturalWidth*scale;height=naturalHeight*scale;
+        }else{
+            const float scale=fit==L"cover"?
+                std::max(box.content.width/naturalWidth,box.content.height/naturalHeight):
+                containScale;
+            width=naturalWidth*scale;height=naturalHeight*scale;
+        }
+    }
+
+    std::wstring xToken=L"50%",yToken=L"50%";
+    std::wistringstream position(box.style.Get(L"object-position",L"50% 50%"));
+    std::wstring first,second;position>>first>>second;
+    const auto normalizedFirst=ToLower(first);
+    if(normalizedFirst==L"top"||normalizedFirst==L"bottom"){
+        yToken=first;if(!second.empty())xToken=second;
+    }else{
+        if(!first.empty())xToken=first;if(!second.empty())yToken=second;
+    }
+    const float left=box.content.x+ImagePositionOffset(xToken,box.content.width-width,true);
+    const float top=box.content.y+ImagePositionOffset(yToken,box.content.height-height,false);
+    const auto destination=D2D1::RectF(left,top,left+width,top+height);
+    const auto interpolation=box.style.Is(L"image-rendering",L"pixelated")||
+        box.style.Is(L"image-rendering",L"crisp-edges")?
+        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR:
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+    target->PushAxisAlignedClip(D2D1::RectF(box.content.x,box.content.y,
+        box.content.x+box.content.width,box.content.y+box.content.height),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    target->DrawBitmap(bitmap,destination,1.0f,interpolation,
+        D2D1::RectF(0,0,naturalWidth,naturalHeight));
+    target->PopAxisAlignedClip();
+}
 
 CanvasFont ParseCanvasFont(const std::wstring& source){
     CanvasFont result;const auto lower=ToLower(source);const auto px=lower.find(L"px");
@@ -3349,6 +3742,7 @@ std::wstring GeneratedContentText(const std::wstring& source,
 
 LayoutEngine::LayoutEngine(Document& document,StyleSheet& styleSheet):document_(document),styleSheet_(styleSheet){}
 LayoutEngine::~LayoutEngine(){ClearOwnerBoundThreadCaches();}
+void LayoutEngine::SetRasterImageResolver(RasterImageResolver resolver){rasterImageResolver_=std::move(resolver);}
 
 std::unique_ptr<LayoutBox> LayoutEngine::Build(const std::shared_ptr<Node>& node,const ComputedStyle* parentStyle,std::uint64_t parentContext,size_t siblingIndex,size_t siblingCount,const std::shared_ptr<Node>& previousElement){
     if(!node)return {};auto box=std::make_unique<LayoutBox>();box->node=node;boxIndex_[node.get()]=box.get();const auto cacheKey=StyleContextHash(node,parentContext,styleSheet_,siblingIndex,siblingCount,previousElement);auto cached=styleCache_.find(cacheKey);if(cached!=styleCache_.end())box->style=cached->second;else{box->style=styleSheet_.Compute(node,parentStyle);styleCache_.emplace(cacheKey,box->style);}box->style.deviceScale=deviceScale_;box->visible=!box->style.Is(L"display",L"none");
@@ -3550,7 +3944,14 @@ void LayoutEngine::ClearTransitions(){
     transitionTargets_.clear();transitions_.clear();
 }
 
+void LayoutEngine::DiscardDeviceResources(){
+    imageBitmapCache_.clear();imageBitmapCacheTarget_=nullptr;
+    shadowBitmapCache_.clear();shadowBitmapCacheTarget_=nullptr;
+    brushCache_.clear();brushCacheTarget_=nullptr;
+}
+
 void LayoutEngine::Layout(float width,float height,float deviceScale){
+    imageBitmapCache_.clear();imageBitmapCacheTarget_=nullptr;
     deviceScale_=std::max(0.01f,deviceScale);
     viewportWidth_=std::max(1.0f,width);viewportHeight_=std::max(1.0f,height);
     styleSheet_.SetViewport(viewportWidth_,viewportHeight_);
@@ -3576,6 +3977,7 @@ void LayoutEngine::Layout(float width,float height,float deviceScale){
     root_->rect={0,0,viewportWidth_,viewportHeight_};root_->content=root_->rect;LayoutBoxTree(*root_,root_->rect,true);
     UpdateTraversalMetadata(*root_);
     UpdateStackingContexts(*root_);
+    UpdateTopLayer();
 }
 
 void LayoutEngine::InvalidateMeasurements(LayoutBox& box){
@@ -3599,6 +4001,7 @@ void LayoutEngine::Relayout(float width,float height,float deviceScale){
     LayoutBoxTree(*root_,root_->rect,true);
     UpdateTraversalMetadata(*root_);
     UpdateStackingContexts(*root_);
+    UpdateTopLayer();
 }
 
 void LayoutEngine::LayoutBoxTree(LayoutBox& box,const LayoutRect& available,bool forcedSize,
@@ -3678,6 +4081,16 @@ void LayoutEngine::UpdateStackingContexts(LayoutBox& scope){
     };
     collect(scope);
     StableStackingOrder(scope.nonNegativeStackingContexts);
+}
+
+void LayoutEngine::UpdateTopLayer(){
+    modalBoxes_.clear();if(!root_)return;
+    std::function<void(LayoutBox&)> collect=[&](LayoutBox& box){
+        if(box.visible&&box.node&&box.node->tag==L"dialog"&&box.node->modal&&
+           box.node->attributes.count(L"open"))modalBoxes_.push_back(&box);
+        for(auto& child:box.children)collect(*child);
+    };
+    collect(*root_);
 }
 
 void LayoutEngine::FinalizeScroll(LayoutBox& box){
@@ -3762,7 +4175,20 @@ void LayoutEngine::LayoutBlock(LayoutBox& box,bool definiteHeight){
     }
     auto inlineOuterWidth=[&](const LayoutBox& child){
         const auto width=child.style.Get(L"width");
-        return !width.empty()&&width!=L"auto"?BlockOuterWidth(child,flowWidth,viewportWidth_):NaturalWidth(child);
+        if(!width.empty()&&width!=L"auto")return BlockOuterWidth(child,flowWidth,viewportWidth_);
+        float natural=NaturalWidth(child);
+        if(child.node->tag==L"img"){
+            // Replaced elements keep their intrinsic width, but percentage
+            // min/max constraints are relative to the actual containing block.
+            // NaturalWidth deliberately cannot resolve those percentages.
+            const auto intrinsicMargin=EdgeValues(child.style,L"margin",500,500);
+            const auto margin=EdgeValues(child.style,L"margin",flowWidth,viewportWidth_);
+            float content=std::max(0.0f,natural-intrinsicMargin.left-intrinsicMargin.right);
+            content=Constrain(child.style,L"min-width",L"max-width",content,
+                              flowWidth,viewportWidth_);
+            natural=content+margin.left+margin.right;
+        }
+        return natural;
     };
     auto inlineOuterHeight=[&](const LayoutBox& child,float width){
         const auto height=child.style.Get(L"height");
@@ -4349,11 +4775,66 @@ void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory,const
         clip.width=std::max(0.0f,right-clip.x);clip.height=std::max(0.0f,bottom-clip.y);
         if(clip.width<=0||clip.height<=0)return;
     }
+    LayoutBox* html=nullptr;LayoutBox* body=nullptr;
+    std::function<void(LayoutBox&)> findCanvasBackground=[&](LayoutBox& box){
+        if(box.node&&box.node->tag==L"html")html=&box;
+        else if(box.node&&box.node->tag==L"body")body=&box;
+        for(auto& child:box.children)findCanvasBackground(*child);
+    };
+    findCanvasBackground(*root_);
+    canvasBackgroundBox_=html&&HasCanvasBackground(html->style)?html:
+        (body&&HasCanvasBackground(body->style)?body:nullptr);
+    if(canvasBackgroundBox_){
+        target->PushAxisAlignedClip(PixelAlignedRect(clip),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const LayoutRect canvas{0,0,viewportWidth_,viewportHeight_};const CornerRadii radius{};
+        const auto color=BackgroundColor(canvasBackgroundBox_->style);
+        if((color>>24)!=0)target->FillRectangle(PixelAlignedRect(canvas),SolidBrush(target,color));
+        PaintGradientBackgrounds(target,canvasBackgroundBox_->style,canvas,radius,viewportWidth_);
+        PaintImageBackgrounds(target,canvasBackgroundBox_->style,canvas,radius,viewportWidth_,
+            document_,styleSheet_,svgBackgroundCache_,svgGeometryCache_,rasterImageResolver_,
+            imageBitmapCacheTarget_,imageBitmapCache_);
+        target->PopAxisAlignedClip();
+    }
+    paintingTopLayer_=nullptr;
     PaintStackingContext(target,factory,*root_,clip);
+    // Modal dialogs and their backdrops are HTML top-layer boxes: they paint
+    // after every document stacking context and are not clipped by ancestors.
+    for(auto* dialog:modalBoxes_)if(dialog&&dialog->visible){
+        PaintDialogBackdrop(target,*dialog,clip);
+        paintingTopLayer_=dialog;
+        PaintStackingContext(target,factory,*dialog,clip);
+    }
+    paintingTopLayer_=nullptr;
+    canvasBackgroundBox_=nullptr;
+}
+
+void LayoutEngine::PaintDialogBackdrop(ID2D1RenderTarget* target,const LayoutBox& dialog,
+                                       const LayoutRect& clipBounds){
+    if(!target||!dialog.node||!dialog.node->modal)return;
+    auto style=styleSheet_.Compute(dialog.node,nullptr,L"backdrop");
+    style.deviceScale=deviceScale_;
+    if(style.Is(L"visibility",L"hidden"))return;
+    float opacity=1.0f;try{opacity=std::stof(style.Get(L"opacity",L"1"));}catch(...){}
+    opacity=std::max(0.0f,std::min(1.0f,opacity));if(opacity<=0.001f)return;
+    target->PushAxisAlignedClip(PixelAlignedRect(clipBounds),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;
+    if(opacity<0.999f&&SUCCEEDED(target->CreateLayer(nullptr,&opacityLayer)))
+        target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),opacity),opacityLayer.Get());
+    const LayoutRect viewport{0,0,viewportWidth_,viewportHeight_};
+    const CornerRadii radius{};const auto color=BackgroundColor(style);
+    if((color>>24)!=0)target->FillRectangle(PixelAlignedRect(viewport),SolidBrush(target,color));
+    PaintGradientBackgrounds(target,style,viewport,radius,viewportWidth_);
+    PaintImageBackgrounds(target,style,viewport,radius,viewportWidth_,document_,styleSheet_,
+        svgBackgroundCache_,svgGeometryCache_,rasterImageResolver_,imageBitmapCacheTarget_,
+        imageBitmapCache_);
+    if(opacityLayer)target->PopLayer();
+    target->PopAxisAlignedClip();
 }
 
 void LayoutEngine::PaintStackingContext(ID2D1RenderTarget* target,IDWriteFactory* factory,
                                         LayoutBox& box,const LayoutRect& clipBounds){
+    if(box.node&&box.node->modal&& &box!=paintingTopLayer_)return;
     target->PushAxisAlignedClip(PixelAlignedRect(clipBounds),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     PaintBox(target,factory,box,clipBounds,&box.nonNegativeStackingContexts);
     for(auto* context:box.nonNegativeStackingContexts)
@@ -4364,6 +4845,7 @@ void LayoutEngine::PaintStackingContext(ID2D1RenderTarget* target,IDWriteFactory
 void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,LayoutBox& box,
                             const LayoutRect& clipBounds,
                             const std::vector<LayoutBox*>* deferredContexts){
+    if(box.node&&box.node->modal&& &box!=paintingTopLayer_)return;
     if(IsDeferredContext(box,deferredContexts))return;
     const bool intersects=box.rect.x<clipBounds.x+clipBounds.width&&box.rect.x+box.rect.width>clipBounds.x&&box.rect.y<clipBounds.y+clipBounds.height&&box.rect.y+box.rect.height>clipBounds.y;
     if(!box.visible||box.rect.width<=0||box.rect.height<=0||!intersects)return;
@@ -4371,11 +4853,15 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     opacity=std::max(0.0f,std::min(1.0f,opacity));
     if(box.style.Is(L"visibility",L"hidden")||opacity<=0.001f)return;D2D1_MATRIX_3X2_F previousTransform{};const bool transformed=ApplyPaintTransform(target,box,previousTransform);Microsoft::WRL::ComPtr<ID2D1Layer> opacityLayer;if(opacity<0.999f&&SUCCEEDED(target->CreateLayer(nullptr,&opacityLayer)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),opacity),opacityLayer.Get());const auto background=BackgroundColor(box.style);ID2D1SolidColorBrush* brush=nullptr;
     const auto radius=UniformCornerRadii(box.style,box.rect.width,box.rect.height,viewportWidth_);
-    PaintOuterBoxShadows(target,box.style,box.rect,radius,viewportWidth_);
-    if((background>>24)!=0){brush=SolidBrush(target,background);auto rect=PixelAlignedRect(box.rect);if(radius.x>0&&radius.y>0)target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius.x,radius.y),brush);else target->FillRectangle(rect,brush);}
-    PaintGradientBackgrounds(target,box.style,box.rect,radius,viewportWidth_);
-    PaintSvgBackgrounds(target,box.style,box.rect,radius,viewportWidth_,document_,styleSheet_,
-                        svgBackgroundCache_,svgGeometryCache_);
+    PaintOuterBoxShadows(target,box.style,box.rect,radius,viewportWidth_,deviceScale_,
+                         shadowBitmapCacheTarget_,shadowBitmapCache_);
+    if(&box!=canvasBackgroundBox_){
+        if((background>>24)!=0){brush=SolidBrush(target,background);auto rect=PixelAlignedRect(box.rect);if(radius.x>0&&radius.y>0)target->FillRoundedRectangle(D2D1::RoundedRect(rect,radius.x,radius.y),brush);else target->FillRectangle(rect,brush);}
+        PaintGradientBackgrounds(target,box.style,box.rect,radius,viewportWidth_);
+        PaintImageBackgrounds(target,box.style,box.rect,radius,viewportWidth_,document_,styleSheet_,
+                              svgBackgroundCache_,svgGeometryCache_,rasterImageResolver_,
+                              imageBitmapCacheTarget_,imageBitmapCache_);
+    }
     PaintInsetBoxShadows(target,box.style,box.rect,viewportWidth_);
     const auto borders=BorderValues(box.style);const bool uniform=borders.top==borders.right&&borders.top==borders.bottom&&borders.top==borders.left;
     const LayoutBox* collapsedTable=nullptr;
@@ -4444,7 +4930,9 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     }
     if(box.node->tag==L"svg")PaintSvg(target,box,styleSheet_,svgGeometryCache_);
     if(box.node->tag==L"canvas")PaintCanvas(target,factory,box);
+    if(box.node->tag==L"img")PaintRasterImage(target,box,imageBitmapCacheTarget_,imageBitmapCache_);
     bool placeholderText=false;std::wstring text=BoxText(box,&placeholderText);
+    if(box.node->tag==L"img"&&!box.node->image)text=box.node->Attribute(L"alt");
     if(box.node->type==NodeType::Text&&!text.empty()){
         const auto* owner=box.parent;
         if(owner&&owner->style.Is(L"text-overflow",L"ellipsis")&&
@@ -4524,7 +5012,43 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
             target->FillGeometry(selectArrowGeometry_.Get(),brush);target->SetTransform(current);
         }
     }
-    const auto overflow=box.style.Get(L"overflow",L"visible"),overflowX=box.style.Get(L"overflow-x",L"visible"),overflowY=box.style.Get(L"overflow-y",L"visible");const bool clip=overflow==L"hidden"||overflow==L"clip"||overflow==L"auto"||overflow==L"scroll"||overflowX==L"hidden"||overflowX==L"clip"||overflowX==L"auto"||overflowX==L"scroll"||overflowY==L"hidden"||overflowY==L"clip"||overflowY==L"auto"||overflowY==L"scroll";LayoutRect childClip=clipBounds;if(clip){const float left=std::max(clipBounds.x,box.content.x),top=std::max(clipBounds.y,box.content.y),right=std::min(clipBounds.x+clipBounds.width,box.content.x+box.content.width),bottom=std::min(clipBounds.y+clipBounds.height,box.content.y+box.content.height);childClip={left,top,std::max(0.0f,right-left),std::max(0.0f,bottom-top)};target->PushAxisAlignedClip(PixelAlignedRect(box.content),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);}
+    const auto overflow=box.style.Get(L"overflow",L"visible");
+    const auto overflowX=box.style.Get(L"overflow-x",overflow);
+    const auto overflowY=box.style.Get(L"overflow-y",overflow);
+    const auto clips=[](const std::wstring& value){
+        return value==L"hidden"||value==L"clip"||value==L"auto"||value==L"scroll";
+    };
+    const bool clip=clips(overflow)||clips(overflowX)||clips(overflowY);
+    LayoutRect childClip=clipBounds;
+    Microsoft::WRL::ComPtr<ID2D1Layer> roundedOverflowLayer;
+    Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry> roundedOverflowGeometry;
+    bool roundedOverflowClip=false;
+    if(clip){
+        // Overflow clips at the padding edge. The padding-box curve is the
+        // border-box radius inset by the border; clipping to content instead
+        // incorrectly removes padding, while reusing the outer curve lets a
+        // descendant repaint the inside edge of the rounded border.
+        const auto paddingBox=PaddingBox(box);
+        childClip=IntersectRects(clipBounds,paddingBox);
+        target->PushAxisAlignedClip(PixelAlignedRect(paddingBox),
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const float clipRadiusX=std::max(0.0f,radius.x-
+            std::max(borders.left,borders.right));
+        const float clipRadiusY=std::max(0.0f,radius.y-
+            std::max(borders.top,borders.bottom));
+        if(clipRadiusX>0&&clipRadiusY>0){
+            Microsoft::WRL::ComPtr<ID2D1Factory> clipFactory;
+            target->GetFactory(&clipFactory);
+            if(clipFactory&&SUCCEEDED(clipFactory->CreateRoundedRectangleGeometry(
+                    D2D1::RoundedRect(PixelAlignedRect(paddingBox),clipRadiusX,clipRadiusY),
+                    &roundedOverflowGeometry))&&
+               SUCCEEDED(target->CreateLayer(nullptr,&roundedOverflowLayer))){
+                target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),
+                    roundedOverflowGeometry.Get()),roundedOverflowLayer.Get());
+                roundedOverflowClip=true;
+            }
+        }
+    }
     const auto paintChild=[&](LayoutBox& child){
         if(IsDeferredContext(child,deferredContexts))return;
         if(IsStackingContext(child))PaintStackingContext(target,factory,child,childClip);
@@ -4539,7 +5063,10 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
     }else{
         for(auto* child:box.paintChildren)paintChild(*child);
     }
-    if(clip)target->PopAxisAlignedClip();
+    if(clip){
+        if(roundedOverflowClip)target->PopLayer();
+        target->PopAxisAlignedClip();
+    }
     VerticalScrollbarGeometry scrollbar;if(VerticalScrollbarFor(box,styleSheet_,scrollbar)){
         const auto colorScheme=ToLower(Trim(box.style.Get(L"color-scheme",L"light")));
         const bool darkScheme=!colorScheme.empty()&&Words(colorScheme).front()==L"dark";
@@ -4587,7 +5114,7 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         const float trackRight=horizontalScrollbar.track.x+horizontalScrollbar.track.width;
         if((trackColor>>24)!=0){brush=SolidBrush(target,trackColor);target->FillRectangle(D2D1::RectF(horizontalScrollbar.track.x,horizontalScrollbar.track.y,trackRight,horizontalScrollbar.track.y+horizontalScrollbar.track.height),brush);}
         brush=SolidBrush(target,thumbColor);const auto thumbRadii=UniformCornerRadii(thumbStyle,horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height,viewportWidth_);const float thumbRadius=horizontalScrollbar.standardStyling?std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f:(thumbRadii.x>0?thumbRadii.x:std::min(horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.height)/2.0f);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(horizontalScrollbar.thumb.x,horizontalScrollbar.thumb.y,horizontalScrollbar.thumb.x+horizontalScrollbar.thumb.width,horizontalScrollbar.thumb.y+horizontalScrollbar.thumb.height),thumbRadius,thumbRadius),brush);
-        if(horizontalScrollbar.arrowWidth>0&&horizontalArrowGeometry_){
+    if(horizontalScrollbar.arrowWidth>0&&horizontalArrowGeometry_){
             const float center=horizontalScrollbar.track.y+horizontalScrollbar.track.height/2.0f;
             const float halfHeight=horizontalScrollbar.thumb.height/2.0f;
             const float figureWidth=horizontalScrollbar.arrowWidth/3.0f;
@@ -4602,11 +5129,23 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
             target->FillGeometry(horizontalArrowGeometry_.Get(),brush);target->SetTransform(current);
         }
     }
+    PaintOutline(target,box.style,box.rect,radius,viewportWidth_);
     if(opacityLayer)target->PopLayer();
     if(transformed)target->SetTransform(previousTransform);
 }
 
-std::shared_ptr<Node> LayoutEngine::HitTest(float x,float y)const{return root_?HitTestStackingContext(*root_,x,y):nullptr;}
+std::shared_ptr<Node> LayoutEngine::HitTest(float x,float y)const{
+    if(!root_)return {};
+    for(auto it=modalBoxes_.rbegin();it!=modalBoxes_.rend();++it){
+        const auto* dialog=*it;if(!dialog||!dialog->visible||!dialog->node)continue;
+        if(auto node=HitTestStackingContext(*dialog,x,y))return node;
+        const auto backdrop=styleSheet_.Compute(dialog->node,nullptr,L"backdrop");
+        if(x>=0&&y>=0&&x<viewportWidth_&&y<viewportHeight_&&
+           !backdrop.Is(L"pointer-events",L"none")&&
+           !backdrop.Is(L"visibility",L"hidden"))return dialog->node;
+    }
+    return HitTestStackingContext(*root_,x,y);
+}
 
 bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float y,
                                std::shared_ptr<Node>& textNode,size_t& textOffset){
@@ -4619,7 +5158,7 @@ bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float 
         [&](LayoutBox& box,LayoutRect clip,bool generated){
             if(!box.visible)return;
             generated=generated||!box.pseudo.empty();
-            if(ClipsOverflow(box))clip=IntersectRects(clip,box.content);
+            if(ClipsOverflow(box))clip=IntersectRects(clip,PaddingBox(box));
             const bool textRun=box.node->type==NodeType::Text;
             const bool textControl=box.node==scope&&(box.node->tag==L"input"||box.node->tag==L"textarea");
             if(!generated&&(textRun||textControl)){
@@ -4657,9 +5196,209 @@ bool LayoutEngine::HitTestText(const std::shared_ptr<Node>& scope,float x,float 
     textNode=bestSource;textOffset=std::min(sourceLength,sourceOffset+localOffset);return true;
 }
 
+bool LayoutEngine::VerticalCaretPosition(const std::shared_ptr<Node>& scope,
+                                         const std::shared_ptr<Node>& currentNode,
+                                         size_t currentOffset,float preferredX,bool upward,
+                                         std::shared_ptr<Node>& targetNode,
+                                         size_t& targetOffset){
+    targetNode.reset();targetOffset=0;
+    if(!scope||!currentNode||!root_)return false;
+    const auto scopeEntry=boxIndex_.find(scope.get());
+    if(scopeEntry==boxIndex_.end()||!scopeEntry->second)return false;
+    LayoutRect currentCaret{};
+    if(!TextCaretRect(currentNode,currentOffset,currentCaret))return false;
+    struct CaretLine {
+        LayoutBox* box=nullptr;
+        std::shared_ptr<Node> source;
+        size_t sourceStart=0;
+        size_t localStart=0;
+        size_t localLength=0;
+        float top=0;
+        float height=0;
+        float baseline=0;
+        bool boundary=false;
+        size_t boundaryOffset=0;
+    };
+    std::vector<CaretLine> lines;
+    std::function<bool(LayoutBox&,bool)> collect=[&](LayoutBox& box,bool generated){
+        if(!box.visible)return false;
+        generated=generated||!box.pseudo.empty();
+        bool hasPosition=false;
+        if(!generated){
+            const bool textRun=box.node->type==NodeType::Text;
+            const bool textControl=box.node==scope&&
+                (box.node->tag==L"input"||box.node->tag==L"textarea");
+            auto source=textRun&&box.generatedFrom&&box.generatedFrom->type==NodeType::Text?
+                box.generatedFrom:box.node;
+            if((textRun||textControl)&&source&&
+               (textControl||ParticipatesInEditableContent(source))){
+                const auto text=BoxText(box);
+                EnsureTextLayout(box,SharedWriteFactory(),text);
+                if(box.textLayout){
+                    UINT32 count=0;box.textLayout->GetLineMetrics(nullptr,0,&count);
+                    if(count){
+                        std::vector<DWRITE_LINE_METRICS> metrics(count);
+                        if(SUCCEEDED(box.textLayout->GetLineMetrics(metrics.data(),count,&count))){
+                            const auto origin=TextOrigin(box);float top=origin.y;size_t local=0;
+                            for(UINT32 index=0;index<count;++index){
+                                const float height=std::max(1.0f,metrics[index].height);
+                                lines.push_back({&box,source,
+                                    textRun?box.textSourceOffset:0,local,
+                                    static_cast<size_t>(metrics[index].length),top,height,
+                                    top+metrics[index].baseline,false,0});
+                                local+=metrics[index].length;top+=height;hasPosition=true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if(!generated){
+            for(auto& child:box.children)
+                hasPosition=collect(*child,generated)||hasPosition;
+            const auto display=ToLower(box.style.Get(L"display"));
+            const bool lineContainer=display==L"block"||display==L"flow-root"||
+                display==L"list-item"||box.node==scope;
+            if(!hasPosition&&lineContainer&&box.node->type==NodeType::Element&&
+               ParticipatesInEditableContent(box.node)){
+                LayoutRect caret{};
+                if(TextCaretRect(box.node,0,caret)){
+                    lines.push_back({&box,box.node,0,0,0,caret.y,
+                        std::max(1.0f,caret.height),
+                        caret.y+TextBaselineOffset(box.style),true,0});
+                    hasPosition=true;
+                }
+            }
+        }
+        return hasPosition;
+    };
+    collect(*scopeEntry->second,false);
+    if(lines.empty())return false;
+
+    float currentBaseline=currentCaret.y+currentCaret.height*0.8f;
+    float currentMatch=std::numeric_limits<float>::max();
+    for(const auto& line:lines){
+        if(line.source!=currentNode)continue;
+        bool contains=false;
+        if(line.boundary)contains=currentOffset==line.boundaryOffset;
+        else if(currentOffset>=line.sourceStart){
+            const size_t local=currentOffset-line.sourceStart;
+            contains=local>=line.localStart&&
+                local<=line.localStart+line.localLength;
+        }
+        if(!contains)continue;
+        const float distance=std::abs(line.top-currentCaret.y);
+        if(distance<currentMatch){currentMatch=distance;currentBaseline=line.baseline;}
+    }
+    const float epsilon=0.5f/std::max(0.01f,deviceScale_);
+    bool foundBaseline=false;float targetBaseline=0;
+    for(const auto& line:lines){
+        if(upward){
+            if(line.baseline>=currentBaseline-epsilon)continue;
+            if(!foundBaseline||line.baseline>targetBaseline){
+                targetBaseline=line.baseline;foundBaseline=true;
+            }
+        }else{
+            if(line.baseline<=currentBaseline+epsilon)continue;
+            if(!foundBaseline||line.baseline<targetBaseline){
+                targetBaseline=line.baseline;foundBaseline=true;
+            }
+        }
+    }
+    if(!foundBaseline)return false;
+    const CaretLine* target=nullptr;float horizontalDistance=std::numeric_limits<float>::max();
+    const float baselineTolerance=std::max(0.25f,epsilon);
+    for(const auto& line:lines){
+        if(std::abs(line.baseline-targetBaseline)>baselineTolerance)continue;
+        float left=line.box->rect.x,right=line.box->rect.x+line.box->rect.width;
+        if(line.boundary){
+            LayoutRect caret{};if(TextCaretRect(line.source,line.boundaryOffset,caret))
+                left=right=caret.x;
+        }
+        const float distance=preferredX<left?left-preferredX:
+            (preferredX>right?preferredX-right:0.0f);
+        if(distance<horizontalDistance){horizontalDistance=distance;target=&line;}
+    }
+    if(!target)return false;
+    if(target->boundary){
+        targetNode=target->source;targetOffset=target->boundaryOffset;return true;
+    }
+    const auto text=BoxText(*target->box);
+    EnsureTextLayout(*target->box,SharedWriteFactory(),text);
+    if(!target->box->textLayout)return false;
+    const auto origin=TextOrigin(*target->box);BOOL trailing=FALSE,inside=FALSE;
+    DWRITE_HIT_TEST_METRICS hit{};
+    size_t local=target->localStart;
+    if(SUCCEEDED(target->box->textLayout->HitTestPoint(
+        preferredX-origin.x,target->top+target->height*0.5f-origin.y,
+        &trailing,&inside,&hit)))
+        local=std::min(text.size(),static_cast<size_t>(hit.textPosition)+
+            (trailing?static_cast<size_t>(hit.length):0));
+    const size_t sourceLength=target->source->type==NodeType::Text?
+        target->source->text.size():target->source->Attribute(L"value").size();
+    targetNode=target->source;
+    targetOffset=std::min(sourceLength,target->sourceStart+local);return true;
+}
+
 bool LayoutEngine::TextCaretRect(const std::shared_ptr<Node>& textNode,size_t textOffset,
                                  LayoutRect& caretRect){
     caretRect={};if(!textNode||!root_)return false;
+    // DOM Range offsets on elements describe a position between children.
+    // Contenteditable keeps those boundaries directly (for example after an
+    // inserted image), so resolve them from the surrounding CSS boxes without
+    // relying on a disposable empty text node.
+    if(textNode->type==NodeType::Element&&textNode->tag!=L"input"&&
+       textNode->tag!=L"textarea"){
+        const auto containerEntry=boxIndex_.find(textNode.get());
+        if(containerEntry==boxIndex_.end()||!containerEntry->second||
+           !containerEntry->second->visible)return false;
+        const auto* containerBox=containerEntry->second;
+        const float caretWidth=1.0f/std::max(0.01f,deviceScale_);
+        const float lineHeight=std::max(1.0f,LineHeight(containerBox->style));
+        const auto caretLine=CaretLineMetrics(containerBox->style);
+        const auto boxCaret=[&](const LayoutBox& box,bool after,LayoutRect& result){
+            const bool inlineLevel=IsInlineLevel(box.style.Get(L"display"));
+            if(!inlineLevel){
+                result={containerBox->content.x,
+                    (after?box.rect.y+box.rect.height:box.rect.y)+caretLine.topInset,
+                    caretWidth,caretLine.height};
+                return true;
+            }
+            // Atomic inline boxes can be taller than the inherited line
+            // height.  A caret at their DOM edge belongs to the line's text
+            // track, not to the bottom of the replaced element.  The inline
+            // formatter places a following text run at this same line origin.
+            result={after?box.rect.x+box.rect.width:box.rect.x,
+                    box.rect.y+caretLine.topInset,caretWidth,caretLine.height};
+            return true;
+        };
+        std::function<bool(const std::shared_ptr<Node>&,bool,LayoutRect&)> edgeCaret;
+        edgeCaret=[&](const std::shared_ptr<Node>& node,bool after,LayoutRect& result){
+            if(!node)return false;
+            if(node->type==NodeType::Text)
+                return TextCaretRect(node,after?node->text.size():0,result);
+            const auto found=boxIndex_.find(node.get());
+            if(found!=boxIndex_.end()&&found->second&&found->second->visible&&
+               !IsInlineLevel(found->second->style.Get(L"display")))
+                return boxCaret(*found->second,after,result);
+            if(after){
+                for(auto child=node->children.rbegin();child!=node->children.rend();++child)
+                    if(edgeCaret(*child,true,result))return true;
+            }else{
+                for(const auto& child:node->children)
+                    if(edgeCaret(child,false,result))return true;
+            }
+            return found!=boxIndex_.end()&&found->second&&found->second->visible?
+                boxCaret(*found->second,after,result):false;
+        };
+        const size_t offset=std::min(textOffset,textNode->children.size());
+        for(size_t index=offset;index>0;--index)
+            if(edgeCaret(textNode->children[index-1],true,caretRect))return true;
+        for(size_t index=offset;index<textNode->children.size();++index)
+            if(edgeCaret(textNode->children[index],false,caretRect))return true;
+        caretRect={containerBox->content.x,containerBox->content.y,caretWidth,lineHeight};
+        return true;
+    }
     LayoutBox* matched=nullptr;std::wstring matchedText;
     std::function<void(LayoutBox&,bool)> find=[&](LayoutBox& box,bool generated){
         if(matched||!box.visible)return;

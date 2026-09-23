@@ -5,6 +5,11 @@
 #include "DOM.h"
 #include "JavaScript.h"
 #include "Layout.h"
+#include "RasterImage.h"
+// Keep the decoder in this long-standing translation unit as well as in its
+// own source file.  Some downstream TWebFrame consumers maintain a fixed
+// source list and would otherwise omit the new raster implementation.
+#include "RasterImage.cpp"
 #include "TextInput.h"
 
 #include <d2d1.h>
@@ -45,6 +50,7 @@ constexpr UINT_PTR kAnimationFrameTimer = 0x5746;
 constexpr UINT_PTR kJavaScriptTimer = 0x5747;
 constexpr UINT_PTR kCssTransitionTimer = 0x5748;
 constexpr UINT_PTR kCaretBlinkTimer = 0x5749;
+constexpr UINT_PTR kImageAnimationTimer = 0x574a;
 constexpr UINT kAnimationFrameFallbackMessage = WM_APP + 0x57;
 constexpr UINT_PTR kTooltipToolId = 0x5750;
 
@@ -78,6 +84,14 @@ bool IsContentEditable(const std::shared_ptr<Node>& node) {
     if(!node||!node->attributes.count(L"contenteditable"))return false;
     const auto value=ToLower(Trim(node->Attribute(L"contenteditable")));
     return value.empty()||value==L"true"||value==L"plaintext-only";
+}
+
+bool IsAtomicEditingElement(const std::shared_ptr<Node>& node) {
+    if(!node||node->type!=NodeType::Element)return false;
+    const auto& tag=node->tag;
+    return tag==L"img"||tag==L"br"||tag==L"hr"||tag==L"input"||
+           tag==L"canvas"||tag==L"svg"||tag==L"iframe"||tag==L"video"||
+           tag==L"audio"||tag==L"embed"||tag==L"object";
 }
 
 std::shared_ptr<Node> EditableRoot(const std::shared_ptr<Node>& node) {
@@ -127,7 +141,10 @@ bool FileInfoForPath(const std::wstring& path,Node::FileInfo& result){
     if(result.name.empty())result.name=selected.root_name().wstring();
     result.path=selected.lexically_normal().wstring();
     result.type=directory?L"application/x-directory":extension==L".csv"?L"text/csv":extension==L".json"?L"application/json":
-        extension==L".txt"||extension==L".log"?L"text/plain":L"application/octet-stream";
+        extension==L".txt"||extension==L".log"?L"text/plain":extension==L".png"?L"image/png":
+        extension==L".jpg"||extension==L".jpeg"?L"image/jpeg":extension==L".gif"?L"image/gif":
+        extension==L".webp"?L"image/webp":extension==L".bmp"||extension==L".dib"?L"image/bmp":
+        extension==L".svg"?L"image/svg+xml":L"application/octet-stream";
     result.size=directory?0:(static_cast<unsigned long long>(metadata.nFileSizeHigh)<<32)|metadata.nFileSizeLow;
     return true;
 }
@@ -228,6 +245,8 @@ struct View::Impl {
     MessageHandler messageHandler;
     LoadHandler loadHandler;
     View::ResourceLoader resourceLoader;
+    View::BinaryResourceLoader binaryResourceLoader;
+    std::unordered_map<std::wstring,std::shared_ptr<RasterImage>> rasterImageCache;
     struct ChildFrame { std::shared_ptr<Node> node; std::unique_ptr<View> view; };
     std::vector<ChildFrame> childFrames;
     std::wstring lastError;
@@ -263,9 +282,17 @@ struct View::Impl {
     bool selectPopupScrollDragging=false;
     float selectPopupScrollDragOffset=0;
     std::shared_ptr<Node> editingNode;
+    // A collapsed contenteditable selection may live between child nodes
+    // (notably immediately after an img).  Keep that DOM boundary as a real
+    // selection instead of manufacturing an empty text node that normalize()
+    // is required to remove.
+    std::shared_ptr<Node> editingBoundaryContainer;
+    size_t editingBoundaryOffset=0;
     bool textSelectionDragging=false;
     size_t selectionAnchor=0;
     size_t caretPosition=0;
+    float verticalCaretX=0;
+    bool verticalCaretXValid=false;
     bool caretVisible=true;
     bool caretBlinkTimerActive=false;
     bool textEditDirty=false;
@@ -290,6 +317,7 @@ struct View::Impl {
     float pointerX=0;
     float pointerY=0;
     bool cssTransitionTimerActive=false;
+    bool imageAnimationTimerActive=false;
     std::chrono::steady_clock::time_point cssTransitionTick{};
     HWND tooltip=nullptr;
     HFONT tooltipFont=nullptr;
@@ -329,6 +357,127 @@ struct View::Impl {
         if(path.is_relative()&&!basePath.empty())path=std::filesystem::path(basePath)/path;
         std::ifstream input(path,std::ios::binary);if(!input)return false;
         std::ostringstream bytes;bytes<<input.rdbuf();content=Utf8ToWide(bytes.str());return true;
+    }
+
+    static int HexDigit(wchar_t value){
+        if(value>=L'0'&&value<=L'9')return value-L'0';
+        if(value>=L'a'&&value<=L'f')return value-L'a'+10;
+        if(value>=L'A'&&value<=L'F')return value-L'A'+10;
+        return -1;
+    }
+    static std::wstring PercentDecode(const std::wstring& value){
+        std::wstring result;std::string encoded;
+        const auto flush=[&]{if(!encoded.empty()){result+=Utf8ToWide(encoded);encoded.clear();}};
+        for(size_t index=0;index<value.size();++index){
+            if(value[index]==L'%'&&index+2<value.size()){
+                const int high=HexDigit(value[index+1]),low=HexDigit(value[index+2]);
+                if(high>=0&&low>=0){encoded.push_back(static_cast<char>((high<<4)|low));index+=2;continue;}
+            }
+            flush();result.push_back(value[index]);
+        }
+        flush();return result;
+    }
+    std::wstring ResolveResourceReference(const std::wstring& reference)const{
+        if(reference.rfind(L"data:",0)==0)return reference;
+        auto resolved=reference;
+        const auto baseScheme=basePath.find(L"://");
+        if(baseScheme!=std::wstring::npos&&reference.find(L"://")==std::wstring::npos){
+            auto base=basePath;const auto fragment=base.find(L'#');
+            if(fragment!=std::wstring::npos)base.resize(fragment);
+            const auto originEnd=base.find(L'/',baseScheme+3);
+            if(reference.rfind(L"//",0)==0)resolved=base.substr(0,baseScheme+1)+reference;
+            else if(!reference.empty()&&reference.front()==L'/')
+                resolved=(originEnd==std::wstring::npos?base:base.substr(0,originEnd))+reference;
+            else{
+                const auto slash=base.find_last_of(L'/');
+                resolved=(slash==std::wstring::npos?base+L'/':base.substr(0,slash+1))+reference;
+            }
+        }
+        return resolved;
+    }
+    bool LoadBinaryResource(const std::wstring& reference,
+                            std::vector<unsigned char>& bytes)const{
+        if(DecodeImageDataUrl(reference,bytes))return true;
+        const auto resolved=ResolveResourceReference(reference);
+        if(binaryResourceLoader&&binaryResourceLoader(resolved,bytes))return true;
+        if(resolved!=reference&&binaryResourceLoader&&binaryResourceLoader(reference,bytes))return true;
+        if(resolved.find(L"://")!=std::wstring::npos&&resolved.rfind(L"file://",0)!=0)return false;
+        auto local=resolved;
+        if(local.rfind(L"file:///",0)==0)local=PercentDecode(local.substr(8));
+        else if(local.rfind(L"file://",0)==0)local=PercentDecode(local.substr(7));
+        const auto suffix=local.find_first_of(L"?#");if(suffix!=std::wstring::npos)local.resize(suffix);
+        std::filesystem::path path(local);
+        if(path.is_relative()&&!basePath.empty()&&basePath.find(L"://")==std::wstring::npos)
+            path=std::filesystem::path(basePath)/path;
+        std::ifstream input(path,std::ios::binary);if(!input)return false;
+        input.seekg(0,std::ios::end);const auto size=input.tellg();
+        if(size<=0)return false;input.seekg(0,std::ios::beg);
+        bytes.resize(static_cast<size_t>(size));
+        input.read(reinterpret_cast<char*>(bytes.data()),size);
+        return input.good()||input.eof();
+    }
+
+    std::shared_ptr<RasterImage> ResolveRasterImage(const std::wstring& reference){
+        const auto key=ResolveResourceReference(reference);
+        const auto cached=rasterImageCache.find(key);
+        if(cached!=rasterImageCache.end())return cached->second;
+        std::vector<unsigned char> bytes;std::wstring decodeError;
+        std::shared_ptr<RasterImage> image;
+        if(LoadBinaryResource(reference,bytes))image=DecodeRasterImage(bytes,key,&decodeError);
+        if(image&&image->animated){
+            const auto now=GetTickCount64();
+            image->nextFrameTick=now+std::max(1u,image->frames.front().delayMs);
+        }
+        rasterImageCache.emplace(key,image);
+        if(image&&image->animated)SyncImageAnimationTimer();
+        return image;
+    }
+
+    std::vector<std::shared_ptr<RasterImage>> ActiveRasterImages()const{
+        std::vector<std::shared_ptr<RasterImage>> result;
+        std::unordered_set<const RasterImage*> seen;
+        const auto append=[&](const std::shared_ptr<RasterImage>& image){
+            if(image&&seen.insert(image.get()).second)result.push_back(image);
+        };
+        for(const auto& item:rasterImageCache)append(item.second);
+        for(const auto& node:document.QuerySelectorAll(L"img"))append(node->image);
+        return result;
+    }
+
+    bool LoadImageNode(const std::shared_ptr<Node>& node,bool dispatchEvent){
+        if(!node||node->tag!=L"img")return false;
+        const auto source=node->Attribute(L"src");
+        if(node->imageSource==source&&node->imageComplete)return false;
+        node->imageSource=source;node->image.reset();node->imageComplete=source.empty();
+        if(source.empty())return true;
+        node->image=ResolveRasterImage(source);
+        node->imageComplete=true;
+        if(dispatchEvent){JavaScriptRuntime::EventInit event;event.bubbles=false;event.cancelable=false;
+            javascript.DispatchNodeEvent(node,node->image?L"load":L"error",event);}
+        return true;
+    }
+    void SyncImageAnimationTimer(){
+        KillTimer(hwnd,kImageAnimationTimer);imageAnimationTimerActive=false;
+        const auto now=GetTickCount64();std::uint32_t delay=0;
+        for(const auto& image:ActiveRasterImages()){
+            const auto candidate=image->TimeUntilNextFrame(now);
+            if(candidate&&(!delay||candidate<delay))delay=candidate;
+        }
+        if(delay)imageAnimationTimerActive=
+            SetTimer(hwnd,kImageAnimationTimer,std::max(1u,delay),nullptr)!=0;
+    }
+    bool LoadImages(bool dispatchEvents){
+        bool changed=false;
+        for(const auto& node:document.QuerySelectorAll(L"img"))
+            changed=LoadImageNode(node,dispatchEvents)||changed;
+        SyncImageAnimationTimer();return changed;
+    }
+    void AdvanceImageAnimations(){
+        KillTimer(hwnd,kImageAnimationTimer);imageAnimationTimerActive=false;
+        const auto now=GetTickCount64();bool changed=false;
+        for(const auto& image:ActiveRasterImages())changed=image->Advance(now)||changed;
+        if(changed)InvalidateRect(hwnd,nullptr,FALSE);
+        SyncImageAnimationTimer();
     }
 
     float DpiScale()const{
@@ -476,10 +625,19 @@ struct View::Impl {
         DragAcceptFiles(hwnd,TRUE);
         HRESULT hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,d2dFactory.ReleaseAndGetAddressOf());if(FAILED(hr)){lastError=L"D2D1CreateFactory failed";return false;}
         hr=DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf()));if(FAILED(hr)){lastError=L"DWriteCreateFactory failed";return false;}
+        layout.SetRasterImageResolver([this](const std::wstring& reference){
+            return ResolveRasterImage(reference);
+        });
         javascript.SetMessageSink([this](const std::wstring& msg){if(messageHandler)messageHandler(msg);});
         javascript.SetMutationSink([this](const JavaScriptRuntime::Mutation& mutation){HandleMutation(mutation);});
         javascript.SetFocusSink([this](const std::shared_ptr<Node>& node){
             SetFocusedNode(node,true,true);
+        });
+        javascript.SetActivationSink([this](const std::shared_ptr<Node>& node){
+            if(!node)return;if(layoutDirty)Rebuild();float x=0,y=0;if(const auto* box=layout.BoxFor(node)){x=box->content.x+box->content.width/2;y=box->content.y+box->content.height/2;}Activate(node,x,y,true);
+        });
+        javascript.SetPointerCaptureSink([this](bool capture){
+            if(capture){if(GetCapture()!=hwnd)SetCapture(hwnd);}else if(GetCapture()==hwnd)ReleaseCapture();
         });
         javascript.SetSelectionProvider([this](const std::shared_ptr<Node>& node,size_t& start,size_t& end){
             if(!IsTextControl(node))return false;
@@ -489,11 +647,20 @@ struct View::Impl {
         });
         javascript.SetSelectionSetter([this](const std::shared_ptr<Node>& node,size_t start,size_t end){
             if(node!=focused||!IsTextControl(node))return;editingNode=node;
-            const auto length=node->Attribute(L"value").size();selectionAnchor=std::min(start,length);
-            caretPosition=std::min(end,length);ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);
+            const auto length=node->Attribute(L"value").size();const auto first=std::min(start,length),last=std::min(end,length);
+            if(node->selectionDirection==L"backward"){selectionAnchor=last;caretPosition=first;}
+            else{selectionAnchor=first;caretPosition=last;}ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);
         });
         javascript.SetDomSelectionProvider([this](JavaScriptRuntime::DomSelection& selection){
-            if(!focused||!editingNode||(!IsTextControl(focused)&&!IsContentEditable(focused)))return false;
+            if(!focused||(!editingNode&&!editingBoundaryContainer)||
+               (!IsTextControl(focused)&&!IsContentEditable(focused)))return false;
+            if(editingBoundaryContainer){
+                const auto offset=std::min(editingBoundaryOffset,
+                                           editingBoundaryContainer->children.size());
+                selection.anchorNode=selection.focusNode=editingBoundaryContainer;
+                selection.anchorOffset=selection.focusOffset=offset;
+                return true;
+            }
             selection.anchorNode=editingNode;selection.anchorOffset=std::min(selectionAnchor,EditingValue().size());
             selection.focusNode=editingNode;selection.focusOffset=std::min(caretPosition,EditingValue().size());
             return true;
@@ -502,14 +669,31 @@ struct View::Impl {
             if(!selection.anchorNode||!selection.focusNode)return;
             const auto root=IsTextControl(selection.anchorNode)?selection.anchorNode:EditableRoot(selection.anchorNode);
             if(!root)return;
-            SetFocusedNode(root,true,true);
+            // addRange() supplies the exact editing position, so focusing here
+            // must not create a surrogate text node before that position is
+            // installed.
+            SetFocusedNode(root,true,false);
             auto target=selection.anchorNode;
-            if(target->type!=NodeType::Text&&target!=root)target=EnsureEditableTextNode(target);
-            if(target==root&&IsContentEditable(root))target=EnsureEditableTextNode(root);
+            size_t anchorOffset=selection.anchorOffset,focusOffset=selection.focusOffset;
+            if(IsContentEditable(root)&&target->type!=NodeType::Text&&
+               selection.focusNode==target&&selection.focusOffset==selection.anchorOffset){
+                const auto boundary=EditableBoundary(target,selection.anchorOffset);
+                if(!boundary.first)return;
+                editingNode.reset();editingBoundaryContainer=boundary.first;
+                editingBoundaryOffset=boundary.second;
+                selectionAnchor=caretPosition=0;verticalCaretXValid=false;
+                ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return;
+            }else{
+                if(target->type!=NodeType::Text&&target!=root)target=EnsureEditableTextNode(target);
+                if(target==root&&IsContentEditable(root))target=EnsureEditableTextNode(root);
+            }
             if(!target)return;
+            ClearEditingBoundary();
             editingNode=target;const auto length=EditingValue().size();
-            selectionAnchor=std::min(selection.anchorOffset,length);
-            caretPosition=selection.focusNode==target?std::min(selection.focusOffset,length):selectionAnchor;
+            selectionAnchor=std::min(anchorOffset,length);
+            caretPosition=selection.focusNode==target?
+                std::min(focusOffset,length):selectionAnchor;
+            verticalCaretXValid=false;
             StoreControlSelection();ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);
         });
         javascript.SetFrameScheduler([this]{
@@ -552,10 +736,10 @@ struct View::Impl {
         InitializeAccessibility();
         return true;
     }
-    void ResetRenderTargets(){backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;renderTarget.Reset();}
+    void ResetRenderTargets(){layout.DiscardDeviceResources();backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;renderTarget.Reset();}
     void EnsureTarget(){
         if(renderTarget||!d2dFactory)return;
-        backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;
+        layout.DiscardDeviceResources();backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;
         RECT r{};GetClientRect(hwnd,&r);const auto size=D2D1::SizeU(
             static_cast<UINT32>(std::max(1L,r.right-r.left)),
             static_cast<UINT32>(std::max(1L,r.bottom-r.top)));
@@ -574,7 +758,7 @@ struct View::Impl {
             capacity.width=std::max(required.width,backBufferPixelSize.width+std::max(64u,backBufferPixelSize.width/4u));
             capacity.height=std::max(required.height,backBufferPixelSize.height+std::max(64u,backBufferPixelSize.height/4u));
         }
-        backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;
+        layout.DiscardDeviceResources();backBuffer.Reset();backBufferPixelSize={};backBufferDpi=0;
         const auto dipSize=D2D1::SizeF(capacity.width*USER_DEFAULT_SCREEN_DPI/dpi,
             capacity.height*USER_DEFAULT_SCREEN_DPI/dpi);
         if(FAILED(renderTarget->CreateCompatibleRenderTarget(&dipSize,&capacity,nullptr,
@@ -892,6 +1076,10 @@ struct View::Impl {
         }
     }
     void HandleMutation(const JavaScriptRuntime::Mutation& mutation){
+        const bool imageChanged=(mutation.kind==JavaScriptRuntime::MutationKind::Tree||
+            mutation.kind==JavaScriptRuntime::MutationKind::Layout||
+            mutation.kind==JavaScriptRuntime::MutationKind::Style)&&LoadImages(true);
+        if(imageChanged){layoutDirty=true;viewportOnlyDirty=false;}
         LayoutRect dirtyBounds{};bool hasDirtyBounds=false,canTarget=!layoutDirty&&
             !mutation.targets.empty()&&(mutation.kind==JavaScriptRuntime::MutationKind::Paint||
                                         mutation.kind==JavaScriptRuntime::MutationKind::Style);
@@ -1035,7 +1223,8 @@ struct View::Impl {
     }
     bool CanEditText()const{
         return IsEditableTextControl(focused)||(focused&&IsContentEditable(focused)&&editingNode&&
-            editingNode->type==NodeType::Text);
+            editingNode->type==NodeType::Text)||(focused&&IsContentEditable(focused)&&
+            editingBoundaryContainer);
     }
     std::wstring EditingValue()const{
         if(!editingNode)return {};
@@ -1050,6 +1239,7 @@ struct View::Impl {
         if(IsTextControl(focused)){
             focused->selectionStart=std::min(selectionAnchor,caretPosition);
             focused->selectionEnd=std::max(selectionAnchor,caretPosition);
+            focused->selectionDirection=selectionAnchor==caretPosition?L"none":selectionAnchor>caretPosition?L"backward":L"forward";
         }
     }
     std::shared_ptr<Node> FirstEditableText(const std::shared_ptr<Node>& parent)const{
@@ -1069,20 +1259,161 @@ struct View::Impl {
         auto text=std::make_shared<Node>();text->type=NodeType::Text;text->text=L"";text->parent=focused;
         focused->children.push_back(text);document.Reindex();layoutDirty=true;return text;
     }
+    void ClearEditingBoundary(){
+        editingBoundaryContainer.reset();editingBoundaryOffset=0;
+    }
+    std::pair<std::shared_ptr<Node>,size_t> EditableBoundary(
+        const std::shared_ptr<Node>& requestedContainer,size_t requestedOffset)const{
+        if(!focused||!IsContentEditable(focused))return {};
+        auto container=requestedContainer;size_t offset=requestedOffset;
+        if(IsAtomicEditingElement(container)){
+            const auto parent=container->parent.lock();if(!parent)return {};
+            const auto position=std::find(parent->children.begin(),parent->children.end(),container);
+            if(position==parent->children.end())return {};
+            offset=static_cast<size_t>(position-parent->children.begin())+(requestedOffset?1:0);
+            container=parent;
+        }
+        if(!container||container->type==NodeType::Text||
+           (container!=focused&&EditableRoot(container)!=focused))return {};
+        return {container,std::min(offset,container->children.size())};
+    }
+    std::pair<std::shared_ptr<Node>,size_t> EnsureEditableBoundaryText(
+        const std::shared_ptr<Node>& requestedContainer,size_t requestedOffset){
+        const auto boundary=EditableBoundary(requestedContainer,requestedOffset);
+        auto container=boundary.first;size_t offset=boundary.second;
+        if(!container)return {};
+        // A lone <br> is the browser-compatible placeholder for an otherwise
+        // empty editable line (including an empty table cell).  Once typing
+        // begins it must be replaced by the real text node, rather than left
+        // behind as an extra line break after the inserted text.
+        bool reindex=false;
+        if(container->children.size()==1&&container->children.front()->tag==L"br"){
+            const auto placeholder=container->children.front();
+            reindex=!document.UnindexSubtree(placeholder);
+            container->children.clear();placeholder->parent.reset();offset=0;
+        }
+        if(offset<container->children.size()&&
+           container->children[offset]->type==NodeType::Text)
+            return {container->children[offset],0};
+        if(offset>0&&container->children[offset-1]->type==NodeType::Text){
+            const auto text=container->children[offset-1];return {text,text->text.size()};
+        }
+        auto text=std::make_shared<Node>();text->type=NodeType::Text;text->tag=L"#text";
+        text->ownerDocument=container->ownerDocument;
+        text->parent=container;
+        container->children.insert(container->children.begin()+static_cast<std::ptrdiff_t>(offset),text);
+        if(reindex||!document.IndexSubtree(text))document.Reindex();
+        layoutDirty=true;return {text,0};
+    }
+    bool MaterializeEditingBoundary(){
+        if(!editingBoundaryContainer)return editingNode!=nullptr;
+        const auto text=EnsureEditableBoundaryText(editingBoundaryContainer,editingBoundaryOffset);
+        if(!text.first)return false;
+        editingNode=text.first;selectionAnchor=caretPosition=text.second;
+        ClearEditingBoundary();return true;
+    }
+    bool ParticipatesInFocusedEditing(const std::shared_ptr<Node>& node)const{
+        if(!node||!focused||!IsContentEditable(focused))return false;
+        if(node==focused)return true;
+        if(node->attributes.count(L"contenteditable")&&!IsContentEditable(node))return false;
+        return EditableRoot(node)==focused;
+    }
+    std::shared_ptr<Node> FirstEditingLeaf(const std::shared_ptr<Node>& node)const{
+        if(!ParticipatesInFocusedEditing(node))return {};
+        if(node->type==NodeType::Text||IsAtomicEditingElement(node))return node;
+        for(const auto& child:node->children)
+            if(auto leaf=FirstEditingLeaf(child))return leaf;
+        return {};
+    }
+    std::shared_ptr<Node> LastEditingLeaf(const std::shared_ptr<Node>& node)const{
+        if(!ParticipatesInFocusedEditing(node))return {};
+        if(node->type==NodeType::Text||IsAtomicEditingElement(node))return node;
+        for(auto child=node->children.rbegin();child!=node->children.rend();++child)
+            if(auto leaf=LastEditingLeaf(*child))return leaf;
+        return {};
+    }
+    std::shared_ptr<Node> AdjacentEditingLeaf(const std::shared_ptr<Node>& node,
+                                              bool backward)const{
+        for(auto current=node;current&&current!=focused;){
+            const auto parent=current->parent.lock();if(!parent)return {};
+            const auto position=std::find(parent->children.begin(),parent->children.end(),current);
+            if(position==parent->children.end())return {};
+            if(backward){
+                for(auto item=position;item!=parent->children.begin();){
+                    --item;if(auto leaf=LastEditingLeaf(*item))return leaf;
+                }
+            }else{
+                for(auto item=position+1;item!=parent->children.end();++item)
+                    if(auto leaf=FirstEditingLeaf(*item))return leaf;
+            }
+            current=parent;
+        }
+        return {};
+    }
+    std::shared_ptr<Node> EditingLeafAtBoundary(bool backward)const{
+        if(!editingBoundaryContainer)return {};
+        const auto& children=editingBoundaryContainer->children;
+        const auto offset=std::min(editingBoundaryOffset,children.size());
+        if(backward){
+            for(size_t index=offset;index>0;--index)
+                if(auto leaf=LastEditingLeaf(children[index-1]))return leaf;
+        }else{
+            for(size_t index=offset;index<children.size();++index)
+                if(auto leaf=FirstEditingLeaf(children[index]))return leaf;
+        }
+        return AdjacentEditingLeaf(editingBoundaryContainer,backward);
+    }
+    bool SetEditingTextPosition(const std::shared_ptr<Node>& text,size_t offset){
+        if(!text||text->type!=NodeType::Text||EditableRoot(text)!=focused)return false;
+        ClearEditingBoundary();editingNode=text;
+        selectionAnchor=caretPosition=std::min(offset,text->text.size());verticalCaretXValid=false;
+        ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return true;
+    }
+    bool SetEditingBoundaryPosition(const std::shared_ptr<Node>& container,size_t offset){
+        const auto boundary=EditableBoundary(container,offset);if(!boundary.first)return false;
+        editingNode.reset();editingBoundaryContainer=boundary.first;
+        editingBoundaryOffset=boundary.second;selectionAnchor=caretPosition=0;verticalCaretXValid=false;
+        ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return true;
+    }
+    bool MoveAcrossEditingLeaf(bool backward){
+        if(!focused||!IsContentEditable(focused))return false;
+        auto leaf=editingBoundaryContainer?EditingLeafAtBoundary(backward):
+            AdjacentEditingLeaf(editingNode,backward);
+        std::shared_ptr<Node> atomic;while(leaf){
+            if(leaf->type==NodeType::Text)
+                return SetEditingTextPosition(leaf,backward?leaf->text.size():0);
+            if(IsAtomicEditingElement(leaf)&&!atomic)atomic=leaf;
+            leaf=AdjacentEditingLeaf(leaf,backward);
+        }
+        if(!atomic)return false;
+        const auto parent=atomic->parent.lock();if(!parent)return false;
+        const auto position=std::find(parent->children.begin(),parent->children.end(),atomic);
+        if(position==parent->children.end())return false;
+        const auto index=static_cast<size_t>(position-parent->children.begin());
+        return SetEditingBoundaryPosition(parent,index+(backward?0:1));
+    }
     const LayoutBox* EditingLayoutBox()const{
         return editingNode?layout.BoxFor(editingNode):nullptr;
     }
     const LayoutBox* EditingStyleBox()const{
-        if(!editingNode)return nullptr;
-        for(auto current=editingNode;current;current=current->parent.lock())
+        auto source=editingNode?editingNode:editingBoundaryContainer;
+        if(!source)return nullptr;
+        for(auto current=source;current;current=current->parent.lock())
             if(const auto* box=layout.BoxFor(current))return box;
         return nullptr;
     }
     void BeginEditingAt(const std::shared_ptr<Node>& target,float x,float y){
+        ClearEditingBoundary();verticalCaretXValid=false;
         if(layoutDirty)Rebuild();std::shared_ptr<Node> hitNode;size_t hitOffset=0;
         auto scope=IsTextControl(focused)?focused:
             (target&&EditableRoot(target)==focused?target:focused);
         bool hit=layout.HitTestText(scope,x,y,hitNode,hitOffset);
+        // Prefer the clicked editable subtree over unrelated nearby text.  An
+        // empty block or table cell has no text layout to hit-test, but its DOM
+        // boundary is still a valid caret position and must remain observable
+        // through Selection.anchorNode for generic editor scripts.
+        if(!hit&&!IsTextControl(focused)&&scope&&scope!=focused&&
+           SetEditingBoundaryPosition(scope,0))return;
         if(!hit&&scope!=focused)hit=layout.HitTestText(focused,x,y,hitNode,hitOffset);
         if(hit&&(hitNode==focused||EditableRoot(hitNode)==focused)){
             editingNode=std::move(hitNode);selectionAnchor=caretPosition=hitOffset;
@@ -1101,11 +1432,11 @@ struct View::Impl {
         if(!layout.HitTestText(scope,x,y,hitNode,hitOffset)||hitNode!=editingNode)return false;
         const auto next=std::min(hitOffset,EditingValue().size());
         if(caretPosition==next)return true;
-        caretPosition=next;StoreControlSelection();
+        caretPosition=next;verticalCaretXValid=false;StoreControlSelection();
         textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();return true;
     }
     bool CanBlinkCaret()const{
-        return hwnd&&editingNode&&focused&&GetFocus()==hwnd&&
+        return hwnd&&(editingNode||editingBoundaryContainer)&&focused&&GetFocus()==hwnd&&
             (selectionAnchor==caretPosition||compositionActive);
     }
     void StopCaretBlink(){
@@ -1126,8 +1457,9 @@ struct View::Impl {
         if(hwnd)InvalidateRect(hwnd,nullptr,FALSE);
     }
     bool CaretDipRect(D2D1_RECT_F& result){
-        if(!editingNode)return false;LayoutRect caret{};
-        if(!layout.TextCaretRect(editingNode,caretPosition,caret))return false;
+        if(!editingNode&&!editingBoundaryContainer)return false;LayoutRect caret{};
+        if(!layout.TextCaretRect(editingNode?editingNode:editingBoundaryContainer,
+            editingNode?caretPosition:editingBoundaryOffset,caret))return false;
         result=D2D1::RectF(caret.x,caret.y,caret.x+caret.width,caret.y+caret.height);return true;
     }
     RECT CaretClientRect(){
@@ -1142,7 +1474,8 @@ struct View::Impl {
         InflateRect(&caret,2,2);InvalidateRect(hwnd,&caret,FALSE);
     }
     void PaintTextEditing(ID2D1RenderTarget* target){
-        if(!target||!editingNode||GetFocus()!=hwnd)return;const auto* box=EditingLayoutBox();
+        if(!target||(!editingNode&&!editingBoundaryContainer)||GetFocus()!=hwnd)return;
+        const auto* box=EditingLayoutBox();
         const auto* styleBox=EditingStyleBox();if(!styleBox||!styleBox->visible)return;
         const size_t valueLength=EditingValue().size();
         const size_t begin=std::min({selectionAnchor,caretPosition,valueLength});
@@ -1201,6 +1534,7 @@ struct View::Impl {
             compositionReplaceEnd-compositionReplaceStart,text);SetEditingValue(display);
         compositionText=text;compositionAttributes=attributes;compositionCursor=std::min(cursor,text.size());
         selectionAnchor=caretPosition=compositionReplaceStart+compositionCursor;
+        verticalCaretXValid=false;
         StoreControlSelection();
         JavaScriptRuntime::EventInit event{};event.data=text;event.isComposing=true;
         javascript.DispatchNodeEvent(focused,L"compositionupdate",event);
@@ -1329,18 +1663,19 @@ struct View::Impl {
         if(next==focused){
             const bool desired=focused&&(focusVisible||IsTextControl(focused)||IsContentEditable(focused));
             if(focused&&desired!=focused->focusVisible){focused->focusVisible=desired;RestyleDocument();if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);}
-            if(focused&&openTextEditor&&!editingNode&&(IsTextControl(focused)||IsContentEditable(focused)))
+            if(focused&&openTextEditor&&!editingNode&&!editingBoundaryContainer&&
+               (IsTextControl(focused)||IsContentEditable(focused)))
                 editingNode=EnsureEditableTextNode(focused);
-            if(editingNode)ResetCaretBlink();
+            if(editingNode||editingBoundaryContainer)ResetCaretBlink();
             return;
         }
-        textInput.Cancel(hwnd);StoreControlSelection();editingNode.reset();StopCaretBlink();
+        textInput.Cancel(hwnd);StoreControlSelection();editingNode.reset();ClearEditingBoundary();StopCaretBlink();
         if(focused){for(auto current=focused;current;current=current->parent.lock())current->focusWithin=false;CommitTextEdit();focused->focused=false;focused->focusVisible=false;
             javascript.DispatchNodeEvent(focused,L"blur");javascript.DispatchNodeEvent(focused,L"focusout");}
-        focused=next;textEditDirty=false;selectionAnchor=caretPosition=0;
+        focused=next;textEditDirty=false;selectionAnchor=caretPosition=0;verticalCaretXValid=false;
         undoHistory.clear();redoHistory.clear();
         if(focused){focused->focused=true;focused->focusVisible=focusVisible||IsTextControl(focused)||IsContentEditable(focused);for(auto current=focused;current;current=current->parent.lock())current->focusWithin=true;
-            if(IsTextControl(focused)){editingNode=focused;const auto length=EditingValue().size();selectionAnchor=std::min(focused->selectionStart,length);caretPosition=std::min(focused->selectionEnd,length);}
+            if(IsTextControl(focused)){editingNode=focused;const auto length=EditingValue().size();const auto start=std::min(focused->selectionStart,length),end=std::min(focused->selectionEnd,length);if(focused->selectionDirection==L"backward"){selectionAnchor=end;caretPosition=start;}else{selectionAnchor=start;caretPosition=end;}}
             else if(IsContentEditable(focused)){editingNode=EnsureEditableTextNode(focused);selectionAnchor=caretPosition=EditingValue().size();}
             javascript.DispatchNodeEvent(focused,L"focus");javascript.DispatchNodeEvent(focused,L"focusin");}
         RestyleDocument();if(accessibility)accessibility->Invalidate();InvalidateRect(hwnd,nullptr,FALSE);
@@ -1732,6 +2067,19 @@ struct View::Impl {
         javascript.DispatchNodeEvent(input,L"input");javascript.DispatchNodeEvent(input,L"change");
         layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);
     }
+    std::shared_ptr<Node> NearestForm(const std::shared_ptr<Node>& node)const{
+        for(auto current=node;current;current=current->parent.lock())if(current->tag==L"form")return current;return {};
+    }
+    bool SubmitNearestForm(const std::shared_ptr<Node>& control){
+        const auto form=NearestForm(control);if(!form)return false;
+        if(javascript.DispatchNodeEvent(form,L"submit"))return true;
+        if(ToLower(form->Attribute(L"method"))==L"dialog")if(const auto dialog=form->Closest(L"dialog");dialog&&dialog->attributes.count(L"open")){
+            dialog->RemoveAttribute(L"open");dialog->modal=false;dialog->SetAttribute(L"returnvalue",control?control->Attribute(L"value"):L"");
+            JavaScriptRuntime::EventInit close{};close.bubbles=false;close.cancelable=false;javascript.DispatchNodeEvent(dialog,L"close",close);
+            layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return true;
+    }
     void Activate(const std::shared_ptr<Node>& node,float clickX,float clickY,bool keyboardFocusVisible=false){if(node&&(node->disabled||ToLower(node->Attribute(L"aria-disabled"))==L"true"))return;SetFocusedNode(node,keyboardFocusVisible,false);if(!node){layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);return;}const auto focusTarget=FocusTarget(node);auto type=ToLower(node->Attribute(L"type"));const auto role=ToLower(node->Attribute(L"role"));bool changed=false;
         if(node->tag==L"input"&&type==L"checkbox"&&!node->disabled){node->indeterminate=false;node->checked=!node->checked;changed=true;}
         else if(node->tag==L"input"&&type==L"radio"&&!node->disabled){auto name=node->Attribute(L"name");for(auto& other:document.GetElementsByName(name))other->checked=(other==node);changed=true;}
@@ -1743,6 +2091,11 @@ struct View::Impl {
             const auto anchor=node->Closest(L"a[href]");
             if(anchor){const auto href=Trim(anchor->Attribute(L"href"));
                 if(!href.empty()&&href.front()==L'#')javascript.NavigateToFragment(href);
+            }
+            auto submitter=node;if(node->tag!=L"button"&&node->tag!=L"input")submitter=node->Closest(L"button");
+            if(submitter&&!submitter->disabled){const auto submitterType=ToLower(submitter->Attribute(L"type"));
+                if((submitter->tag==L"button"&&(submitterType.empty()||submitterType==L"submit"))||
+                   (submitter->tag==L"input"&&(submitterType==L"submit"||submitterType==L"image")))SubmitNearestForm(submitter);
             }
         }
         layoutDirty=true;
@@ -1781,7 +2134,8 @@ struct View::Impl {
         destination.push_back({EditingValue(),selectionAnchor,caretPosition});
         const auto snapshot=std::move(source.back());source.pop_back();
         SetEditingValue(snapshot.value);selectionAnchor=std::min(snapshot.anchor,snapshot.value.size());
-        caretPosition=std::min(snapshot.caret,snapshot.value.size());StoreControlSelection();
+        caretPosition=std::min(snapshot.caret,snapshot.value.size());verticalCaretXValid=false;
+        StoreControlSelection();
         if(IsTextControl(focused))textEditDirty=true;
         javascript.DispatchNodeEvent(focused,L"input",before);layoutDirty=true;
         ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return true;
@@ -1801,11 +2155,16 @@ struct View::Impl {
         CloseClipboard();return true;
     }
     bool PasteFromClipboard(){
-        if(!CanEditText()||!OpenClipboard(hwnd))return false;
-        HANDLE data=GetClipboardData(CF_UNICODETEXT);if(!data){CloseClipboard();return false;}
-        const auto* text=static_cast<const wchar_t*>(GlobalLock(data));
-        if(!text){CloseClipboard();return false;}
-        std::wstring value(text);GlobalUnlock(data);CloseClipboard();
+        if(!OpenClipboard(hwnd))return false;
+        std::wstring value;bool hasText=false;std::vector<Node::FileInfo> files;
+        if(HANDLE data=GetClipboardData(CF_UNICODETEXT))if(const auto* text=static_cast<const wchar_t*>(GlobalLock(data))){value=text;GlobalUnlock(data);hasText=true;}
+        if(HANDLE data=GetClipboardData(CF_HDROP)){
+            const auto drop=static_cast<HDROP>(data);const UINT count=DragQueryFileW(drop,0xffffffff,nullptr,0);
+            for(UINT index=0;index<count;++index){const UINT length=DragQueryFileW(drop,index,nullptr,0);std::wstring path(length+1,L'\0');DragQueryFileW(drop,index,path.data(),length+1);path.resize(length);Node::FileInfo info;if(FileInfoForPath(path,info))files.push_back(std::move(info));}
+        }
+        CloseClipboard();if(!hasText&&files.empty())return false;
+        if(javascript.DispatchClipboardEvent(focused,L"paste",value,files))return true;
+        if(!CanEditText()||!hasText)return false;
         if(IsTextInput(focused)){
             value.erase(std::remove(value.begin(),value.end(),L'\r'),value.end());
             const auto lineBreak=value.find(L'\n');if(lineBreak!=std::wstring::npos)value.resize(lineBreak);
@@ -1817,13 +2176,24 @@ struct View::Impl {
     }
     bool ReplaceSelection(const std::wstring& replacement,const std::wstring& inputType=L"insertText",
                            bool isComposing=false){
-        if(!CanEditText())return false;auto value=EditingValue();size_t begin=std::min(selectionAnchor,caretPosition),end=std::min(value.size(),std::max(selectionAnchor,caretPosition));begin=std::min(begin,value.size());std::wstring inserted=replacement;
+        if(!CanEditText())return false;
+        const bool atBoundary=editingBoundaryContainer!=nullptr;
+        auto value=EditingValue();size_t begin=atBoundary?0:std::min(selectionAnchor,caretPosition);
+        size_t end=atBoundary?0:std::min(value.size(),std::max(selectionAnchor,caretPosition));
+        begin=std::min(begin,value.size());std::wstring inserted=replacement;
         if(IsTextControl(focused)){const auto maximum=focused->Attribute(L"maxlength");if(!maximum.empty()){try{const size_t limit=std::stoul(maximum);const size_t kept=value.size()-(end-begin);if(kept>=limit)inserted.clear();else if(inserted.size()>limit-kept)inserted.resize(limit-kept);}catch(...){} }}
         if(begin==end&&inserted.empty())return false;
         JavaScriptRuntime::EventInit before{};before.data=inserted;before.inputType=inputType;before.isComposing=isComposing;
         if(javascript.DispatchNodeEvent(focused,L"beforeinput",before))return false;
+        if(atBoundary){
+            if(!MaterializeEditingBoundary())return false;
+            value=EditingValue();begin=std::min(selectionAnchor,caretPosition);
+            end=std::min(value.size(),std::max(selectionAnchor,caretPosition));
+            begin=std::min(begin,value.size());
+        }
         RecordUndo();
         value.replace(begin,end-begin,inserted);selectionAnchor=caretPosition=begin+inserted.size();SetEditingValue(value);
+        verticalCaretXValid=false;
         StoreControlSelection();
         if(IsTextControl(focused))textEditDirty=true;
         JavaScriptRuntime::EventInit input=before;javascript.DispatchNodeEvent(focused,L"input",input);
@@ -1833,14 +2203,231 @@ struct View::Impl {
         }
         layoutDirty=true;ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return true;
     }
+    std::shared_ptr<Node> CloneEditingShell(const std::shared_ptr<Node>& source)const{
+        if(!source||source->type!=NodeType::Element)return {};
+        auto clone=std::make_shared<Node>();clone->type=source->type;clone->tag=source->tag;
+        clone->attributes=source->attributes;clone->attributes.erase(L"id");
+        clone->inlineStyle=source->inlineStyle;clone->ownerDocument=source->ownerDocument;
+        return clone;
+    }
+    static void MoveEditingChildren(const std::shared_ptr<Node>& source,size_t offset,
+                                    const std::shared_ptr<Node>& destination){
+        if(!source||!destination)return;offset=std::min(offset,source->children.size());
+        auto first=source->children.begin()+static_cast<std::ptrdiff_t>(offset);
+        for(auto item=first;item!=source->children.end();++item)(*item)->parent=destination;
+        destination->children.insert(destination->children.end(),first,source->children.end());
+        source->children.erase(first,source->children.end());
+    }
+    bool CollapseEditingSelectionToBoundary(std::shared_ptr<Node>& container,size_t& offset){
+        if(editingBoundaryContainer){
+            container=editingBoundaryContainer;
+            offset=std::min(editingBoundaryOffset,container->children.size());return true;
+        }
+        if(!editingNode||editingNode->type!=NodeType::Text)return false;
+        const auto parent=editingNode->parent.lock();if(!parent)return false;
+        const auto position=std::find(parent->children.begin(),parent->children.end(),editingNode);
+        if(position==parent->children.end())return false;
+        const size_t begin=std::min({selectionAnchor,caretPosition,editingNode->text.size()});
+        const size_t end=std::min(editingNode->text.size(),
+                                  std::max(selectionAnchor,caretPosition));
+        if(end>begin)editingNode->text.erase(begin,end-begin);
+        const size_t index=static_cast<size_t>(position-parent->children.begin());
+        container=parent;
+        if(begin==0)offset=index;
+        else if(begin>=editingNode->text.size())offset=index+1;
+        else{
+            auto trailing=std::make_shared<Node>();trailing->type=NodeType::Text;
+            trailing->tag=L"#text";trailing->text=editingNode->text.substr(begin);
+            trailing->ownerDocument=editingNode->ownerDocument;trailing->parent=parent;
+            editingNode->text.resize(begin);
+            parent->children.insert(parent->children.begin()+static_cast<std::ptrdiff_t>(index+1),
+                                    trailing);
+            offset=index+1;
+        }
+        return true;
+    }
+    std::shared_ptr<Node> NearestEditingBlock(const std::shared_ptr<Node>& container)const{
+        for(auto current=container;current&&current!=focused;current=current->parent.lock()){
+            const auto* box=layout.BoxFor(current);if(!box)continue;
+            const auto display=ToLower(box->style.Get(L"display"));
+            if(display==L"block"||display==L"flow-root"||display==L"list-item")
+                return current;
+        }
+        return {};
+    }
+    static std::shared_ptr<Node> AppendEmptyEditingText(const std::shared_ptr<Node>& parent){
+        if(!parent)return {};
+        auto text=std::make_shared<Node>();text->type=NodeType::Text;text->tag=L"#text";
+        text->ownerDocument=parent->ownerDocument;text->parent=parent;
+        parent->children.push_back(text);return text;
+    }
+    bool InsertEditingParagraph(){
+        if(!focused||!IsContentEditable(focused))return false;
+        JavaScriptRuntime::EventInit before{};before.inputType=L"insertParagraph";
+        if(javascript.DispatchNodeEvent(focused,L"beforeinput",before))return true;
+        if(layoutDirty)Rebuild();
+        std::shared_ptr<Node> container;size_t offset=0;
+        if(!CollapseEditingSelectionToBoundary(container,offset))return false;
+        auto block=NearestEditingBlock(container);
+        if(!block)block=focused;
+        auto trailing=CloneEditingShell(container);if(!trailing)return false;
+        auto caretHost=trailing;MoveEditingChildren(container,offset,trailing);
+        for(auto original=container;original!=block;){
+            const auto parent=original->parent.lock();if(!parent)return false;
+            const auto position=std::find(parent->children.begin(),parent->children.end(),original);
+            if(position==parent->children.end())return false;
+            auto parentTrailing=CloneEditingShell(parent);if(!parentTrailing)return false;
+            trailing->parent=parentTrailing;parentTrailing->children.push_back(trailing);
+            const auto siblingOffset=static_cast<size_t>(position-parent->children.begin())+1;
+            MoveEditingChildren(parent,siblingOffset,parentTrailing);
+            trailing=parentTrailing;original=parent;
+        }
+        std::shared_ptr<Node> newBlock;
+        if(block==focused){
+            newBlock=document.CreateElement(L"div");
+            MoveEditingChildren(trailing,0,newBlock);
+            if(caretHost==trailing)caretHost=newBlock;
+            newBlock->parent=focused;focused->children.push_back(newBlock);
+        }else{
+            newBlock=trailing;
+            const auto parent=block->parent.lock();if(!parent)return false;
+            const auto position=std::find(parent->children.begin(),parent->children.end(),block);
+            if(position==parent->children.end())return false;
+            newBlock->parent=parent;
+            parent->children.insert(position+1,newBlock);
+        }
+        if(caretHost->children.empty())AppendEmptyEditingText(caretHost);
+        if(block!=focused&&block->children.empty())AppendEmptyEditingText(block);
+        document.Reindex();layoutDirty=true;verticalCaretXValid=false;
+        if(accessibility)accessibility->Invalidate();
+        if(!SetEditingBoundaryPosition(caretHost,0))return false;
+        javascript.DispatchNodeEvent(focused,L"input",before);
+        layoutDirty=true;ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);return true;
+    }
+    std::shared_ptr<Node> AdjacentAtomicEditingNode(bool backward)const{
+        if(!focused)return {};
+        if(editingBoundaryContainer){
+            const auto& children=editingBoundaryContainer->children;
+            auto index=std::min(editingBoundaryOffset,children.size());
+            if(backward){
+                while(index>0){
+                    const auto candidate=children[--index];
+                    if(candidate->type==NodeType::Text&&candidate->text.empty())continue;
+                    return IsAtomicEditingElement(candidate)?candidate:std::shared_ptr<Node>{};
+                }
+            }else{
+                while(index<children.size()){
+                    const auto candidate=children[index++];
+                    if(candidate->type==NodeType::Text&&candidate->text.empty())continue;
+                    return IsAtomicEditingElement(candidate)?candidate:std::shared_ptr<Node>{};
+                }
+            }
+            return {};
+        }
+        if(!editingNode||editingNode==focused)return {};
+        auto current=editingNode;
+        while(current&&current!=focused){
+            const auto parent=current->parent.lock();if(!parent)return {};
+            const auto position=std::find(parent->children.begin(),parent->children.end(),current);
+            if(position==parent->children.end())return {};
+            if(backward){
+                auto index=static_cast<size_t>(position-parent->children.begin());
+                while(index>0){
+                    const auto candidate=parent->children[--index];
+                    if(candidate->type==NodeType::Text&&candidate->text.empty())continue;
+                    return IsAtomicEditingElement(candidate)?candidate:std::shared_ptr<Node>{};
+                }
+            }else{
+                auto index=static_cast<size_t>(position-parent->children.begin())+1;
+                while(index<parent->children.size()){
+                    const auto candidate=parent->children[index++];
+                    if(candidate->type==NodeType::Text&&candidate->text.empty())continue;
+                    return IsAtomicEditingElement(candidate)?candidate:std::shared_ptr<Node>{};
+                }
+            }
+            current=parent;
+        }
+        return {};
+    }
+    bool DeleteAdjacentAtomic(bool backward,const std::wstring& inputType){
+        if(IsTextControl(focused)||selectionAnchor!=caretPosition)return false;
+        const auto target=AdjacentAtomicEditingNode(backward);if(!target)return false;
+        JavaScriptRuntime::EventInit before{};before.inputType=inputType;
+        if(javascript.DispatchNodeEvent(focused,L"beforeinput",before))return false;
+        const auto parent=target->parent.lock();if(!parent)return false;
+        const auto position=std::find(parent->children.begin(),parent->children.end(),target);
+        if(position==parent->children.end())return false;
+        const auto removedOffset=static_cast<size_t>(position-parent->children.begin());
+        const bool indexOk=document.UnindexSubtree(target);
+        parent->children.erase(position);target->parent.reset();
+        if(editingBoundaryContainer==parent&&removedOffset<editingBoundaryOffset)
+            --editingBoundaryOffset;
+        if(!indexOk)document.Reindex();
+        javascript.DispatchNodeEvent(focused,L"input",before);
+        layoutDirty=true;verticalCaretXValid=false;if(accessibility)accessibility->Invalidate();
+        ResetCaretBlink();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);
+        return true;
+    }
     bool Backspace(){
-        if(!CanEditText())return false;const auto value=EditingValue();if(selectionAnchor==caretPosition){if(caretPosition==0)return false;selectionAnchor=PreviousTextPosition(value,std::min(caretPosition,value.size()));}return ReplaceSelection(L"",L"deleteContentBackward");
+        if(!CanEditText())return false;
+        if(editingBoundaryContainer)return DeleteAdjacentAtomic(true,L"deleteContentBackward");
+        const auto value=EditingValue();if(selectionAnchor==caretPosition){if(caretPosition==0)return DeleteAdjacentAtomic(true,L"deleteContentBackward");selectionAnchor=PreviousTextPosition(value,std::min(caretPosition,value.size()));}return ReplaceSelection(L"",L"deleteContentBackward");
     }
     bool DeleteForward(){
-        if(!CanEditText())return false;const auto value=EditingValue();if(selectionAnchor==caretPosition){if(caretPosition>=value.size())return false;selectionAnchor=NextTextPosition(value,caretPosition);}return ReplaceSelection(L"",L"deleteContentForward");
+        if(!CanEditText())return false;
+        if(editingBoundaryContainer)return DeleteAdjacentAtomic(false,L"deleteContentForward");
+        const auto value=EditingValue();if(selectionAnchor==caretPosition){if(caretPosition>=value.size())return DeleteAdjacentAtomic(false,L"deleteContentForward");selectionAnchor=NextTextPosition(value,caretPosition);}return ReplaceSelection(L"",L"deleteContentForward");
     }
     void MoveCaret(size_t position,bool extend){
-        if(!editingNode)return;const auto length=EditingValue().size();caretPosition=std::min(position,length);if(!extend)selectionAnchor=caretPosition;StoreControlSelection();textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();
+        if(!editingNode)return;const auto length=EditingValue().size();caretPosition=std::min(position,length);if(!extend)selectionAnchor=caretPosition;verticalCaretXValid=false;StoreControlSelection();textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();
+    }
+    bool MoveHorizontalCaret(bool backward,bool extend){
+        verticalCaretXValid=false;
+        if(IsTextControl(focused)){
+            const auto value=EditingValue();
+            const auto position=caretPosition==selectionAnchor?
+                (backward?PreviousTextPosition(value,caretPosition):
+                          NextTextPosition(value,caretPosition)):
+                (backward?std::min(caretPosition,selectionAnchor):
+                          std::max(caretPosition,selectionAnchor));
+            MoveCaret(position,extend);return true;
+        }
+        if(!focused||!IsContentEditable(focused))return false;
+        if(editingBoundaryContainer)return !extend&&MoveAcrossEditingLeaf(backward);
+        if(!editingNode||editingNode->type!=NodeType::Text)return false;
+        const auto value=EditingValue();
+        if(selectionAnchor!=caretPosition){
+            MoveCaret(backward?std::min(caretPosition,selectionAnchor):
+                               std::max(caretPosition,selectionAnchor),extend);
+            return true;
+        }
+        const auto position=backward?PreviousTextPosition(value,caretPosition):
+                                     NextTextPosition(value,caretPosition);
+        if(position!=caretPosition){MoveCaret(position,extend);return true;}
+        return !extend&&MoveAcrossEditingLeaf(backward);
+    }
+    bool MoveVerticalCaret(bool upward,bool extend){
+        if(!focused||IsTextInput(focused)||(!editingNode&&!editingBoundaryContainer))return false;
+        if(layoutDirty)Rebuild();
+        const auto current=editingNode?editingNode:editingBoundaryContainer;
+        const size_t currentOffset=editingNode?caretPosition:editingBoundaryOffset;
+        LayoutRect caret{};if(!layout.TextCaretRect(current,currentOffset,caret))return false;
+        const float preferred=verticalCaretXValid?verticalCaretX:caret.x;
+        std::shared_ptr<Node> target;size_t targetOffset=0;
+        if(!layout.VerticalCaretPosition(focused,current,currentOffset,preferred,upward,
+                                        target,targetOffset))return false;
+        bool moved=false;
+        if(IsTextControl(focused)){
+            if(target!=focused)return false;
+            MoveCaret(targetOffset,extend);moved=true;
+        }else if(target->type==NodeType::Text){
+            if(extend){
+                if(target!=editingNode)return false;
+                MoveCaret(targetOffset,true);moved=true;
+            }else moved=SetEditingTextPosition(target,targetOffset);
+        }else if(!extend)moved=SetEditingBoundaryPosition(target,targetOffset);
+        if(moved){verticalCaretX=preferred;verticalCaretXValid=true;}
+        return moved;
     }
     HCURSOR CursorAtCurrentPosition(){
         POINT point{};GetCursorPos(&point);ScreenToClient(hwnd,&point);if(layoutDirty)Rebuild();
@@ -1892,7 +2479,7 @@ struct View::Impl {
         case WM_PAINT:Paint();return 0;case WM_ERASEBKGND:return 1;
         case WM_IME_SETCONTEXT:return DefWindowProcW(hwnd,message,wParam,lParam&~ISC_SHOWUICOMPOSITIONWINDOW);
         case WM_SETFOCUS:textInput.UpdateCandidateWindow(hwnd);ResetCaretBlink();return 0;
-        case WM_TIMER:if(wParam==kAnimationFrameTimer){KillTimer(hwnd,kAnimationFrameTimer);javascript.RunAnimationFrame();return 0;}if(wParam==kJavaScriptTimer){KillTimer(hwnd,kJavaScriptTimer);javascript.RunTimers();return 0;}if(wParam==kCssTransitionTimer){const auto now=std::chrono::steady_clock::now();const float elapsed=std::max(1.0f,std::chrono::duration<float,std::milli>(now-cssTransitionTick).count());cssTransitionTick=now;if(layoutDirty)Rebuild();const bool remains=layout.AdvanceTransitions(elapsed);UpdateFrameBounds();InvalidateRect(hwnd,nullptr,FALSE);if(!remains){KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;}return 0;}if(wParam==kCaretBlinkTimer){if(CanBlinkCaret()){caretVisible=!caretVisible;InvalidateCaret();}else StopCaretBlink();return 0;}break;
+        case WM_TIMER:if(wParam==kAnimationFrameTimer){KillTimer(hwnd,kAnimationFrameTimer);javascript.RunAnimationFrame();return 0;}if(wParam==kJavaScriptTimer){KillTimer(hwnd,kJavaScriptTimer);javascript.RunTimers();return 0;}if(wParam==kCssTransitionTimer){const auto now=std::chrono::steady_clock::now();const float elapsed=std::max(1.0f,std::chrono::duration<float,std::milli>(now-cssTransitionTick).count());cssTransitionTick=now;if(layoutDirty)Rebuild();const bool remains=layout.AdvanceTransitions(elapsed);UpdateFrameBounds();InvalidateRect(hwnd,nullptr,FALSE);if(!remains){KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;}return 0;}if(wParam==kCaretBlinkTimer){if(CanBlinkCaret()){caretVisible=!caretVisible;InvalidateCaret();}else StopCaretBlink();return 0;}if(wParam==kImageAnimationTimer){AdvanceImageAnimations();return 0;}break;
         case kAnimationFrameFallbackMessage:javascript.RunAnimationFrame();return 0;
         case WM_SIZE:{HideTooltip();const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
         case WM_DPICHANGED:{HideTooltip();UpdateTooltipMetrics();const bool viewportOnly=!layoutDirty||viewportOnlyDirty;layoutDirty=true;viewportOnlyDirty=viewportOnly;UpdateJavaScriptViewport();javascript.DispatchWindowEvent(L"resize");InvalidateRect(hwnd,nullptr,FALSE);return 0;}
@@ -1954,17 +2541,26 @@ struct View::Impl {
             return 0;
         }
         case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);auto pointer=PointerEventAt(wParam,x,y,0,2);javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
+        case WM_CONTEXTMENU:{float x=0,y=0;std::shared_ptr<Node> target;if(lParam==static_cast<LPARAM>(-1)){target=focused;if(layoutDirty)Rebuild();if(const auto* box=layout.BoxFor(target)){x=box->content.x+box->content.width/2.0f;y=box->content.y+box->content.height/2.0f;}}else{POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);x=PixelToDip(static_cast<float>(point.x));y=PixelToDip(static_cast<float>(point.y));if(layoutDirty)Rebuild();target=layout.HitTest(x,y);}auto context=PointerEventAt(0,x,y,2,1);javascript.DispatchNodeEvent(target,L"contextmenu",context);return 0;}
         case WM_LBUTTONUP:
             if(selectPopupScrollDragging){selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
             if(scrollbarDragNode){InvalidateRect(hwnd,nullptr,FALSE);scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
             if(textSelectionDragging){
                 const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam)));
                 const float y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));
-                UpdateTextSelectionAt(x,y);textSelectionDragging=false;
+                UpdateTextSelectionAt(x,y);if(layoutDirty)Rebuild();auto target=javascript.CapturedPointerTarget();if(!target)target=layout.HitTest(x,y);
+                auto pointer=PointerEventAt(wParam,x,y,0,1);javascript.DispatchNodeEvent(target,L"pointerup",pointer);textSelectionDragging=false;
+                if(javascript.CapturedPointerTarget())javascript.ClearPointerCapture();
                 if(GetCapture()==hwnd)ReleaseCapture();return 0;
             }
+            {
+                const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));
+                if(layoutDirty)Rebuild();auto target=javascript.CapturedPointerTarget();if(!target)target=layout.HitTest(x,y);
+                auto pointer=PointerEventAt(wParam,x,y,0,1);javascript.DispatchNodeEvent(target,L"pointerup",pointer);
+                if(javascript.CapturedPointerTarget())javascript.ClearPointerCapture();return 0;
+            }
             break;
-        case WM_CAPTURECHANGED:HideTooltip();textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;return 0;
+        case WM_CAPTURECHANGED:{HideTooltip();textSelectionDragging=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;if(auto captured=javascript.CapturedPointerTarget()){auto pointer=PointerEventAt(0,pointerX,pointerY);javascript.DispatchNodeEvent(captured,L"pointercancel",pointer);if(javascript.CapturedPointerTarget())javascript.ClearPointerCapture();}return 0;}
         case WM_MOUSEWHEEL:{
             HideTooltip();
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
@@ -1995,7 +2591,8 @@ struct View::Impl {
             auto pointer=PointerEventAt(wParam,x,y);if(hasPointerPosition){pointer.movementX=x-pointerX;pointer.movementY=y-pointerY;}
             const auto previous=hovered;LayoutRect dirty{};bool targeted=false;
             if(n!=previous){const bool hoverLayoutChanged=SetHoveredNode(n,&dirty,&targeted);layoutDirty=layoutDirty||hoverLayoutChanged;DispatchPointerTransition(previous,n,pointer);}
-            if(n)javascript.DispatchNodeEvent(n,L"pointermove",pointer);
+            if(auto target=javascript.CapturedPointerTarget())javascript.DispatchNodeEvent(target,L"pointermove",pointer);
+            else if(n)javascript.DispatchNodeEvent(n,L"pointermove",pointer);
             pointerX=x;pointerY=y;hasPointerPosition=true;
             if(n!=previous){if(!layoutDirty&&targeted)InvalidateDipBounds(dirty);else InvalidateRect(hwnd,nullptr,FALSE);}return 0;
         }
@@ -2008,8 +2605,10 @@ struct View::Impl {
         }hasPointerPosition=false;return 0;}
         case WM_GETDLGCODE:return DLGC_WANTTAB|DLGC_WANTARROWS|
             ((CanEditText()||focused&&focused->tag==L"select")?DLGC_WANTCHARS:0);
+        case WM_KEYUP:{JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;javascript.DispatchNodeEvent(focused,L"keyup",key);return 0;}
         case WM_KEYDOWN:{HideTooltip();JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
         if(textInput.IsComposing())break;
+        if(wParam==VK_ESCAPE)if(const auto dialog=document.QuerySelector(L"dialog[open]")){JavaScriptRuntime::EventInit cancel{};cancel.bubbles=false;cancel.cancelable=true;if(!javascript.DispatchNodeEvent(dialog,L"cancel",cancel)&&dialog->attributes.count(L"open")){dialog->RemoveAttribute(L"open");dialog->modal=false;JavaScriptRuntime::EventInit close{};close.bubbles=false;close.cancelable=false;javascript.DispatchNodeEvent(dialog,L"close",close);layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
         if(openSelectPopup){
             if(wParam==VK_ESCAPE||wParam==VK_F4){CloseSelectPopup();return 0;}
             if(wParam==VK_UP){MoveSelectPopupHot(-1);return 0;}
@@ -2042,24 +2641,29 @@ struct View::Impl {
             if(control&&(wParam==L'V'||wParam==L'v')){PasteFromClipboard();return 0;}
             if(control&&(wParam==L'Z'||wParam==L'z')){ApplyHistory(extend);return 0;}
             if(control&&(wParam==L'Y'||wParam==L'y')){ApplyHistory(true);return 0;}
-            if(control&&(wParam==L'A'||wParam==L'a')){selectionAnchor=0;caretPosition=value.size();StoreControlSelection();ResetCaretBlink();return 0;}
-            if(wParam==VK_LEFT){MoveCaret(caretPosition==selectionAnchor?PreviousTextPosition(value,caretPosition):std::min(caretPosition,selectionAnchor),extend);return 0;}
-            if(wParam==VK_RIGHT){MoveCaret(caretPosition==selectionAnchor?NextTextPosition(value,caretPosition):std::max(caretPosition,selectionAnchor),extend);return 0;}
-            if(wParam==VK_HOME){MoveCaret(0,extend);return 0;}if(wParam==VK_END){MoveCaret(value.size(),extend);return 0;}if(wParam==VK_DELETE){DeleteForward();return 0;}if(wParam==VK_RETURN&&IsTextInput(focused))return 0;
+            if(control&&(wParam==L'A'||wParam==L'a')){selectionAnchor=0;caretPosition=value.size();verticalCaretXValid=false;StoreControlSelection();ResetCaretBlink();return 0;}
+            if(wParam==VK_LEFT){MoveHorizontalCaret(true,extend);return 0;}
+            if(wParam==VK_RIGHT){MoveHorizontalCaret(false,extend);return 0;}
+            if(wParam==VK_UP){MoveVerticalCaret(true,extend);return 0;}
+            if(wParam==VK_DOWN){MoveVerticalCaret(false,extend);return 0;}
+            if(wParam==VK_HOME){MoveCaret(0,extend);return 0;}if(wParam==VK_END){MoveCaret(value.size(),extend);return 0;}if(wParam==VK_DELETE){DeleteForward();return 0;}if(wParam==VK_RETURN&&IsTextInput(focused)){SubmitNearestForm(focused);return 0;}
         }break;
         case WM_COPY:CopySelectionToClipboard();return 0;
         case WM_CUT:if(CopySelectionToClipboard())ReplaceSelection(L"",L"deleteByCut");return 0;
         case WM_PASTE:PasteFromClipboard();return 0;
         case WM_UNDO:ApplyHistory(false);return 0;
-        case WM_CHAR:if(textInput.IsComposing())return 0;else if(CanEditText()){if(wParam==VK_BACK)Backspace();else if(wParam==L'\r'){if(!IsTextInput(focused))ReplaceSelection(L"\n",L"insertLineBreak");}else if(wParam>=32&&wParam!=127)ReplaceSelection(std::wstring(1,static_cast<wchar_t>(wParam)));return 0;}break;
+        case WM_CHAR:if(textInput.IsComposing())return 0;else if(CanEditText()){if(wParam==VK_BACK)Backspace();else if(wParam==L'\r'){
+            if(IsTextControl(focused)){if(!IsTextInput(focused))ReplaceSelection(L"\n",L"insertLineBreak");}
+            else InsertEditingParagraph();
+        }else if(wParam>=32&&wParam!=127)ReplaceSelection(std::wstring(1,static_cast<wchar_t>(wParam)));return 0;}break;
         case WM_UNICHAR:if(wParam==UNICODE_NOCHAR)return TRUE;else if(CanEditText()&&wParam>=32&&wParam<=0x10ffff){std::wstring text;if(wParam<=0xffff)text.push_back(static_cast<wchar_t>(wParam));else{const auto value=static_cast<unsigned>(wParam)-0x10000;text.push_back(static_cast<wchar_t>(0xd800+(value>>10)));text.push_back(static_cast<wchar_t>(0xdc00+(value&0x3ff)));}ReplaceSelection(text);return 0;}break;
         case WM_KILLFOCUS:HideTooltip();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();CloseSelectPopup();textInput.Cancel(hwnd);SetFocusedNode({});StopCaretBlink();InvalidateRect(hwnd,nullptr,FALSE);return 0;
         case WM_SETCURSOR:{POINT screenPoint{};GetCursorPos(&screenPoint);const LRESULT parentHit=ParentResizeHit(screenPoint);if(const HCURSOR resize=ResizeCursor(parentHit)){SetCursor(resize);return TRUE;}const UINT hit=LOWORD(lParam);
             if(const HCURSOR resize=ResizeCursor(hit)){SetCursor(resize);return TRUE;}
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
-        case WM_DESTROY:HideTooltip();if(tooltip){DestroyWindow(tooltip);tooltip=nullptr;}if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
+        case WM_DESTROY:HideTooltip();if(tooltip){DestroyWindow(tooltip);tooltip=nullptr;}if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);KillTimer(hwnd,kImageAnimationTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;imageAnimationTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
-        HideTooltip();lastError.clear();childFrames.clear();basePath=base;textInput.Cancel(nullptr);focused.reset();editingNode.reset();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();hasPointerPosition=false;pointerX=pointerY=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);cssTransitionTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        HideTooltip();lastError.clear();childFrames.clear();basePath=base;rasterImageCache.clear();textInput.Cancel(nullptr);focused.reset();editingNode.reset();ClearEditingBoundary();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();hasPointerPosition=false;pointerX=pointerY=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kImageAnimationTimer);cssTransitionTimerActive=false;imageAnimationTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();
         for(const auto& link:document.QuerySelectorAll(L"link[rel='stylesheet']")){
             std::wstring external;if(LoadTextResource(link->Attribute(L"href"),external))css+=external+L"\n";
@@ -2072,8 +2676,15 @@ struct View::Impl {
             if(source.empty())scripts+=script->InnerText()+L"\n";
             else{std::wstring external;if(LoadTextResource(source,external))scripts+=external+L"\n";else{lastError=L"Cannot load script: "+source;if(loadHandler)loadHandler(false,lastError);return false;}}
         }
+        LoadImages(false);std::vector<std::pair<std::shared_ptr<Node>,std::wstring>> initialImages;
+        for(const auto& image:document.QuerySelectorAll(L"img"))
+            initialImages.push_back({image,image->imageSource});
         javascript.SetLocation(location);
         if(!javascript.Load(scripts,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
+        for(const auto& item:initialImages)if(item.first->imageSource==item.second&&!item.second.empty()){
+            JavaScriptRuntime::EventInit event;event.bubbles=false;event.cancelable=false;
+            javascript.DispatchNodeEvent(item.first,item.first->image?L"load":L"error",event);
+        }
         javascript.DispatchDocumentEvent(L"DOMContentLoaded");
         for(const auto& node:document.QuerySelectorAll(L"iframe[src]")){
             const auto source=node->Attribute(L"src");std::wstring childHtml;
@@ -2081,6 +2692,7 @@ struct View::Impl {
             RECT bounds{0,0,1,1};auto child=View::Create(hwnd,bounds);
             if(!child){lastError=L"Cannot create frame: "+source;if(loadHandler)loadHandler(false,lastError);return false;}
             child->SetResourceLoader(resourceLoader);
+            child->SetBinaryResourceLoader(binaryResourceLoader);
             child->SetMessageHandler([this](const std::wstring& message){if(messageHandler)messageHandler(message);});
             child->impl_->javascript.SetParentMessageSink([this,node](const std::wstring& data){
                 javascript.DispatchWindowMessageAsJson(data,node);
@@ -2118,6 +2730,7 @@ void View::SetVisible(bool visible){if(!visible)impl_->HideTooltip();ShowWindow(
 void View::SetMessageHandler(MessageHandler handler){impl_->messageHandler=std::move(handler);}
 void View::SetLoadHandler(LoadHandler handler){impl_->loadHandler=std::move(handler);}
 void View::SetResourceLoader(ResourceLoader loader){impl_->resourceLoader=std::move(loader);}
+void View::SetBinaryResourceLoader(BinaryResourceLoader loader){impl_->binaryResourceLoader=std::move(loader);}
 bool View::Navigate(const std::wstring& filePath){auto path=filePath;const auto suffix=path.find_first_of(L"?#");if(suffix!=std::wstring::npos)path.resize(suffix);std::ifstream input(path,std::ios::binary);if(!input){impl_->lastError=L"Cannot open HTML file: "+path;if(impl_->loadHandler)impl_->loadHandler(false,impl_->lastError);return false;}std::ostringstream bytes;bytes<<input.rdbuf();auto slash=path.find_last_of(L"\\/");return impl_->LoadHtml(Utf8ToWide(bytes.str()),slash==std::wstring::npos?L"":path.substr(0,slash),filePath);}
 bool View::NavigateToString(const std::wstring& html,const std::wstring& basePath){return impl_->LoadHtml(html,basePath,basePath);}
 bool View::ExecuteScript(const std::wstring& source,std::wstring* result,std::wstring* error){const bool ok=impl_->javascript.Execute(source,result,error);if(!ok)impl_->lastError=error?*error:L"JavaScript execution failed";impl_->RefreshTextSelectionFromDom();return ok;}

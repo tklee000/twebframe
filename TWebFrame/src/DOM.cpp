@@ -791,7 +791,12 @@ std::vector<std::shared_ptr<Node>> Document::GetElementsByName(const std::wstrin
 }
 
 bool Document::MatchesSelector(const std::shared_ptr<Node>& node, const std::wstring& selector) {
-    return MatchesSelector(node,SplitSelector(selector));
+    // Element.matches() and Element.closest() accept a selector list.  Reuse
+    // the same comma-aware compilation as querySelector(), and match when any
+    // list item applies instead of treating the comma as part of a tag name.
+    for(const auto& compiled:CompileQuerySelectors(selector,false))
+        if(MatchesSelector(node,compiled.parts))return true;
+    return false;
 }
 
 std::vector<std::wstring> Document::CompileSelector(const std::wstring& selector) {

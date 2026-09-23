@@ -25,6 +25,8 @@ public:
     using FrameMessageSink = std::function<void(const std::shared_ptr<Node>&, const std::wstring&)>;
     using ParentMessageSink = std::function<void(const std::wstring&)>;
     using FocusSink = std::function<void(const std::shared_ptr<Node>&)>;
+    using ActivationSink = std::function<void(const std::shared_ptr<Node>&)>;
+    using PointerCaptureSink = std::function<void(bool)>;
     using SelectionProvider = std::function<bool(const std::shared_ptr<Node>&, size_t&, size_t&)>;
     using SelectionSetter = std::function<void(const std::shared_ptr<Node>&, size_t, size_t)>;
     struct DomSelection {
@@ -83,6 +85,8 @@ public:
     void SetFrameMessageSink(FrameMessageSink sink);
     void SetParentMessageSink(ParentMessageSink sink);
     void SetFocusSink(FocusSink sink);
+    void SetActivationSink(ActivationSink sink);
+    void SetPointerCaptureSink(PointerCaptureSink sink);
     void SetSelectionProvider(SelectionProvider provider);
     void SetSelectionSetter(SelectionSetter setter);
     void SetDomSelectionProvider(DomSelectionProvider provider);
@@ -100,6 +104,12 @@ public:
     void RunTimers();
     bool DispatchNodeEvent(const std::shared_ptr<Node>& node, const std::wstring& eventName,
                            const EventInit& init = {});
+    bool DispatchClipboardEvent(const std::shared_ptr<Node>& node,
+                                const std::wstring& eventName,
+                                const std::wstring& text,
+                                const std::vector<Node::FileInfo>& files = {});
+    std::shared_ptr<Node> CapturedPointerTarget() const;
+    void ClearPointerCapture();
     void DispatchFileDrop(const std::shared_ptr<Node>& node,
                           const std::vector<Node::FileInfo>& files);
     bool DispatchWebMessageAsJson(const std::wstring& json, std::wstring* error = nullptr);

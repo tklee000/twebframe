@@ -125,6 +125,7 @@ UINT CheckPointerGridAtDpi(DPI_AWARENESS_CONTEXT context) {
                     #grid::after { content: ""; position: absolute; inset: 0; pointer-events: none; }
                     #grid button { width: 18px; min-width: 18px; height: 18px; min-height: 18px; }
                     #grid button.is-selected { background: red; }
+                    #capture { position: absolute; left: 80px; top: 20px; width: 20px; height: 20px; }
                 </style>
                 <div id="grid">
                     <button id="b11" data-table-columns="1" data-table-rows="1"></button>
@@ -135,6 +136,8 @@ UINT CheckPointerGridAtDpi(DPI_AWARENESS_CONTEXT context) {
                     <button id="b23" data-table-columns="3" data-table-rows="2"></button>
                 </div>
                 <div id="label">0 x 0</div>
+                <button id="capture"></button>
+                <dialog id="form-dialog"><form id="dialog-form" method="dialog"><input id="dialog-input"><button id="dialog-submit" type="submit" value="accepted">Submit</button></form></dialog>
                 <script>
                     window.overCount = 0;
                     window.moveCount = 0;
@@ -145,6 +148,20 @@ UINT CheckPointerGridAtDpi(DPI_AWARENESS_CONTEXT context) {
                     window.lastClientY = 0;
                     window.lastMovementX = 0;
                     window.lastMovementY = 0;
+                    window.captureMoves = 0;
+                    window.captureUps = 0;
+                    window.captureMouseUps = 0;
+                    window.captureOnUp = false;
+                    window.captureClientX = 0;
+                    window.captureClientY = 0;
+                    window.captureKeyUps = 0;
+                    window.captureCancels = 0;
+                    window.contextMenus = 0;
+                    window.contextTarget = "";
+                    window.contextClientX = 0;
+                    window.dialogSubmits = 0;
+                    window.dialogCancels = 0;
+                    window.dialogCloses = 0;
                     const grid = document.getElementById("grid");
                     grid.addEventListener("pointerenter", () => { window.gridEnterCount += 1; });
                     grid.addEventListener("pointerover", (event) => {
@@ -171,6 +188,34 @@ UINT CheckPointerGridAtDpi(DPI_AWARENESS_CONTEXT context) {
                         window.lastMovementX = event.movementX;
                         window.lastMovementY = event.movementY;
                     });
+                    const capture = document.getElementById("capture");
+                    capture.addEventListener("pointerdown", (event) => capture.setPointerCapture(event.pointerId));
+                    capture.addEventListener("pointermove", (event) => {
+                        window.captureMoves += 1;
+                        window.captureClientX = event.clientX;
+                        window.captureClientY = event.clientY;
+                    });
+                    capture.addEventListener("pointerup", (event) => {
+                        window.captureUps += 1;
+                        window.captureOnUp = capture.hasPointerCapture(event.pointerId);
+                        capture.releasePointerCapture(event.pointerId);
+                    });
+                    capture.addEventListener("mouseup", () => { window.captureMouseUps += 1; });
+                    capture.addEventListener("keyup", () => { window.captureKeyUps += 1; });
+                    capture.addEventListener("pointercancel", (event) => {
+                        window.captureCancels += 1;
+                        if (capture.hasPointerCapture(event.pointerId)) capture.releasePointerCapture(event.pointerId);
+                    });
+                    grid.addEventListener("contextmenu", (event) => {
+                        event.preventDefault();
+                        window.contextMenus += 1;
+                        window.contextTarget = event.target.id;
+                        window.contextClientX = event.clientX;
+                    });
+                    const formDialog = document.getElementById("form-dialog");
+                    document.getElementById("dialog-form").addEventListener("submit", () => { window.dialogSubmits += 1; });
+                    formDialog.addEventListener("cancel", () => { window.dialogCancels += 1; });
+                    formDialog.addEventListener("close", () => { window.dialogCloses += 1; });
                 </script>
             )HTML";
             Check(view->NavigateToString(html), L"the generic pointer-driven grid fixture loads");
@@ -193,10 +238,58 @@ UINT CheckPointerGridAtDpi(DPI_AWARENESS_CONTEXT context) {
                          L"6|2",
                          L"the delegated pointer handler can expand the whole grid selection");
 
-            ScriptEquals(*view,
-                         L"return (Math.abs(window.lastClientX-55)<0.01)+'|'+(Math.abs(window.lastClientY-32)<0.01)+'|'+(Math.abs(window.lastMovementX-46)<0.01)+'|'+(Math.abs(window.lastMovementY-23)<0.01)+'|'+(Math.abs(window.devicePixelRatio-(window.innerWidth/240))<0.01);",
+            const float firstX=std::round(9.0f*scale)/scale;
+            const float firstY=std::round(9.0f*scale)/scale;
+            const float secondX=std::round(55.0f*scale)/scale;
+            const float secondY=std::round(32.0f*scale)/scale;
+            const std::wstring coordinateScript=
+                L"return (Math.abs(window.lastClientX-"+std::to_wstring(secondX)+L")<0.01)+'|'+"+
+                L"(Math.abs(window.lastClientY-"+std::to_wstring(secondY)+L")<0.01)+'|'+"+
+                L"(Math.abs(window.lastMovementX-"+std::to_wstring(secondX-firstX)+L")<0.01)+'|'+"+
+                L"(Math.abs(window.lastMovementY-"+std::to_wstring(secondY-firstY)+L")<0.01)+'|'+"+
+                L"(Math.abs(window.devicePixelRatio-"+std::to_wstring(scale)+L")<0.01);";
+            ScriptEquals(*view,coordinateScript.c_str(),
                          L"true|true|true|true|true",
                          L"pointer coordinates stay in CSS pixels at the active DPI");
+
+            SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, PointerPosition(90.0f, 30.0f, scale));
+            Check(GetCapture() == window, L"setPointerCapture acquires native capture at the active DPI");
+            SendMessageW(window, WM_MOUSEMOVE, MK_LBUTTON, PointerPosition(180.0f, 90.0f, scale));
+            SendMessageW(window, WM_LBUTTONUP, 0, PointerPosition(180.0f, 90.0f, scale));
+            ScriptEquals(*view,
+                         L"return window.captureMoves+'|'+window.captureUps+'|'+window.captureMouseUps+'|'+window.captureOnUp+'|'+document.getElementById('capture').hasPointerCapture(1)+'|'+(Math.abs(window.captureClientX-180)<0.01)+'|'+(Math.abs(window.captureClientY-90)<0.01);",
+                         L"1|1|1|true|false|true|true",
+                         L"captured pointermove and pointerup remain in CSS-pixel coordinates outside the element");
+            Check(GetCapture() != window, L"pointerup releases native pointer capture");
+            SendMessageW(window, WM_KEYUP, L'A', 0);
+            ScriptEquals(*view,L"return window.captureKeyUps;",L"1",
+                         L"native key release dispatches the common DOM keyup event");
+            SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, PointerPosition(90.0f, 30.0f, scale));
+            ReleaseCapture();
+            ScriptEquals(*view,L"return window.captureCancels+'|'+document.getElementById('capture').hasPointerCapture(1);",L"1|false",
+                         L"unexpected native capture loss dispatches pointercancel and clears DOM capture");
+
+            POINT contextPoint{static_cast<LONG>(std::lround(9.0f*scale)),static_cast<LONG>(std::lround(9.0f*scale))};
+            ClientToScreen(window,&contextPoint);
+            SendMessageW(window,WM_CONTEXTMENU,reinterpret_cast<WPARAM>(window),MAKELPARAM(contextPoint.x,contextPoint.y));
+            const auto expectedContextX=std::round(9.0f*scale)/scale;
+            const auto contextScript=L"return window.contextMenus+'|'+window.contextTarget+'|'+(Math.abs(window.contextClientX-"+
+                std::to_wstring(expectedContextX)+L")<0.01);";
+            ScriptEquals(*view,contextScript.c_str(),L"1|b11|true",
+                         L"contextmenu targets the CSS-pixel hit at the active DPI");
+
+            ScriptEquals(*view,L"const dialog=document.getElementById('form-dialog');dialog.showModal();document.getElementById('dialog-submit').click();return window.dialogSubmits+'|'+dialog.open+'|'+window.dialogCloses;",L"1|false|1",
+                         L"programmatic submit-button activation submits and closes method-dialog forms");
+            ScriptEquals(*view,L"const dialog=document.getElementById('form-dialog');dialog.showModal();document.getElementById('dialog-input').focus();return dialog.open;",L"true",
+                         L"dialog can reopen and focus its text input");
+            SendMessageW(window,WM_KEYDOWN,VK_RETURN,0);
+            ScriptEquals(*view,L"return window.dialogSubmits+'|'+document.getElementById('form-dialog').open+'|'+window.dialogCloses;",L"2|false|2",
+                         L"Enter in a text input submits its nearest form");
+            ScriptEquals(*view,L"const dialog=document.getElementById('form-dialog');dialog.showModal();document.getElementById('dialog-input').focus();return dialog.open;",L"true",
+                         L"dialog reopens for Escape cancellation");
+            SendMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);
+            ScriptEquals(*view,L"return window.dialogCancels+'|'+document.getElementById('form-dialog').open+'|'+window.dialogCloses;",L"1|false|3",
+                         L"Escape dispatches cancel and performs the dialog close default action");
 
             SendMessageW(window, WM_MOUSELEAVE, 0, 0);
         }

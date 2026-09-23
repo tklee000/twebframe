@@ -14,6 +14,7 @@ enum class NodeType { Document, Element, Text };
 
 class Document;
 struct CanvasSurface;
+struct RasterImage;
 
 struct Node : std::enable_shared_from_this<Node> {
     struct FileInfo {
@@ -38,12 +39,19 @@ struct Node : std::enable_shared_from_this<Node> {
     bool focused = false;
     bool focusVisible = false;
     bool focusWithin = false;
+    // HTMLDialogElement top-layer state. The open attribute alone also covers
+    // non-modal show(), so showModal() must retain this distinction in the DOM.
+    bool modal = false;
     bool scriptStarted = false;
     float scrollLeft = 0.0f;
     float scrollTop = 0.0f;
     size_t selectionStart = 0;
     size_t selectionEnd = 0;
+    std::wstring selectionDirection = L"none";
     std::shared_ptr<CanvasSurface> canvas;
+    std::shared_ptr<RasterImage> image;
+    std::wstring imageSource;
+    bool imageComplete = true;
 
     std::wstring Attribute(const std::wstring& name) const;
     void SetAttribute(const std::wstring& name, const std::wstring& value);

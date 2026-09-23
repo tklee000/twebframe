@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace TWebFrame {
 
@@ -21,6 +22,11 @@ public:
     // Resolves page-relative text resources such as stylesheets, scripts, and
     // JSON requested by fetch(). Return false when a resource is unavailable.
     using ResourceLoader = std::function<bool(const std::wstring&, std::wstring&)>;
+    // Resolves byte resources without a text transcoding step. Image hosts use
+    // this callback so JPEG/PNG/GIF bytes, including archive-backed resources,
+    // reach the shared decoder unchanged.
+    using BinaryResourceLoader = std::function<bool(
+        const std::wstring&, std::vector<unsigned char>&)>;
 
     static std::unique_ptr<View> Create(HWND parent, const RECT& bounds);
     ~View();
@@ -34,6 +40,7 @@ public:
     void SetMessageHandler(MessageHandler handler);
     void SetLoadHandler(LoadHandler handler);
     void SetResourceLoader(ResourceLoader loader);
+    void SetBinaryResourceLoader(BinaryResourceLoader loader);
 
     bool Navigate(const std::wstring& filePath);
     bool NavigateToString(const std::wstring& html, const std::wstring& basePath = L"");

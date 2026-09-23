@@ -67,6 +67,86 @@ std::wstring BorderColorFromShorthand(const std::wstring& value) {
     return value;
 }
 
+struct BackgroundShorthand {
+    std::wstring image = L"none";
+    std::wstring position = L"0% 0%";
+    std::wstring size = L"auto";
+    std::wstring repeat = L"repeat";
+    std::wstring color = L"transparent";
+};
+
+bool IsBackgroundImageToken(const std::wstring& token) {
+    const auto lowered=ToLower(Trim(token));
+    return lowered.rfind(L"url(",0)==0||lowered.find(L"gradient(")!=std::wstring::npos||
+           lowered==L"none";
+}
+
+bool IsBackgroundRepeatToken(const std::wstring& token) {
+    const auto lowered=ToLower(Trim(token));
+    return lowered==L"repeat"||lowered==L"repeat-x"||lowered==L"repeat-y"||
+           lowered==L"no-repeat"||lowered==L"space"||lowered==L"round";
+}
+
+size_t BackgroundSizeSlash(const std::wstring& token) {
+    int nesting=0;wchar_t quote=0;
+    for(size_t index=0;index<token.size();++index){
+        const auto character=token[index];
+        if(quote){if(character==quote&&(index==0||token[index-1]!=L'\\'))quote=0;continue;}
+        if(character==L'\''||character==L'"'){quote=character;continue;}
+        if(character==L'('||character==L'['){++nesting;continue;}
+        if(character==L')'||character==L']'){--nesting;continue;}
+        if(character==L'/'&&nesting==0)return index;
+    }
+    return std::wstring::npos;
+}
+
+BackgroundShorthand ParseBackgroundLayer(const std::wstring& value,bool finalLayer) {
+    BackgroundShorthand result;std::vector<std::wstring> position,size,repeat;
+    bool afterSlash=false;constexpr unsigned int invalid=0x01020304u;
+    for(const auto& original:SplitWhitespace(value)){
+        auto token=original;
+        const auto slash=BackgroundSizeSlash(token);
+        std::vector<std::wstring> pieces;
+        if(slash!=std::wstring::npos){
+            if(slash)pieces.push_back(token.substr(0,slash));
+            pieces.push_back(L"/");
+            if(slash+1<token.size())pieces.push_back(token.substr(slash+1));
+        }else pieces.push_back(token);
+        for(const auto& piece:pieces){
+            if(piece==L"/"){afterSlash=true;continue;}
+            const auto lowered=ToLower(Trim(piece));if(lowered.empty())continue;
+            if(IsBackgroundImageToken(piece)){result.image=piece;continue;}
+            if(IsBackgroundRepeatToken(piece)){repeat.push_back(piece);continue;}
+            if(lowered==L"scroll"||lowered==L"fixed"||lowered==L"local"||
+               lowered==L"border-box"||lowered==L"padding-box"||lowered==L"content-box")continue;
+            if(finalLayer&&StyleSheet::Color(piece,invalid)!=invalid){result.color=piece;continue;}
+            (afterSlash?size:position).push_back(piece);
+        }
+    }
+    const auto join=[](const std::vector<std::wstring>& values,const wchar_t* fallback){
+        if(values.empty())return std::wstring(fallback);std::wstring joined;
+        for(const auto& value:values){if(!joined.empty())joined+=L' ';joined+=value;}return joined;
+    };
+    result.position=join(position,L"0% 0%");result.size=join(size,L"auto");
+    result.repeat=join(repeat,L"repeat");return result;
+}
+
+BackgroundShorthand ParseBackgroundShorthand(const std::wstring& value) {
+    const auto layers=Split(value,L',');BackgroundShorthand result;
+    std::vector<std::wstring> images,positions,sizes,repeats;
+    for(size_t index=0;index<layers.size();++index){
+        const auto layer=ParseBackgroundLayer(layers[index],index+1==layers.size());
+        images.push_back(layer.image);positions.push_back(layer.position);
+        sizes.push_back(layer.size);repeats.push_back(layer.repeat);
+        if(index+1==layers.size())result.color=layer.color;
+    }
+    const auto join=[](const std::vector<std::wstring>& values){std::wstring joined;
+        for(const auto& value:values){if(!joined.empty())joined+=L", ";joined+=value;}return joined;};
+    if(!images.empty()){result.image=join(images);result.position=join(positions);
+        result.size=join(sizes);result.repeat=join(repeats);}
+    return result;
+}
+
 std::wstring SelectorSubjectKey(const std::vector<std::wstring>& parts) {
     if(parts.empty())return {};
     const auto& subject=parts.back();
@@ -193,7 +273,7 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
              node->tag == L"small" || node->tag == L"span" || node->tag == L"strong" ||
              node->tag == L"sub" || node->tag == L"sup" || node->tag == L"time" ||
              node->tag == L"u" || node->tag == L"var" || node->tag == L"wbr") display = L"inline";
-    else if (node->tag == L"button" || node->tag == L"canvas" || node->tag == L"input" ||
+    else if (node->tag == L"button" || node->tag == L"canvas" || node->tag == L"img" || node->tag == L"input" ||
              node->tag == L"select" || node->tag == L"textarea" || node->tag == L"svg")
         display = L"inline-block";
     else if (node->tag == L"table") display = L"table";
@@ -210,7 +290,14 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
         (*style.values)[L"transform"] = L"translate(-50%, -50%)";
         (*style.values)[L"z-index"] = L"10000";
     }
-    if (node && node->tag == L"body") set(L"margin", L"8px");
+    if (node && node->tag == L"body") {
+        set(L"margin", L"8px");
+        // Preserve the legacy HTML body background hint as a low-priority
+        // presentational rule. Author CSS still wins through the normal cascade.
+        const auto background=node->Attribute(L"background");
+        if(!background.empty()&&!style.values->count(L"background-image"))
+            (*style.values)[L"background-image"]=L"url(\""+background+L"\")";
+    }
     if (node && node->tag == L"p") set(L"margin", L"1em 0");
     if (node && node->tag.size() == 2 && node->tag[0] == L'h' &&
         node->tag[1] >= L'1' && node->tag[1] <= L'6') {
@@ -592,6 +679,9 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
         // override it normally instead of making the painter special-case an
         // individual input or page.
         if(pseudo==L"placeholder")(*result.values)[L"color"]=L"#757575";
+        // Browser user-agent styles give modal dialogs a translucent backdrop.
+        // Author ::backdrop rules participate in the normal cascade below.
+        if(pseudo==L"backdrop")(*result.values)[L"background-color"]=L"rgba(0,0,0,.1)";
     }
     // Preserve the user-agent/inherited starting point so a winning CSS-wide
     // `inherit` declaration can replace an earlier author declaration rather
@@ -697,14 +787,12 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
 
         if (name == L"background") {
             const auto resolvedBackground=ResolveVariables(value,variables);
-            std::wstring color=resolvedBackground;constexpr unsigned int invalid=0x01020304u;
-            const auto tokens=SplitWhitespace(resolvedBackground);
-            for(auto it=tokens.rbegin();it!=tokens.rend();++it){
-                auto token=*it;
-                while(!token.empty()&&(token.back()==L','||token.back()==L';'))token.pop_back();
-                if(StyleSheet::Color(token,invalid)!=invalid){color=token;break;}
-            }
-            setProperty(L"background-color", color, candidate);
+            const auto background=ParseBackgroundShorthand(resolvedBackground);
+            setProperty(L"background-color",background.color,candidate);
+            setProperty(L"background-image",background.image,candidate);
+            setProperty(L"background-position",background.position,candidate);
+            setProperty(L"background-size",background.size,candidate);
+            setProperty(L"background-repeat",background.repeat,candidate);
         } else if (name == L"margin" || name == L"padding") {
             const auto edges = ExpandEdges(value);
             if (edges.size() == 4) {
@@ -736,6 +824,23 @@ ComputedStyle StyleSheet::Compute(const std::shared_ptr<Node>& node, const Compu
             setProperty(name + L"-color", BorderColorFromShorthand(
                 ResolveVariables(value, variables)), candidate);
             setProperty(name + L"-style", value, candidate);
+        } else if (name == L"outline") {
+            const auto resolvedOutline=ResolveVariables(value,variables);
+            std::wstring width=L"medium",style=L"none",color=L"currentcolor";
+            constexpr unsigned int invalid=0x01020304u;
+            for(const auto& token:SplitWhitespace(resolvedOutline)){
+                const auto lowered=ToLower(Trim(token));
+                if(lowered==L"none"||lowered==L"hidden"||lowered==L"dotted"||
+                   lowered==L"dashed"||lowered==L"solid"||lowered==L"double"||
+                   lowered==L"groove"||lowered==L"ridge"||lowered==L"inset"||
+                   lowered==L"outset"||lowered==L"auto")style=token;
+                else if(lowered==L"currentcolor"||lowered==L"invert"||
+                        StyleSheet::Color(token,invalid)!=invalid)color=token;
+                else width=token;
+            }
+            setProperty(L"outline-width",width,candidate);
+            setProperty(L"outline-style",style,candidate);
+            setProperty(L"outline-color",color,candidate);
         } else if (name == L"gap") {
             const auto parts = SplitWhitespace(value);
             if (!parts.empty()) {
