@@ -112,17 +112,17 @@ int RunFrameBenchmark() {
     if(!view){DestroyWindow(host);std::wcerr<<L"benchmark view creation failed\n";return 1;}
     std::wstring html;
     html.reserve(nodeCount*72);
-    html+=LR"HTML(<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:14px Segoe UI}#viewport{height:680px;overflow:auto}.item{height:22px;padding:2px 8px;border-bottom:1px solid #eee;color:#222}.item:hover,.item.hot{color:#b91c1c;background:#fef2f2}</style><div id="viewport">)HTML";
+    html+=LR"HTML(<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:14px Segoe UI}#viewport{height:680px;overflow:auto}.item{height:22px;padding:2px 8px;border-bottom:1px solid #eee;color:#222}.item:hover,.item.hot{color:#b91c1c;background:#fef2f2}.hidden{display:none}</style><div id="viewport">)HTML";
     for(size_t index=0;index<nodeCount;++index)
         html+=L"<div class='item' id='row-"+std::to_wstring(index)+L"'>Row "+
             std::to_wstring(index)+L"</div>";
-    html+=L"</div>";
+    html+=L"</div><div id='benchmark-menu' class='hidden'></div>";
     const auto loadStart=Clock::now();
     if(!view->NavigateToString(html)){std::wcerr<<view->LastError()<<L'\n';view.reset();DestroyWindow(host);return 1;}
     UpdateWindow(view->Window());
     const double initialLoad=std::chrono::duration<double,std::milli>(Clock::now()-loadStart).count();
 
-    FrameStats hover,style,scroll;
+    FrameStats hover,style,scroll,scrollNoopClass,scrollHeavySibling;
     const bool hoverOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
         const int y=11+static_cast<int>(index%28)*22;
         SendMessageW(view->Window(),WM_MOUSEMOVE,0,MAKELPARAM(80,y));return true;
@@ -142,6 +142,32 @@ int RunFrameBenchmark() {
         SendMessageW(view->Window(),WM_MOUSEWHEEL,MAKEWPARAM(0,delta),
             MAKELPARAM(wheelPoint.x,wheelPoint.y));return true;
     },scroll);
+    const bool scrollListenerOk=view->ExecuteScript(
+        L"document.getElementById('viewport').addEventListener('scroll',()=>document.getElementById('benchmark-menu').classList.add('hidden'));",
+        nullptr,&error);
+    view->ExecuteScript(L"document.getElementById('viewport').scrollTop=0;",nullptr,&error);
+    UpdateWindow(view->Window());
+    const bool scrollNoopClassOk=MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const short delta=index%2?WHEEL_DELTA:-WHEEL_DELTA;
+        SendMessageW(view->Window(),WM_MOUSEWHEEL,MAKEWPARAM(0,delta),
+            MAKELPARAM(wheelPoint.x,wheelPoint.y));return true;
+    },scrollNoopClass);
+    std::wstring splitPaneHtml=LR"HTML(<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:12px Segoe UI}#history{height:300px;overflow:auto}.commit{height:22px;padding:2px 8px;border-bottom:1px solid #ddd}#detail{height:380px;overflow:hidden;border-top:1px solid #bbb}#diff{height:100%;overflow:auto;font:11px Consolas}.diff-line{display:grid;grid-template-columns:46px 46px minmax(0,1fr);height:17px}.diff-line span{overflow:hidden;white-space:pre}</style><div id='history'>)HTML";
+    for(size_t index=0;index<240;++index)
+        splitPaneHtml+=L"<div class='commit'>Commit "+std::to_wstring(index)+L"</div>";
+    splitPaneHtml+=L"</div><div id='detail'><div id='diff'>";
+    for(size_t index=0;index<5000;++index)
+        splitPaneHtml+=L"<div class='diff-line'><span>"+std::to_wstring(index)+
+            L"</span><span>"+std::to_wstring(index+1)+
+            L"</span><span>Localization payload line "+std::to_wstring(index)+L"</span></div>";
+    splitPaneHtml+=L"</div></div>";
+    const bool splitPaneOk=view->NavigateToString(splitPaneHtml);
+    UpdateWindow(view->Window());
+    const bool scrollHeavySiblingOk=splitPaneOk&&MeasureFrames(view->Window(),sampleCount,[&](size_t index){
+        const short delta=index%2?WHEEL_DELTA:-WHEEL_DELTA;
+        SendMessageW(view->Window(),WM_MOUSEWHEEL,MAKEWPARAM(0,delta),
+            MAKELPARAM(wheelPoint.x,wheelPoint.y));return true;
+    },scrollHeavySibling);
 
     std::wcout<<std::fixed<<std::setprecision(3)
         <<L"TWebFrame 10k-node frame benchmark (milliseconds)\n"
@@ -152,8 +178,11 @@ int RunFrameBenchmark() {
                   <<value.p95<<L','<<value.p99<<L','<<value.maximum<<L'\n';
     };
     print(L"hover",hover);print(L"style_toggle",style);print(L"wheel_scroll",scroll);
+    print(L"wheel_scroll_noop_class",scrollNoopClass);
+    print(L"wheel_scroll_heavy_sibling",scrollHeavySibling);
     view.reset();DestroyWindow(host);
-    if(!hoverOk||!styleOk||!scrollOk){
+    if(!hoverOk||!styleOk||!scrollOk||!scrollListenerOk||!scrollNoopClassOk||
+       !splitPaneOk||!scrollHeavySiblingOk){
         std::wcerr<<L"benchmark action failed: "<<error<<L'\n';return 1;
     }
     return 0;
@@ -462,6 +491,25 @@ int wmain(int argc,wchar_t** argv) {
     Check(mutationJs.Execute(L"document.getElementById('scroll').setAttribute('ARIA-LIVE','polite');",nullptr,&error)&&
           mutationNotifications==1&&lastMutation.liveRegionMembershipChanged,
           L"aria-live membership changes are identified without a document-wide scan");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(
+              L"const node=document.getElementById('scroll');node.classList.add('hidden');",
+              nullptr,&error)&&mutationNotifications==1&&
+          lastMutation.kind==JavaScriptRuntime::MutationKind::Style,
+          L"classList reports an actual class change once");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(
+              L"const node=document.getElementById('scroll');"
+              L"node.classList.add('hidden');node.classList.toggle('hidden',true);"
+              L"node.classList.remove('missing');",
+              nullptr,&error)&&mutationNotifications==0,
+          L"no-op classList operations do not invalidate style or layout");
+    mutationNotifications=0;
+    Check(mutationJs.Execute(
+              L"const node=document.getElementById('scroll');node.classList.remove('hidden');",
+              nullptr,&error)&&mutationNotifications==1&&
+          lastMutation.kind==JavaScriptRuntime::MutationKind::Style,
+          L"classList reports an actual class removal once");
     Document normalizeDoc;
     Check(normalizeDoc.Parse(L"<body><div id='editor'>text</div></body>"),
           L"DOM normalization fixture parses");

@@ -4353,6 +4353,7 @@ void LayoutEngine::Layout(float width,float height,float deviceScale){
     if(styleCacheVersion_!=styleSheet_.Version()||styleCache_.size()>8192){
         styleCache_.clear();styleCacheVersion_=styleSheet_.Version();
     }
+    canvasBackgroundBox_=nullptr;canvasHtmlBox_=nullptr;canvasBodyBox_=nullptr;
     boxIndex_.clear();firstLetterRuns_.clear();auto rootNode=document_.Body();if(!rootNode)rootNode=document_.Root();
     std::uint64_t context=1469598103934665603ull;
     std::vector<std::shared_ptr<Node>> ancestors;
@@ -4365,6 +4366,12 @@ void LayoutEngine::Layout(float width,float height,float deviceScale){
         inheritedStyle=&ancestorStyles.back();
     }
     root_=Build(rootNode,inheritedStyle,context);if(!root_)return;
+    const auto rememberCanvasBox=[&](const std::shared_ptr<Node>& node,const LayoutBox*& box){
+        if(!node)return;const auto found=boxIndex_.find(node.get());
+        if(found!=boxIndex_.end())box=found->second;
+    };
+    rememberCanvasBox(document_.QuerySelector(L"html"),canvasHtmlBox_);
+    rememberCanvasBox(document_.Body(),canvasBodyBox_);
     ApplyTransitions(*root_);
     std::vector<const Node*> removed;
     for(const auto& item:transitionTargets_)if(!boxIndex_.count(item.first))removed.push_back(item.first);
@@ -5181,15 +5188,12 @@ void LayoutEngine::Paint(ID2D1RenderTarget* target,IDWriteFactory* factory,const
         clip.width=std::max(0.0f,right-clip.x);clip.height=std::max(0.0f,bottom-clip.y);
         if(clip.width<=0||clip.height<=0)return;
     }
-    LayoutBox* html=nullptr;LayoutBox* body=nullptr;
-    std::function<void(LayoutBox&)> findCanvasBackground=[&](LayoutBox& box){
-        if(box.node&&box.node->tag==L"html")html=&box;
-        else if(box.node&&box.node->tag==L"body")body=&box;
-        for(auto& child:box.children)findCanvasBackground(*child);
-    };
-    findCanvasBackground(*root_);
-    canvasBackgroundBox_=html&&HasCanvasBackground(html->style)?html:
-        (body&&HasCanvasBackground(body->style)?body:nullptr);
+    // The HTML/body boxes only change when the layout tree is rebuilt. Keep
+    // direct candidates instead of walking every layout box before each dirty
+    // paint; large off-screen code or diff views must not tax an unrelated
+    // scrolling pane.
+    canvasBackgroundBox_=canvasHtmlBox_&&HasCanvasBackground(canvasHtmlBox_->style)?canvasHtmlBox_:
+        (canvasBodyBox_&&HasCanvasBackground(canvasBodyBox_->style)?canvasBodyBox_:nullptr);
     if(canvasBackgroundBox_){
         target->PushAxisAlignedClip(PixelAlignedRect(clip,deviceScale_),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         const LayoutRect canvas{0,0,viewportWidth_,viewportHeight_};const CornerRadii radius{};
@@ -5240,6 +5244,7 @@ void LayoutEngine::PaintDialogBackdrop(ID2D1RenderTarget* target,const LayoutBox
 
 void LayoutEngine::PaintStackingContext(ID2D1RenderTarget* target,IDWriteFactory* factory,
                                         LayoutBox& box,const LayoutRect& clipBounds){
+    if(clipBounds.width<=0||clipBounds.height<=0)return;
     if(box.node&&box.node->modal&& &box!=paintingTopLayer_)return;
     target->PushAxisAlignedClip(PixelAlignedRect(clipBounds,deviceScale_),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     PaintBox(target,factory,box,clipBounds,&box.nonNegativeStackingContexts);

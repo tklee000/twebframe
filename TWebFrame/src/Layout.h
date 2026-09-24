@@ -185,6 +185,8 @@ private:
     std::vector<LayoutBox*> modalBoxes_;
     const LayoutBox* paintingTopLayer_ = nullptr;
     const LayoutBox* canvasBackgroundBox_ = nullptr;
+    const LayoutBox* canvasHtmlBox_ = nullptr;
+    const LayoutBox* canvasBodyBox_ = nullptr;
     ID2D1RenderTarget* brushCacheTarget_ = nullptr;
     FastMap<unsigned int, Microsoft::WRL::ComPtr<ID2D1SolidColorBrush>> brushCache_;
     ID2D1Factory* geometryFactory_ = nullptr;

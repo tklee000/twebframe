@@ -614,6 +614,15 @@ struct View::Impl {
         InflateRect(&dirty,1,1);RECT client{};GetClientRect(hwnd,&client);
         RECT clipped{};if(IntersectRect(&clipped,&dirty,&client))InvalidateRect(hwnd,&clipped,FALSE);
     }
+    void InvalidateScrollViewport(const std::shared_ptr<Node>& node){
+        if(!layoutDirty)if(const auto* box=layout.BoxFor(node)){
+            // Scrolled descendants are clipped to the scroll container's border box.
+            // Invalidate only that box, converting CSS pixels to device pixels in
+            // InvalidateDipBounds so the rule remains correct at every monitor DPI.
+            InvalidateDipBounds(box->rect);return;
+        }
+        InvalidateRect(hwnd,nullptr,FALSE);
+    }
     void UpdateJavaScriptViewport(){
         RECT bounds{};GetClientRect(hwnd,&bounds);const float scale=DpiScale();
         javascript.SetViewportSize(static_cast<double>(std::max(1L,bounds.right-bounds.left))/scale,
@@ -2603,13 +2612,13 @@ struct View::Impl {
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
             if(openSelectPopup){SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y)){ScrollSelectPopup(-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam))/WHEEL_DELTA*popup.rowHeight*3.0f);return 0;}CloseSelectPopup();}
-            std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+            std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateScrollViewport(scrolled);}return 0;
         }
         case WM_MOUSEHWHEEL:{
             HideTooltip();
             if(layoutDirty)Rebuild();POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);
             const float x=PixelToDip(static_cast<float>(point.x)),y=PixelToDip(static_cast<float>(point.y));
-            std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled,true)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+            std::shared_ptr<Node> scrolled;if(layout.ScrollAt(x,y,-static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)),&scrolled,true)){javascript.DispatchNodeEvent(scrolled,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateScrollViewport(scrolled);}return 0;
         }
         case WM_MOUSEMOVE:{
             if(!trackingMouseLeave){TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT),TME_LEAVE,hwnd,0};trackingMouseLeave=TrackMouseEvent(&tracking)!=FALSE;}
@@ -2621,7 +2630,7 @@ struct View::Impl {
                 const float previous=selectPopupScrollOffset;selectPopupScrollOffset=travel>0?thumbTop/travel*maximum:0;
                 if(std::abs(previous-selectPopupScrollOffset)>0.01f)InvalidateRect(hwnd,nullptr,FALSE);
             }return 0;}
-            if(scrollbarDragNode){HideTooltip();if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
+            if(scrollbarDragNode){HideTooltip();if(layout.DragScrollbar(scrollbarDragNode,x,y,scrollbarDragOffset,scrollbarDragHorizontal)){javascript.DispatchNodeEvent(scrollbarDragNode,L"scroll");if(accessibility)accessibility->Invalidate();textInput.UpdateCandidateWindow(hwnd);InvalidateScrollViewport(scrollbarDragNode);}return 0;}
             if(textSelectionDragging){HideTooltip();UpdateTextSelectionAt(x,y);return 0;}
             if(layoutDirty)Rebuild();if(openSelectPopup){int hot=SelectPopupIndexAt(x,y);const auto options=PopupOptions(openSelectPopup);if(hot>=0&&(static_cast<size_t>(hot)>=options.size()||options[hot]->disabled))hot=-1;if(hot!=selectPopupHotIndex){selectPopupHotIndex=hot;InvalidateRect(hwnd,nullptr,FALSE);}SelectPopupGeometry popup;if(GetSelectPopupGeometry(openSelectPopup,popup)&&popup.bounds.Contains(x,y)){HideTooltip();return 0;}}
             auto n=layout.HitTest(x,y);UpdateTooltipTarget(n);

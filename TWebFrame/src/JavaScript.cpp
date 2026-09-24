@@ -3044,14 +3044,21 @@ struct RuntimeCore {
             auto node=object->node;
             if(key==L"length"){size_t count=0;std::wistringstream classes(node?node->Attribute(L"class"):L"");std::wstring token;while(classes>>token)++count;return Value::Number(static_cast<double>(count));}
             if(key==L"add"||key==L"remove")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){
+                if(!node)return Value::Undefined();
+                const auto before=node->Attribute(L"class");
                 for(auto& v:a)if(key==L"add")node->AddClass(r.String(v));else node->RemoveClass(r.String(v));
-                r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Undefined();
+                if(node->Attribute(L"class")!=before)
+                    r.Mutated(node,JavaScriptRuntime::MutationKind::Style);
+                return Value::Undefined();
             });
             if(key==L"toggle")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){
-                if(a.empty())return Value::Bool(false);const auto name=r.String(a[0]);
+                if(!node||a.empty())return Value::Bool(false);const auto name=r.String(a[0]);
+                const auto before=node->Attribute(L"class");
                 bool has=a.size()>1;
                 bool force=has?r.Truth(a[1]):false;node->ToggleClass(name,force,has);
-                r.Mutated(node,JavaScriptRuntime::MutationKind::Style);return Value::Bool(node->HasClass(name));
+                if(node->Attribute(L"class")!=before)
+                    r.Mutated(node,JavaScriptRuntime::MutationKind::Style);
+                return Value::Bool(node->HasClass(name));
             });
             if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&node->HasClass(r.String(a[0])));});
         }
