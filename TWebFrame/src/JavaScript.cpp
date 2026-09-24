@@ -364,7 +364,7 @@ struct PromiseReaction {
 };
 
 enum class PromiseState { Pending, Fulfilled, Rejected };
-enum class ObjectKind { Plain, Array, Map, Set, RegExp, Window, FrameWindow, Document, Node, Range, Selection, TreeWalker, ClassList, Style, Dataset, Event, WebView, Performance, Math, Json, ObjectConstructor, ArrayConstructor, StringConstructor, NumberConstructor, DateConstructor, Date, PromiseConstructor, ErrorConstructor, UrlSearchParams, Storage, MediaQuery, Response, Promise, Error, Location, File, FileReader, Clipboard, DataTransfer, DataTransferItem, CanvasContext2D, CanvasGradient };
+enum class ObjectKind { Plain, Array, Map, Set, RegExp, Window, FrameWindow, Document, Node, Range, Selection, TreeWalker, ClassList, Style, Dataset, Event, WebView, Performance, Math, Json, ObjectConstructor, ArrayConstructor, StringConstructor, NumberConstructor, DateConstructor, Date, PromiseConstructor, ErrorConstructor, Url, UrlSearchParams, Storage, MediaQuery, Response, Promise, Error, Location, File, FileReader, Clipboard, DataTransfer, DataTransferItem, CanvasContext2D, CanvasGradient };
 
 struct Object {
     ObjectKind kind = ObjectKind::Plain;
@@ -1301,6 +1301,7 @@ struct RuntimeCore {
     JavaScriptRuntime::FrameScheduler frameScheduler;
     JavaScriptRuntime::TimerScheduler timerScheduler;
     JavaScriptRuntime::ResourceLoader resourceLoader;
+    JavaScriptRuntime::NavigationSink navigationSink;
     JavaScriptRuntime::DialogSink dialogSink;
     JavaScriptRuntime::FrameMessageSink frameMessageSink;
     JavaScriptRuntime::ParentMessageSink parentMessageSink;
@@ -1560,7 +1561,97 @@ struct RuntimeCore {
         return false;
     }
     std::wstring String(const Value& value){
-        const auto v=Deref(value);switch(v.type){case Value::Type::Undefined:return L"undefined";case Value::Type::Null:return L"null";case Value::Type::Boolean:return v.boolean?L"true":L"false";case Value::Type::Number:return NumberString(v.number);case Value::Type::String:return v.string;case Value::Type::Function:case Value::Type::Native:return L"function";case Value::Type::Object:if(v.object&&v.object->kind==ObjectKind::Array)return L"[object Array]";if(v.object&&v.object->kind==ObjectKind::Promise)return L"[object Promise]";if(v.object&&v.object->kind==ObjectKind::Error){const auto name=v.object->props.find(L"name"),message=v.object->props.find(L"message");const auto n=name==v.object->props.end()?L"Error":String(name->second);const auto m=message==v.object->props.end()?L"":String(message->second);return m.empty()?n:n+L": "+m;}return L"[object Object]";default:return L"undefined";}
+        const auto v=Deref(value);switch(v.type){case Value::Type::Undefined:return L"undefined";case Value::Type::Null:return L"null";case Value::Type::Boolean:return v.boolean?L"true":L"false";case Value::Type::Number:return NumberString(v.number);case Value::Type::String:return v.string;case Value::Type::Function:case Value::Type::Native:return L"function";case Value::Type::Object:if(v.object&&v.object->kind==ObjectKind::Array)return L"[object Array]";if(v.object&&v.object->kind==ObjectKind::Promise)return L"[object Promise]";if(v.object&&v.object->kind==ObjectKind::Url){const auto href=v.object->props.find(L"href");return href==v.object->props.end()?L"":String(href->second);}if(v.object&&v.object->kind==ObjectKind::Error){const auto name=v.object->props.find(L"name"),message=v.object->props.find(L"message");const auto n=name==v.object->props.end()?L"Error":String(name->second);const auto m=message==v.object->props.end()?L"":String(message->second);return m.empty()?n:n+L": "+m;}return L"[object Object]";default:return L"undefined";}
+    }
+    static std::wstring DecodeUrlParameter(const std::wstring& input){
+        std::wstring output;std::string bytes;
+        const auto flush=[&]{if(bytes.empty())return;const auto decoded=Utf8ToWide(bytes);output+=decoded.empty()?std::wstring(bytes.begin(),bytes.end()):decoded;bytes.clear();};
+        for(size_t index=0;index<input.size();++index){
+            if(input[index]==L'+' ){flush();output+=L' ';continue;}
+            if(input[index]==L'%'&&index+2<input.size()){
+                const int high=HexDigitValue(input[index+1]),low=HexDigitValue(input[index+2]);
+                if(high>=0&&low>=0){bytes.push_back(static_cast<char>((high<<4)|low));index+=2;continue;}
+            }
+            flush();output+=input[index];
+        }
+        flush();return output;
+    }
+    static std::wstring EncodeUrlParameter(const std::wstring& input){
+        static constexpr wchar_t hexadecimal[]=L"0123456789ABCDEF";
+        std::wstring output;const auto bytes=WideToUtf8(input);
+        for(const unsigned char byte:bytes){
+            if((byte>='a'&&byte<='z')||(byte>='A'&&byte<='Z')||(byte>='0'&&byte<='9')||
+               byte=='*'||byte=='-'||byte=='.'||byte=='_')output+=static_cast<wchar_t>(byte);
+            else if(byte==' ')output+=L'+';
+            else{output+=L'%';output+=hexadecimal[(byte>>4)&15];output+=hexadecimal[byte&15];}
+        }
+        return output;
+    }
+    static bool HasUrlScheme(const std::wstring& value){
+        const auto colon=value.find(L':');if(colon==std::wstring::npos||colon==0)return false;
+        if(!std::iswalpha(value.front()))return false;
+        for(size_t index=1;index<colon;++index)if(!std::iswalnum(value[index])&&value[index]!=L'+'&&value[index]!=L'-'&&value[index]!=L'.')return false;
+        return true;
+    }
+    static std::wstring ResolveUrlReference(const std::wstring& input,const std::wstring& base){
+        if(input.empty())return base;
+        if(HasUrlScheme(input))return input;
+        const auto scheme=base.find(L"://");
+        if(input.rfind(L"//",0)==0)return scheme==std::wstring::npos?input:base.substr(0,scheme+1)+input;
+        const auto fragment=base.find(L'#');const auto query=base.find(L'?');
+        const auto suffix=std::min(fragment==std::wstring::npos?base.size():fragment,
+                                   query==std::wstring::npos?base.size():query);
+        const auto cleanBase=base.substr(0,suffix);
+        if(input.front()==L'#')return base.substr(0,fragment==std::wstring::npos?base.size():fragment)+input;
+        if(input.front()==L'?')return cleanBase+input;
+        if(input.front()==L'/'&&scheme!=std::wstring::npos){const auto originEnd=base.find(L'/',scheme+3);return (originEnd==std::wstring::npos?cleanBase:base.substr(0,originEnd))+input;}
+        const auto slash=cleanBase.find_last_of(L"/\\");return (slash==std::wstring::npos?L"":cleanBase.substr(0,slash+1))+input;
+    }
+    Value UrlSearchParamsValue(std::wstring query,const std::shared_ptr<Object>& owner={}){
+        auto parameters=CreateObject(ObjectKind::UrlSearchParams);
+        if(!query.empty()&&query.front()==L'?')query.erase(query.begin());
+        size_t start=0;while(start<=query.size()){
+            const auto amp=query.find(L'&',start);const auto part=query.substr(start,amp==std::wstring::npos?std::wstring::npos:amp-start);
+            const auto equal=part.find(L'=');if(!part.empty())parameters->entries.push_back({Value::String(DecodeUrlParameter(part.substr(0,equal))),Value::String(DecodeUrlParameter(equal==std::wstring::npos?L"":part.substr(equal+1)))});
+            if(amp==std::wstring::npos)break;start=amp+1;
+        }
+        if(owner)parameters->props[L"$url"]=Value::FromObject(owner);
+        return Value::FromObject(parameters);
+    }
+    std::wstring SerializeUrlSearchParams(const std::shared_ptr<Object>& parameters){
+        std::wstring result;
+        for(const auto& entry:parameters->entries){if(!result.empty())result+=L'&';result+=EncodeUrlParameter(String(entry.first));result+=L'=';result+=EncodeUrlParameter(String(entry.second));}
+        return result;
+    }
+    void SyncUrlSearchParams(const std::shared_ptr<Object>& parameters){
+        const auto owner=parameters->props.find(L"$url");if(owner==parameters->props.end())return;
+        const auto value=Deref(owner->second);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Url)return;
+        auto url=value.object;const auto href=String(url->props[L"href"]);const auto query=href.find(L'?');const auto fragment=href.find(L'#');
+        const auto pathEnd=std::min(query==std::wstring::npos?href.size():query,fragment==std::wstring::npos?href.size():fragment);
+        const auto encoded=SerializeUrlSearchParams(parameters);const auto hash=fragment==std::wstring::npos?L"":href.substr(fragment);
+        url->props[L"search"]=Value::String(encoded.empty()?L"":L"?"+encoded);
+        url->props[L"href"]=Value::String(href.substr(0,pathEnd)+(encoded.empty()?L"":L"?"+encoded)+hash);
+    }
+    Value UrlValue(const std::wstring& input,const std::wstring& base){
+        const auto href=ResolveUrlReference(input,base);auto url=CreateObject(ObjectKind::Url);
+        const auto fragment=href.find(L'#');const auto query=href.find(L'?');
+        const bool hasQuery=query!=std::wstring::npos&&(fragment==std::wstring::npos||query<fragment);
+        const auto pathEnd=std::min(hasQuery?query:href.size(),fragment==std::wstring::npos?href.size():fragment);
+        const auto schemeEnd=href.find(L':');const auto authorityStart=schemeEnd!=std::wstring::npos&&href.compare(schemeEnd,3,L"://")==0?schemeEnd+3:std::wstring::npos;
+        const auto authorityEnd=authorityStart==std::wstring::npos?std::wstring::npos:href.find_first_of(L"/?#",authorityStart);
+        const auto host=authorityStart==std::wstring::npos?L"":href.substr(authorityStart,(authorityEnd==std::wstring::npos?href.size():authorityEnd)-authorityStart);
+        url->props[L"href"]=Value::String(href);url->props[L"protocol"]=Value::String(schemeEnd==std::wstring::npos?L"":href.substr(0,schemeEnd+1));
+        url->props[L"host"]=Value::String(host);url->props[L"hostname"]=Value::String(host.substr(0,host.find(L':')));
+        url->props[L"origin"]=Value::String(authorityStart==std::wstring::npos?L"null":href.substr(0,authorityStart)+host);
+        url->props[L"pathname"]=Value::String(authorityEnd==std::wstring::npos?(authorityStart==std::wstring::npos?href.substr(0,pathEnd):L"/"):href.substr(authorityEnd,pathEnd-authorityEnd));
+        url->props[L"search"]=Value::String(hasQuery?href.substr(query,(fragment==std::wstring::npos?href.size():fragment)-query):L"");
+        url->props[L"hash"]=Value::String(fragment==std::wstring::npos?L"":href.substr(fragment));
+        url->props[L"searchParams"]=UrlSearchParamsValue(hasQuery?href.substr(query,(fragment==std::wstring::npos?href.size():fragment)-query):L"",url);
+        return Value::FromObject(url);
+    }
+    void RequestNavigation(const std::wstring& target){
+        const auto resolved=ResolveUrlReference(target,location);if(resolved.empty())return;
+        if(navigationSink)navigationSink(resolved);
     }
     Value NodeValue(const std::shared_ptr<Node>& node){
         if(!node)return Value::Null();auto found=nodeObjects.find(node.get());if(found!=nodeObjects.end())if(auto cached=found->second.lock())return Value::FromObject(cached);
@@ -3039,7 +3130,17 @@ struct RuntimeCore {
         }
         if(object->kind==ObjectKind::DataTransfer&&key==L"getData")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){const auto type=a.empty()?L"":ToLower(r.String(a[0]));if(type==L"text"||type==L"text/plain"){const auto found=object->props.find(L"$text");return Value::String(found==object->props.end()?L"":r.String(found->second));}return Value::String(L"");});
         if(object->kind==ObjectKind::DataTransferItem&&key==L"getAsFile")return Native([object](RuntimeCore&,const Value&,const std::vector<Value>&){const auto found=object->props.find(L"$file");return found==object->props.end()?Value::Null():found->second;});
-        if(object->kind==ObjectKind::UrlSearchParams&&key==L"get")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Null();const auto found=object->props.find(r.String(a[0]));return found==object->props.end()?Value::Null():found->second;});
+        if(object->kind==ObjectKind::UrlSearchParams){
+            if(key==L"get")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Null();const auto name=r.String(a[0]);for(const auto& entry:object->entries)if(r.String(entry.first)==name)return entry.second;return Value::Null();});
+            if(key==L"has")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);const auto name=r.String(a[0]);return Value::Bool(std::any_of(object->entries.begin(),object->entries.end(),[&](const auto& entry){return r.String(entry.first)==name;}));});
+            if(key==L"set")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Undefined();const auto name=r.String(a[0]),value=a.size()>1?r.String(a[1]):L"undefined";auto first=object->entries.end();for(auto iterator=object->entries.begin();iterator!=object->entries.end();){if(r.String(iterator->first)!=name){++iterator;continue;}if(first==object->entries.end()){iterator->second=Value::String(value);first=iterator;++iterator;}else iterator=object->entries.erase(iterator);}if(first==object->entries.end())object->entries.push_back({Value::String(name),Value::String(value)});r.SyncUrlSearchParams(object);return Value::Undefined();});
+            if(key==L"append")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Undefined();object->entries.push_back({Value::String(r.String(a[0])),Value::String(a.size()>1?r.String(a[1]):L"undefined")});r.SyncUrlSearchParams(object);return Value::Undefined();});
+            if(key==L"delete")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Undefined();const auto name=r.String(a[0]);object->entries.erase(std::remove_if(object->entries.begin(),object->entries.end(),[&](const auto& entry){return r.String(entry.first)==name;}),object->entries.end());r.SyncUrlSearchParams(object);return Value::Undefined();});
+            if(key==L"toString")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){return Value::String(r.SerializeUrlSearchParams(object));});
+        }
+        if(object->kind==ObjectKind::Url&&key==L"toString")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){return object->props.count(L"href")?Value::String(r.String(object->props[L"href"])):Value::String(L"");});
+        if(object->kind==ObjectKind::Location&&(key==L"replace"||key==L"assign"))return Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(!a.empty())r.RequestNavigation(r.String(a[0]));return Value::Undefined();});
+        if(object->kind==ObjectKind::Location&&key==L"reload")return Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){r.RequestNavigation(r.location);return Value::Undefined();});
         if(object->kind==ObjectKind::Response&&key==L"text")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){const auto found=object->props.find(L"$body");return r.PromiseResolveValue(found==object->props.end()?Value::String(L""):Value::String(r.String(found->second)));});
         if(object->kind==ObjectKind::Response&&key==L"json")return Native([object](RuntimeCore& r,const Value&,const std::vector<Value>&){const auto found=object->props.find(L"$body");if(found==object->props.end())return r.PromiseResolveValue(r.ObjectValue(ObjectKind::Plain));try{Compiler parser(r.module,r.String(found->second));return r.PromiseResolveValue(r.Run(parser.CompileExpressionOnly(),r.global));}catch(const JavaScriptException& exception){auto promise=r.PromiseValue();r.RejectPromise(promise.object,exception.value);return promise;}catch(const std::exception& exception){auto promise=r.PromiseValue();r.RejectPromise(promise.object,r.ErrorValue(L"SyntaxError",Utf8ToWide(exception.what())));return promise;}});
         if(object->kind==ObjectKind::Performance&&key==L"now")return Native([](RuntimeCore&,const Value&,const std::vector<Value>&){using namespace std::chrono;return Value::Number(duration<double,std::milli>(steady_clock::now().time_since_epoch()).count());});
@@ -3152,6 +3253,12 @@ struct RuntimeCore {
             auto baseLocation=location;const auto fragment=baseLocation.find(L'#');if(fragment!=std::wstring::npos)baseLocation.resize(fragment);
             location=baseLocation+hash;object->props[L"hash"]=Value::String(hash);object->props[L"href"]=Value::String(location);
             DispatchWindow(L"hashchange");return;
+        }
+        if(object->kind==ObjectKind::Location&&key==L"href"){
+            RequestNavigation(String(v));return;
+        }
+        if(object->kind==ObjectKind::Window&&key==L"location"){
+            RequestNavigation(String(v));return;
         }
         if(object->kind==ObjectKind::Node&&object->node){auto n=object->node;bool indexOk=true;
             if(n->tag==L"canvas"&&(key==L"width"||key==L"height")){
@@ -3647,7 +3754,10 @@ struct RuntimeCore {
         locationObject->props[L"hash"]=Value::String(fragment==std::wstring::npos?L"":location.substr(fragment));
         global->values[L"location"]=Value::FromObject(locationObject);window->props[L"location"]=Value::FromObject(locationObject);
         auto storage=ObjectValue(ObjectKind::Storage);global->values[L"localStorage"]=storage;window->props[L"localStorage"]=storage;
-        global->values[L"URLSearchParams"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto parameters=r.ObjectValue(ObjectKind::UrlSearchParams);auto query=a.empty()?L"":r.String(a[0]);if(!query.empty()&&query.front()==L'?')query.erase(query.begin());size_t start=0;while(start<=query.size()){const auto amp=query.find(L'&',start);const auto part=query.substr(start,amp==std::wstring::npos?std::wstring::npos:amp-start);const auto equal=part.find(L'=');if(!part.empty())parameters.object->props[part.substr(0,equal)]=Value::String(equal==std::wstring::npos?L"":part.substr(equal+1));if(amp==std::wstring::npos)break;start=amp+1;}return parameters;});
+        const auto urlConstructor=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())throw JavaScriptException{r.ErrorValue(L"TypeError",L"URL requires an input")};return r.UrlValue(r.String(a[0]),a.size()>1?r.String(a[1]):r.location);});
+        const auto urlSearchParamsConstructor=Native([](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.UrlSearchParamsValue(a.empty()?L"":r.String(a[0]));});
+        global->values[L"URL"]=urlConstructor;window->props[L"URL"]=urlConstructor;
+        global->values[L"URLSearchParams"]=urlSearchParamsConstructor;window->props[L"URLSearchParams"]=urlSearchParamsConstructor;
         global->values[L"matchMedia"]=Native([](RuntimeCore& r,const Value&,const std::vector<Value>&){auto media=r.ObjectValue(ObjectKind::MediaQuery);media.object->props[L"matches"]=Value::Bool(false);return media;});
         auto console=ObjectValue(ObjectKind::Plain);
         for(const auto* level:{L"log",L"info",L"warn",L"error",L"debug"}){
@@ -3840,6 +3950,7 @@ void JavaScriptRuntime::SetTimerScheduler(TimerScheduler scheduler){impl_->core.
 void JavaScriptRuntime::SetGeometryProvider(GeometryProvider provider){impl_->core.geometryProvider=std::move(provider);}
 void JavaScriptRuntime::SetStylePropertyProvider(StylePropertyProvider provider){impl_->core.stylePropertyProvider=std::move(provider);}
 void JavaScriptRuntime::SetResourceLoader(ResourceLoader loader){impl_->core.resourceLoader=std::move(loader);}
+void JavaScriptRuntime::SetNavigationSink(NavigationSink sink){impl_->core.navigationSink=std::move(sink);}
 void JavaScriptRuntime::SetDialogSink(DialogSink sink){impl_->core.dialogSink=std::move(sink);}
 void JavaScriptRuntime::SetFrameMessageSink(FrameMessageSink sink){impl_->core.frameMessageSink=std::move(sink);}
 void JavaScriptRuntime::SetParentMessageSink(ParentMessageSink sink){impl_->core.parentMessageSink=std::move(sink);}

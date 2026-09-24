@@ -328,7 +328,7 @@ void SetDefault(const std::shared_ptr<Node>& node, ComputedStyle& style) {
         (*style.values)[L"text-decoration"] = L"line-through";
     if (node && (node->tag == L"code" || node->tag == L"kbd" ||
                  node->tag == L"samp" || node->tag == L"pre"))
-        (*style.values)[L"font-family"] = L"Consolas";
+        (*style.values)[L"font-family"] = L"monospace";
     if (node && node->tag == L"hr") {
         set(L"height", L"1px"); set(L"margin", L"0.5em 0");
         set(L"border", L"0"); set(L"background", L"#808080");

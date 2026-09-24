@@ -21,6 +21,7 @@ public:
     using FrameScheduler = std::function<void()>;
     using TimerScheduler = std::function<void(unsigned)>;
     using ResourceLoader = std::function<bool(const std::wstring&, std::wstring&)>;
+    using NavigationSink = std::function<void(const std::wstring&)>;
     using DialogSink = std::function<void(const std::wstring&)>;
     using FrameMessageSink = std::function<void(const std::shared_ptr<Node>&, const std::wstring&)>;
     using ParentMessageSink = std::function<void(const std::wstring&)>;
@@ -76,6 +77,7 @@ public:
     void SetGeometryProvider(GeometryProvider provider);
     void SetStylePropertyProvider(StylePropertyProvider provider);
     void SetResourceLoader(ResourceLoader loader);
+    void SetNavigationSink(NavigationSink sink);
     void SetDialogSink(DialogSink sink);
     void SetFrameMessageSink(FrameMessageSink sink);
     void SetParentMessageSink(ParentMessageSink sink);

@@ -126,6 +126,12 @@ public:
     void DiscardDeviceResources();
 
 private:
+    struct FirstLetterRun {
+        size_t offset = 0;
+        size_t length = 0;
+        ComputedStyle style;
+    };
+
     std::unique_ptr<LayoutBox> Build(const std::shared_ptr<Node>& node,
                                      const ComputedStyle* parentStyle,
                                      std::uint64_t parentContext = 1469598103934665603ull,
@@ -168,6 +174,7 @@ private:
     StyleSheet& styleSheet_;
     std::unique_ptr<LayoutBox> root_;
     FastMap<const Node*, LayoutBox*> boxIndex_;
+    FastMap<const Node*, FirstLetterRun> firstLetterRuns_;
     FastMap<std::uint64_t, ComputedStyle> styleCache_;
     FastMap<const Node*, ComputedStyle> transitionTargets_;
     FastMap<const Node*, std::vector<StyleTransition>> transitions_;

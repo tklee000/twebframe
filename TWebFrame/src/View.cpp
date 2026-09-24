@@ -53,6 +53,7 @@ constexpr UINT_PTR kCssTransitionTimer = 0x5748;
 constexpr UINT_PTR kCaretBlinkTimer = 0x5749;
 constexpr UINT_PTR kImageAnimationTimer = 0x574a;
 constexpr UINT kAnimationFrameFallbackMessage = WM_APP + 0x57;
+constexpr UINT kNavigationMessage = WM_APP + 0x59;
 constexpr UINT_PTR kTooltipToolId = 0x5750;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -253,6 +254,7 @@ struct View::Impl {
     std::vector<ChildFrame> childFrames;
     std::wstring lastError;
     std::wstring basePath;
+    std::wstring pendingNavigation;
     ComPtr<ID2D1Factory> d2dFactory;
     ComPtr<IDWriteFactory> writeFactory;
     ComPtr<ID2D1HwndRenderTarget> renderTarget;
@@ -272,6 +274,10 @@ struct View::Impl {
     std::unordered_map<const Node*,std::wstring> accessibilityAutomationIdCache;
     bool accessibilityTreeDirty = true;
     std::shared_ptr<Node> focused;
+    // Script-driven focus follows the most recent input modality. A focus()
+    // call made by a pointer handler must not manufacture :focus-visible,
+    // while the same call made during keyboard navigation must retain it.
+    bool focusVisibleFromKeyboard = true;
     std::shared_ptr<Node> hovered;
     std::vector<std::shared_ptr<Node>> hoverPath;
     std::shared_ptr<Node> scrollbarDragNode;
@@ -633,7 +639,7 @@ struct View::Impl {
         javascript.SetMessageSink([this](const std::wstring& msg){if(messageHandler)messageHandler(msg);});
         javascript.SetMutationSink([this](const JavaScriptRuntime::Mutation& mutation){HandleMutation(mutation);});
         javascript.SetFocusSink([this](const std::shared_ptr<Node>& node){
-            SetFocusedNode(node,true,true);
+            SetFocusedNode(node,focusVisibleFromKeyboard,true);
         });
         javascript.SetActivationSink([this](const std::shared_ptr<Node>& node){
             if(!node)return;if(layoutDirty)Rebuild();float x=0,y=0;if(const auto* box=layout.BoxFor(node)){x=box->content.x+box->content.width/2;y=box->content.y+box->content.height/2;}Activate(node,x,y,true);
@@ -708,6 +714,10 @@ struct View::Impl {
         });
         javascript.SetResourceLoader([this](const std::wstring& resource,std::wstring& content){
             return LoadTextResource(resource,content);
+        });
+        javascript.SetNavigationSink([this](const std::wstring& target){
+            pendingNavigation=target;
+            PostMessageW(hwnd,kNavigationMessage,0,0);
         });
         javascript.SetDialogSink([this](const std::wstring& message){
             MessageBoxW(hwnd,message.c_str(),L"",MB_OK|MB_ICONINFORMATION);
@@ -2478,6 +2488,17 @@ struct View::Impl {
         LRESULT textResult=0;if(textInput.HandleMessage(hwnd,message,wParam,lParam,textResult))return textResult;
         switch(message){
         case kAccessibilityDispatchMessage:return accessibility?accessibility->HandleDispatch(lParam):0;
+        case kNavigationMessage:{
+            auto target=std::move(pendingNavigation);pendingNavigation.clear();
+            if(target.empty())return 0;
+            std::wstring html;
+            if(!LoadTextResource(target,html)){
+                lastError=L"Cannot load HTML resource: "+target;
+                if(loadHandler)loadHandler(false,lastError);
+                return 0;
+            }
+            LoadHtml(html,target,target);return 0;
+        }
         case WM_GETOBJECT:if(lParam==static_cast<LPARAM>(UiaRootObjectId)&&accessibility)return accessibility->ReturnRawProvider(wParam,lParam);break;
         case WM_NCHITTEST:{
             const HWND parent=GetParent(hwnd);if(parent){const LRESULT hit=SendMessageW(parent,WM_NCHITTEST,wParam,lParam);
@@ -2520,6 +2541,7 @@ struct View::Impl {
         }
         case WM_LBUTTONDOWN:{
             HideTooltip();
+            focusVisibleFromKeyboard=false;
             POINT screenPoint{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ClientToScreen(hwnd,&screenPoint);
             const LRESULT resizeHit=ParentResizeHit(screenPoint);if(resizeHit>=HTLEFT&&resizeHit<=HTBOTTOMRIGHT){ReleaseCapture();PostMessageW(GetParent(hwnd),WM_NCLBUTTONDOWN,static_cast<WPARAM>(resizeHit),MAKELPARAM(static_cast<WORD>(screenPoint.x),static_cast<WORD>(screenPoint.y)));return 0;}
             const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();
@@ -2555,7 +2577,7 @@ struct View::Impl {
             }
             return 0;
         }
-        case WM_LBUTTONDBLCLK:{const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);auto pointer=PointerEventAt(wParam,x,y,0,2);javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
+        case WM_LBUTTONDBLCLK:{focusVisibleFromKeyboard=false;const float x=PixelToDip(static_cast<float>(GET_X_LPARAM(lParam))),y=PixelToDip(static_cast<float>(GET_Y_LPARAM(lParam)));if(layoutDirty)Rebuild();auto target=layout.HitTest(x,y);auto pointer=PointerEventAt(wParam,x,y,0,2);javascript.DispatchNodeEvent(target,L"pointerdown",pointer);javascript.DispatchNodeEvent(target,L"dblclick",pointer);return 0;}
         case WM_CONTEXTMENU:{float x=0,y=0;std::shared_ptr<Node> target;if(lParam==static_cast<LPARAM>(-1)){target=focused;if(layoutDirty)Rebuild();if(const auto* box=layout.BoxFor(target)){x=box->content.x+box->content.width/2.0f;y=box->content.y+box->content.height/2.0f;}}else{POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&point);x=PixelToDip(static_cast<float>(point.x));y=PixelToDip(static_cast<float>(point.y));if(layoutDirty)Rebuild();target=layout.HitTest(x,y);}auto context=PointerEventAt(0,x,y,2,1);javascript.DispatchNodeEvent(target,L"contextmenu",context);return 0;}
         case WM_LBUTTONUP:
             if(selectPopupScrollDragging){selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
@@ -2621,7 +2643,7 @@ struct View::Impl {
         case WM_GETDLGCODE:return DLGC_WANTTAB|DLGC_WANTARROWS|
             ((CanEditText()||focused&&focused->tag==L"select")?DLGC_WANTCHARS:0);
         case WM_KEYUP:{JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;javascript.DispatchNodeEvent(focused,L"keyup",key);return 0;}
-        case WM_KEYDOWN:{HideTooltip();JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
+        case WM_KEYDOWN:{HideTooltip();JavaScriptRuntime::EventInit key{};key.key=KeyValue(wParam);key.ctrlKey=(GetKeyState(VK_CONTROL)&0x8000)!=0;key.shiftKey=(GetKeyState(VK_SHIFT)&0x8000)!=0;key.altKey=(GetKeyState(VK_MENU)&0x8000)!=0;key.metaKey=(GetKeyState(VK_LWIN)&0x8000)!=0||(GetKeyState(VK_RWIN)&0x8000)!=0;if(!key.ctrlKey&&!key.altKey&&!key.metaKey)focusVisibleFromKeyboard=true;if(javascript.DispatchNodeEvent(focused,L"keydown",key))return 0;}
         if(textInput.IsComposing())break;
         if(wParam==VK_ESCAPE)if(const auto dialog=document.QuerySelector(L"dialog[open]")){JavaScriptRuntime::EventInit cancel{};cancel.bubbles=false;cancel.cancelable=true;if(!javascript.DispatchNodeEvent(dialog,L"cancel",cancel)&&dialog->attributes.count(L"open")){dialog->RemoveAttribute(L"open");dialog->modal=false;JavaScriptRuntime::EventInit close{};close.bubbles=false;close.cancelable=false;javascript.DispatchNodeEvent(dialog,L"close",close);layoutDirty=true;InvalidateRect(hwnd,nullptr,FALSE);}return 0;}
         if(openSelectPopup){
@@ -2676,7 +2698,7 @@ struct View::Impl {
         case WM_SETCURSOR:{POINT screenPoint{};GetCursorPos(&screenPoint);const LRESULT parentHit=ParentResizeHit(screenPoint);if(const HCURSOR resize=ResizeCursor(parentHit)){SetCursor(resize);return TRUE;}const UINT hit=LOWORD(lParam);
             if(const HCURSOR resize=ResizeCursor(hit)){SetCursor(resize);return TRUE;}
             if(hit==HTCLIENT){SetCursor(CursorAtCurrentPosition());return TRUE;}break;}
-        case WM_DESTROY:HideTooltip();if(tooltip){DestroyWindow(tooltip);tooltip=nullptr;}if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);KillTimer(hwnd,kImageAnimationTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;imageAnimationTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
+        case WM_DESTROY:pendingNavigation.clear();HideTooltip();if(tooltip){DestroyWindow(tooltip);tooltip=nullptr;}if(tooltipFont){DeleteObject(tooltipFont);tooltipFont=nullptr;}KillTimer(hwnd,kAnimationFrameTimer);KillTimer(hwnd,kJavaScriptTimer);KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kCaretBlinkTimer);KillTimer(hwnd,kImageAnimationTimer);caretBlinkTimerActive=false;cssTransitionTimerActive=false;imageAnimationTimerActive=false;childFrames.clear();textInput.Cancel(nullptr);if(accessibility)accessibility->Disconnect();ResetRenderTargets();return 0;default:break;}return DefWindowProcW(hwnd,message,wParam,lParam);}
     bool LoadHtml(const std::wstring& html,const std::wstring& base,const std::wstring& location){
         HideTooltip();lastError.clear();childFrames.clear();basePath=base;rasterImageCache.clear();textInput.Cancel(nullptr);focused.reset();editingNode.reset();ClearEditingBoundary();textSelectionDragging=false;if(GetCapture()==hwnd)ReleaseCapture();StopCaretBlink();hovered.reset();hoverPath.clear();hasPointerPosition=false;pointerX=pointerY=0;scrollbarDragNode.reset();scrollbarDragOffset=0;scrollbarDragHorizontal=false;openSelectPopup.reset();selectPopupHotIndex=-1;selectPopupScrollOffset=0;selectPopupShowAll=false;selectPopupScrollDragging=false;selectPopupScrollDragOffset=0;selectionAnchor=caretPosition=0;textEditDirty=false;liveRegions.clear();liveRegionText.clear();KillTimer(hwnd,kCssTransitionTimer);KillTimer(hwnd,kImageAnimationTimer);cssTransitionTimerActive=false;imageAnimationTimerActive=false;layout.ClearTransitions();javascript.Clear();UpdateJavaScriptViewport();if(!document.Parse(html,&lastError)){if(loadHandler)loadHandler(false,lastError);return false;}
         std::wstring css=document.StyleText();

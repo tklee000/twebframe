@@ -20,6 +20,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -310,6 +311,77 @@ TextRasterSample CaptureTextRaster(LayoutEngine& layout,float scale) {
     if(memory)DeleteDC(memory);
     return sample;
 }
+
+struct BoxRasterSample {
+    bool rendered=false;
+    LONG left=std::numeric_limits<LONG>::max();
+    LONG top=std::numeric_limits<LONG>::max();
+    LONG right=std::numeric_limits<LONG>::min();
+    LONG bottom=std::numeric_limits<LONG>::min();
+    std::uint32_t topEdge=0;
+    std::uint32_t belowTopEdge=0;
+    std::uint32_t aboveBottomEdge=0;
+    std::uint32_t bottomEdge=0;
+};
+
+BoxRasterSample CaptureBoxRaster(LayoutEngine& layout,float scale) {
+    BoxRasterSample sample;
+    const UINT width=static_cast<UINT>(std::lround(80.0f*scale));
+    const UINT height=static_cast<UINT>(std::lround(50.0f*scale));
+    BITMAPINFO bitmapInfo{};bitmapInfo.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth=static_cast<LONG>(width);
+    bitmapInfo.bmiHeader.biHeight=-static_cast<LONG>(height);
+    bitmapInfo.bmiHeader.biPlanes=1;bitmapInfo.bmiHeader.biBitCount=32;
+    bitmapInfo.bmiHeader.biCompression=BI_RGB;
+    void* pixels=nullptr;
+    HDC memory=CreateCompatibleDC(nullptr);
+    HBITMAP bitmap=CreateDIBSection(memory,&bitmapInfo,DIB_RGB_COLORS,&pixels,nullptr,0);
+    HGDIOBJ previous=bitmap?SelectObject(memory,bitmap):nullptr;
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory;
+    Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
+    Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory;
+    const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE));
+    RECT bounds{0,0,static_cast<LONG>(width),static_cast<LONG>(height)};
+    D2D1_FACTORY_OPTIONS factoryOptions{};
+    const bool ready=memory&&bitmap&&
+        SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            __uuidof(ID2D1Factory),&factoryOptions,
+            reinterpret_cast<void**>(d2dFactory.ReleaseAndGetAddressOf())))&&
+        SUCCEEDED(d2dFactory->CreateDCRenderTarget(&properties,&target))&&
+        SUCCEEDED(target->BindDC(memory,&bounds))&&
+        SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(writeFactory.ReleaseAndGetAddressOf())));
+    if(ready){
+        layout.DiscardDeviceResources();layout.Layout(80,50,scale);
+        target->SetDpi(USER_DEFAULT_SCREEN_DPI*scale,USER_DEFAULT_SCREEN_DPI*scale);
+        target->BeginDraw();target->Clear(D2D1::ColorF(D2D1::ColorF::White));
+        layout.Paint(target.Get(),writeFactory.Get());
+        sample.rendered=SUCCEEDED(target->EndDraw());GdiFlush();
+        const auto* values=static_cast<const std::uint32_t*>(pixels);
+        for(LONG y=0;y<static_cast<LONG>(height);++y)
+            for(LONG x=0;x<static_cast<LONG>(width);++x)
+                if((values[static_cast<size_t>(y)*width+x]&0x00ffffffu)!=0x00ffffffu){
+                    sample.left=std::min(sample.left,x);sample.top=std::min(sample.top,y);
+                    sample.right=std::max(sample.right,x);sample.bottom=std::max(sample.bottom,y);
+                }
+        if(sample.left<=sample.right&&sample.top<=sample.bottom){
+            const LONG centerX=(sample.left+sample.right)/2;
+            const auto pixel=[&](LONG y){
+                return values[static_cast<size_t>(y)*width+centerX]&0x00ffffffu;
+            };
+            sample.topEdge=pixel(sample.top);
+            sample.belowTopEdge=pixel(std::min(sample.top+1,sample.bottom));
+            sample.aboveBottomEdge=pixel(std::max(sample.top,sample.bottom-1));
+            sample.bottomEdge=pixel(sample.bottom);
+        }
+    }
+    layout.DiscardDeviceResources();
+    if(previous)SelectObject(memory,previous);
+    if(bitmap)DeleteObject(bitmap);
+    if(memory)DeleteDC(memory);
+    return sample;
+}
 }
 
 int wmain(int argc,wchar_t** argv) {
@@ -506,6 +578,19 @@ int wmain(int argc,wchar_t** argv) {
         L"return innerWidth+'|'+innerHeight+'|'+window.innerWidth+'|'+window.innerHeight;",
         &semanticsResult,&error)&&semanticsResult==L"1280|720|1280|720",
         L"viewport dimensions are exposed through browser window globals");
+    semanticsJs.SetLocation(L"https://app.examples/index.html?mode=dark&lang=ko-KR#settings");
+    std::wstring requestedNavigation;
+    semanticsJs.SetNavigationSink([&](const std::wstring& target){requestedNavigation=target;});
+    Check(semanticsJs.Load(L"",&error)&&semanticsJs.Execute(
+        L"const languageUrl=new URL(location.href);"
+        L"languageUrl.searchParams.set('lang','ja-JP');"
+        L"location.replace(languageUrl.href);"
+        L"return languageUrl.href+'|'+languageUrl.searchParams.get('lang')+'|'"
+        L"+new URLSearchParams('?label=hello+world').get('label');",
+        &semanticsResult,&error)&&
+        semanticsResult==L"https://app.examples/index.html?mode=dark&lang=ja-JP#settings|ja-JP|hello world"&&
+        requestedNavigation==L"https://app.examples/index.html?mode=dark&lang=ja-JP#settings",
+        L"URL search parameters update href and location.replace requests navigation");
     Check(semanticsJs.Load(
         L"let exceptionLog='';"
         L"function throwAcrossFrame(){throw {message:'boom'};}"
@@ -868,6 +953,27 @@ int wmain(int argc,wchar_t** argv) {
           !FindPseudo(occupiedGenerated,L"before"),
           L":empty generated content resolves attr() at the block's top content edge");
 
+    Document firstLetterDoc;
+    Check(firstLetterDoc.Parse(
+        L"<style>button{display:inline-flex;font-size:0}button::first-letter{font-size:14px}</style>"
+        L"<button id='compact'>\x21bb <span>Fetch</span></button>",&error),
+        L"first-letter fixture parses");
+    StyleSheet firstLetterCss;
+    Check(firstLetterCss.Parse(firstLetterDoc.StyleText(),&error),
+          L"first-letter CSS parses");
+    LayoutEngine firstLetterLayout(firstLetterDoc,firstLetterCss);
+    firstLetterLayout.Layout(320,120);
+    const auto* compactButton=FindLayout(firstLetterLayout.Root(),L"compact");
+    const LayoutBox* visibleFirstLetter=nullptr;
+    if(compactButton)for(const auto& child:compactButton->children)
+        if(child->node&&child->node->type==NodeType::Text&&
+           child->node->text==L"\x21bb")visibleFirstLetter=child.get();
+    Check(visibleFirstLetter&&
+          std::lround(StyleSheet::Length(visibleFirstLetter->style.Get(L"font-size"),
+                                        16,320,0))==14&&
+          visibleFirstLetter->rect.width>1,
+          L"::first-letter styles the first rendered character as a reusable text run");
+
     Document percentageMinHeightDoc;
     Check(percentageMinHeightDoc.Parse(L"<body><main id='fill'></main></body>",&error),
           L"percentage min-height fixture parses");
@@ -940,26 +1046,79 @@ int wmain(int argc,wchar_t** argv) {
     };
     Check(isGrayscaleText(textRaster100)&&isGrayscaleText(textRaster150),
           L"all DOM text uses grayscale coverage without color fringes at 100 and 150 percent DPI");
+    Document boxRasterDoc;
+    Check(boxRasterDoc.Parse(
+          L"<style>html,body{margin:0}.probe{position:absolute;box-sizing:border-box;left:10.4px;top:10.4px;width:20.4px;height:12.4px;border:1px solid #445566;background:#112233}</style><div class='probe'></div>",
+          &error),L"physical-pixel box fixture parses");
+    StyleSheet boxRasterCss;Check(boxRasterCss.Parse(boxRasterDoc.StyleText(),&error),
+          L"physical-pixel box CSS parses");
+    LayoutEngine boxRasterLayout(boxRasterDoc,boxRasterCss);
+    const auto boxRaster100=CaptureBoxRaster(boxRasterLayout,1.0f);
+    const auto boxRaster150=CaptureBoxRaster(boxRasterLayout,1.5f);
+    const auto hasSinglePixelBorder=[](const BoxRasterSample& sample,LONG left,LONG top,
+                                      LONG right,LONG bottom){
+        constexpr std::uint32_t border=0x00445566u;
+        constexpr std::uint32_t fill=0x00112233u;
+        return sample.rendered&&sample.left==left&&sample.top==top&&
+            sample.right==right&&sample.bottom==bottom&&
+            sample.topEdge==border&&sample.belowTopEdge==fill&&
+            sample.aboveBottomEdge==fill&&sample.bottomEdge==border;
+    };
+    Check(hasSinglePixelBorder(boxRaster100,10,10,30,22)&&
+          hasSinglePixelBorder(boxRaster150,16,16,45,33),
+          L"box backgrounds and borders snap to physical pixel edges at 100 and 150 percent DPI");
+
+    const auto directWriteLineHeight=[](const wchar_t* family,float size){
+        Microsoft::WRL::ComPtr<IDWriteFactory> factory;
+        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        if(FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(factory.ReleaseAndGetAddressOf())))||
+           FAILED(factory->CreateTextFormat(family,nullptr,DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,size,L"ko-kr",&format))||
+           FAILED(factory->CreateTextLayout(L"Hg",2,format.Get(),100000.0f,100000.0f,&layout)))
+            return 0.0f;
+        DWRITE_LINE_METRICS metrics{};UINT32 count=0;
+        return SUCCEEDED(layout->GetLineMetrics(&metrics,1,&count))&&count?metrics.height:0.0f;
+    };
     Document normalLineDoc;
     Check(normalLineDoc.Parse(
-          L"<style>body{margin:0}#normal-line{font-size:13px}</style><div id='normal-line'>Text</div>",
+          L"<style>body{margin:0}#normal-line{font-family:'Segoe UI';font-size:13px}</style><div id='normal-line'>Text</div>",
           &error),L"normal line-height fixture parses");
     StyleSheet normalLineCss;Check(normalLineCss.Parse(normalLineDoc.StyleText(),&error),
           L"normal line-height CSS parses");
-    LayoutEngine normalLineLayout(normalLineDoc,normalLineCss);normalLineLayout.Layout(200,80);
+    LayoutEngine normalLineLayout(normalLineDoc,normalLineCss);normalLineLayout.Layout(200,80,1.0f);
+    const auto expectedNormalLineHeight=directWriteLineHeight(L"Segoe UI",13.0f);
     const auto* normalLineBox=normalLineLayout.BoxFor(normalLineDoc.GetElementById(L"normal-line"));
-    Check(normalLineBox&&std::abs(normalLineBox->rect.height-(13.0f*4.0f/3.0f))<0.001f,
-          L"normal line-height follows the browser four-thirds font metric");
+    const float normalLineHeight100=normalLineBox?normalLineBox->rect.height:0;
+    normalLineLayout.Relayout(200,80,1.5f);
+    normalLineBox=normalLineLayout.BoxFor(normalLineDoc.GetElementById(L"normal-line"));
+    const float normalLineHeight150=normalLineBox?normalLineBox->rect.height:0;
+    Check(expectedNormalLineHeight>0&&
+          std::abs(normalLineHeight100-expectedNormalLineHeight)<0.001f&&
+          std::abs(normalLineHeight150-expectedNormalLineHeight)<0.001f,
+          L"normal line-height follows font metrics without changing CSS geometry across DPI scales");
     Document inlinePaddingDoc;
     Check(inlinePaddingDoc.Parse(
-          L"<style>body{margin:0}.header{display:flex;height:32px;align-items:center}.summary{font-size:11px}.summary code{padding:4px 7px}</style><div class='header'><div id='inline-summary' class='summary'><span>Path</span><code>branch</code></div></div>",
+          L"<style>body{margin:0}.header{display:flex;height:32px;align-items:center}.summary{font-family:'Segoe UI';font-size:11px}.summary code{padding:4px 7px}</style><div id='inline-header' class='header'><div id='inline-summary' class='summary'><span id='inline-path'>Path</span><code id='inline-code'>branch</code></div></div>",
           &error),L"inline padding line-box fixture parses");
     StyleSheet inlinePaddingCss;Check(inlinePaddingCss.Parse(inlinePaddingDoc.StyleText(),&error),
           L"inline padding line-box CSS parses");
     LayoutEngine inlinePaddingLayout(inlinePaddingDoc,inlinePaddingCss);inlinePaddingLayout.Layout(240,80);
     const auto* inlineSummary=inlinePaddingLayout.BoxFor(inlinePaddingDoc.GetElementById(L"inline-summary"));
-    Check(inlineSummary&&std::abs(inlineSummary->rect.height-(11.0f*4.0f/3.0f))<0.001f,
+    const auto* inlineCode=inlinePaddingLayout.BoxFor(
+        inlinePaddingDoc.GetElementById(L"inline-code"));
+    Check(inlineSummary&&
+          std::abs(inlineSummary->rect.height-directWriteLineHeight(L"Segoe UI",11.0f))<0.001f,
           L"vertical padding on a non-atomic inline box does not enlarge its containing line");
+    Check(inlineCode&&std::lround(inlineCode->rect.y)==8&&
+          std::lround(inlineCode->rect.y+inlineCode->rect.height)==27,
+          L"a padded generic-monospace inline box aligns its content baseline at 100 percent DPI");
+    inlinePaddingLayout.Relayout(240,80,1.5f);
+    inlineCode=inlinePaddingLayout.BoxFor(inlinePaddingDoc.GetElementById(L"inline-code"));
+    Check(inlineCode&&std::lround(inlineCode->rect.y*1.5f)==11&&
+          std::lround((inlineCode->rect.y+inlineCode->rect.height)*1.5f)==39,
+          L"a padded generic-monospace inline box keeps browser pixel bounds at 150 percent DPI");
 
     Document rootFontDoc;
     Check(rootFontDoc.Parse(
@@ -1080,7 +1239,7 @@ int wmain(int argc,wchar_t** argv) {
     const auto codeStyle=basicHtmlCss.Compute(basicHtmlDoc.GetElementById(L"code"));
     Check(paragraphStyle.Is(L"display",L"block")&&paragraphStyle.Get(L"margin")==L"1em 0"&&
           linkStyle.Is(L"display",L"inline")&&boldStyle.Get(L"font-weight")==L"700"&&
-          emphasisStyle.Is(L"font-style",L"italic")&&codeStyle.Get(L"font-family")==L"Consolas",
+          emphasisStyle.Is(L"font-style",L"italic")&&codeStyle.Get(L"font-family")==L"monospace",
           L"paragraph and common phrasing elements receive browser-like default styles");
 
     Document breakLayoutDoc;
@@ -1576,6 +1735,7 @@ int wmain(int argc,wchar_t** argv) {
         if(view){
             Check(view->NavigateToString(
                 L"<style>*{box-sizing:border-box}body{margin:0}button,input,select,[role=menuitem]{display:block;width:180px;height:28px}.menu-closed{display:none}</style>"
+                L"<button id='pointer-trigger'>Pointer trigger</button><button id='pointer-target'>Pointer target</button><button id='keyboard-target'>Keyboard target</button>"
                 L"<button id='plain'>Plain</button><button id='tab-two' tabindex='2'>Two</button>"
                 L"<button id='tab-one' tabindex='1' data-automation-id='primary-action' aria-label='Primary action' aria-expanded='false'>One</button>"
                 L"<input id='value-field' aria-label='Value field' value='start'><input id='toggle-field' type='checkbox' aria-label='Toggle field'>"
@@ -1584,7 +1744,7 @@ int wmain(int argc,wchar_t** argv) {
                 L"<div><button id='menu-trigger' aria-controls='command-menu'>Commands</button><div id='command-menu' class='menu-closed' role='menu' aria-label='Commands'><button role='menuitem' id='menu-one'>Menu one</button><button role='menuitem' id='menu-two'>Menu two</button></div></div>"
                 L"<main id='content-region'><section><span>Section text</span></section></main>"
                 L"<div id='live' role='status' aria-live='polite'>Ready</div>"
-                L"<script>let accessibilityLog=[];document.addEventListener('focusin',(e)=>accessibilityLog.push('in:'+e.target.id));document.addEventListener('focusout',(e)=>accessibilityLog.push('out:'+e.target.id));document.addEventListener('click',(e)=>accessibilityLog.push('click:'+e.target.id));document.getElementById('menu-trigger').addEventListener('click',()=>document.getElementById('command-menu').classList.remove('menu-closed'));</script>"),
+                L"<script>let accessibilityLog=[];document.addEventListener('focusin',(e)=>accessibilityLog.push('in:'+e.target.id));document.addEventListener('focusout',(e)=>accessibilityLog.push('out:'+e.target.id));document.addEventListener('click',(e)=>accessibilityLog.push('click:'+e.target.id));document.getElementById('menu-trigger').addEventListener('click',()=>document.getElementById('command-menu').classList.remove('menu-closed'));document.getElementById('pointer-trigger').addEventListener('click',()=>document.getElementById('pointer-target').focus());document.getElementById('pointer-target').addEventListener('keydown',(event)=>{if(event.key==='ArrowDown')document.getElementById('keyboard-target').focus();});</script>"),
                 view->LastError().c_str());
             std::wstring result,scriptError;
             SendMessageW(view->Window(),WM_KEYDOWN,VK_TAB,0);
@@ -1612,6 +1772,16 @@ int wmain(int argc,wchar_t** argv) {
             SendMessageW(view->Window(),WM_KEYDOWN,VK_SPACE,0);
             Check(view->ExecuteScript(L"return accessibilityLog[accessibilityLog.length-1];",&result,&scriptError)&&result==L"click:menu-two",
                   L"Space activates a focused menuitem");
+            SendMessageW(view->Window(),WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(10,10));
+            Check(view->ExecuteScript(
+                  L"return document.activeElement.id+'|'+(document.querySelector(':focus-visible')?.id||'none');",
+                  &result,&scriptError)&&result==L"pointer-target|none",
+                  L"programmatic focus moved by a pointer handler does not match focus-visible");
+            SendMessageW(view->Window(),WM_KEYDOWN,VK_DOWN,0);
+            Check(view->ExecuteScript(
+                  L"return document.activeElement.id+'|'+document.querySelector(':focus-visible').id;",
+                  &result,&scriptError)&&result==L"keyboard-target|keyboard-target",
+                  L"programmatic focus moved by a keyboard handler remains focus-visible");
 
             const auto accessibilityJson=view->DumpAccessibilityJson();
             Check(accessibilityJson.find(L"\"automationId\":\"primary-action\"")!=std::wstring::npos&&
@@ -2582,6 +2752,25 @@ int wmain(int argc,wchar_t** argv) {
                   L"iframe documents exchange structured messages with parent and dispatch load");
             Check(FindWindowExW(inputWindow,nullptr,L"TWebFrame.View.1",nullptr)!=nullptr,
                   L"iframe has a separately rendered TWebFrame child window");
+            inputView->SetResourceLoader([](const std::wstring& path,std::wstring& source){
+                if(path!=L"https://app.examples/index.html")return false;
+                source=L"<main id='language-view'></main><script>document.getElementById('language-view').textContent=new URLSearchParams(location.search).get('lang');</script>";
+                return true;
+            });
+            Check(inputView->NavigateToString(L"<main id='language-view'>ko-KR</main>",
+                                               L"https://app.examples/index.html?lang=ko-KR"),
+                  L"URL navigation fixture loads in a real view");
+            Check(inputView->ExecuteScript(
+                L"const next=new URL(location.href);next.searchParams.set('lang','ja-JP');location.replace(next.href);",
+                nullptr,&selectionError),selectionError.c_str());
+            MSG navigationMessage{};
+            while(PeekMessageW(&navigationMessage,nullptr,0,0,PM_REMOVE)){
+                TranslateMessage(&navigationMessage);DispatchMessageW(&navigationMessage);
+            }
+            Check(inputView->ExecuteScript(
+                L"return document.getElementById('language-view').textContent+'|'+location.search;",
+                &selectionResult,&selectionError)&&selectionResult==L"ja-JP|?lang=ja-JP",
+                L"location.replace reloads the current resource with updated URL search parameters");
         }
         DestroyWindow(inputHost);
     }
