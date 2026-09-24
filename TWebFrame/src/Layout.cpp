@@ -2632,6 +2632,30 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
         if(!eligible.empty()&&deficit>0){const float share=deficit/eligible.size();for(const auto index:eligible)tracks[index].base+=share;}
     }
 
+    // An auto track has an automatic minimum and a max-content maximum. Keep
+    // those two sizes separate: the minimum lets a definite grid contract,
+    // while the preferred size lets a short metadata value stay unwrapped
+    // before an adjacent fr track receives the remaining space.
+    std::vector<float> preferredAutoSizes(tracks.size());
+    for(size_t index=0;index<tracks.size();++index)preferredAutoSizes[index]=tracks[index].base;
+    if(columns&&definiteAvailable)for(const auto& item:items){
+        const auto start=item.column,span=item.columnSpan;
+        if(start>=tracks.size())continue;
+        const auto itemWidth=Trim(item.box->style.Get(L"width"));
+        if(itemWidth.find(L'%')!=std::wstring::npos)continue;
+        std::vector<size_t> eligible;
+        float occupied=gap*std::max(0,static_cast<int>(span)-1);
+        for(size_t offset=0;offset<span&&start+offset<tracks.size();++offset){
+            const size_t index=start+offset;
+            occupied+=preferredAutoSizes[index];
+            if(tracks[index].stretch&&tracks[index].fraction<=0)eligible.push_back(index);
+        }
+        float deficit=std::max(0.0f,NaturalWidth(*item.box)-occupied);
+        if(eligible.empty()||deficit<=0.01f)continue;
+        const float share=deficit/static_cast<float>(eligible.size());
+        for(const auto index:eligible)preferredAutoSizes[index]+=share;
+    }
+
     const float gaps=gap*std::max(0,static_cast<int>(tracks.size())-1);
     auto used=[&](){float total=gaps;for(const auto& track:tracks)total+=track.base;return total;};
     float overflow=std::max(0.0f,used()-available);
@@ -2657,6 +2681,23 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
         const float share=free/capped.size();bool removed=false;
         for(auto it=capped.begin();it!=capped.end();){auto& track=tracks[*it];const float growth=std::min(share,track.limit-track.base);track.base+=growth;free-=growth;if(track.limit-track.base<=0.01f){it=capped.erase(it);removed=true;}else ++it;}
         if(!removed)break;
+    }
+    std::vector<size_t> preferredAutoTracks;
+    for(size_t index=0;index<tracks.size();++index)
+        if(preferredAutoSizes[index]>tracks[index].base+0.01f)
+            preferredAutoTracks.push_back(index);
+    while(free>0.01f&&!preferredAutoTracks.empty()){
+        const float share=free/static_cast<float>(preferredAutoTracks.size());
+        bool reachedPreferredSize=false;
+        for(auto iterator=preferredAutoTracks.begin();iterator!=preferredAutoTracks.end();){
+            auto& track=tracks[*iterator];
+            const float growth=std::min(share,preferredAutoSizes[*iterator]-track.base);
+            track.base+=growth;free-=growth;
+            if(preferredAutoSizes[*iterator]-track.base<=0.01f){
+                iterator=preferredAutoTracks.erase(iterator);reachedPreferredSize=true;
+            }else ++iterator;
+        }
+        if(!reachedPreferredSize)break;
     }
     float totalFraction=0;for(const auto& track:tracks)totalFraction+=track.fraction;
     if(free>0.01f&&totalFraction>0){

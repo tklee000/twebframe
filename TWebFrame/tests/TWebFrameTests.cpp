@@ -1597,6 +1597,26 @@ int wmain(int argc,wchar_t** argv) {
           gridButtonTitle->rect.y+gridButtonTitle->rect.height<=gridButtonDetail->rect.y+0.01f,
           L"grid buttons size from blockified inline items and preserve their vertical content flow");
 
+    Document gridAutoContentDoc;
+    Check(gridAutoContentDoc.Parse(
+          L"<style>*{box-sizing:border-box;margin:0;padding:0}.meta{display:grid;width:520px;grid-template-columns:1fr auto;column-gap:12px;font-family:'Segoe UI';font-size:11px;line-height:14px}.meta small{color:#777}</style>"
+          L"<div class='meta'><span><small>Author</small><br>DESKTOP-INVEG4R\\tklee &lt;tklee@example.com&gt;</span><span id='auto-content-time'><small>Time</small><br>8\uC6D4 7\uC77C \uC624\uD6C4 12:17</span></div>",&error),
+          L"grid auto max-content fixture parses");
+    StyleSheet gridAutoContentCss;
+    Check(gridAutoContentCss.Parse(gridAutoContentDoc.StyleText(),&error),
+          L"grid auto max-content CSS parses");
+    LayoutEngine gridAutoContentLayout(gridAutoContentDoc,gridAutoContentCss);
+    gridAutoContentLayout.Layout(560,120,1.0f);
+    const auto* gridAutoTime100=FindLayout(gridAutoContentLayout.Root(),L"auto-content-time");
+    const float gridAutoWidth100=gridAutoTime100?gridAutoTime100->rect.width:0;
+    const float gridAutoHeight100=gridAutoTime100?gridAutoTime100->rect.height:0;
+    gridAutoContentLayout.Layout(560,120,1.5f);
+    const auto* gridAutoTime150=FindLayout(gridAutoContentLayout.Root(),L"auto-content-time");
+    Check(gridAutoTime100&&gridAutoTime150&&gridAutoWidth100>=80&&gridAutoHeight100<=30&&
+          gridAutoTime150->rect.width>=80&&gridAutoTime150->rect.height<=30&&
+          std::abs(gridAutoTime150->rect.width-gridAutoWidth100)<0.1f,
+          L"an auto grid track next to an fr track keeps fitting inline metadata on one line at 100 and 150 percent DPI");
+
     Document intrinsicDoc;
     Check(intrinsicDoc.Parse(L"<style>*{box-sizing:border-box;margin:0;padding:0}.card{width:300px;display:grid;padding:10px;border:1px solid black}.field{display:grid;gap:5px}.label{height:16px}.control{position:relative}.editor{display:block;width:100%;height:32px}.floating{position:absolute;right:0;top:50%;height:12px}.hint{height:12px}</style><div id='intrinsic-card' class='card'><div class='field'><span class='label'>Label</span><div class='control'><input class='editor'><span class='floating'>v</span></div><span class='hint'>Hint</span></div></div>",&error),
           L"intrinsic positioned-child fixture parses");
