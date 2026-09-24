@@ -331,8 +331,26 @@ bool StackingContextAllowsPoint(const LayoutBox& context,const LayoutBox& scope,
     return true;
 }
 
-bool IsDeferredContext(const LayoutBox& box,const std::vector<LayoutBox*>* contexts) {
-    return contexts&&std::find(contexts->begin(),contexts->end(),&box)!=contexts->end();
+bool IsDeferredContext(const LayoutBox& box,const LayoutBox* scope) {
+    return scope&&box.deferredStackingScope==scope;
+}
+
+bool Intersects(const LayoutRect& left,const LayoutRect& right) {
+    return left.x<right.x+right.width&&left.x+left.width>right.x&&
+           left.y<right.y+right.height&&left.y+left.height>right.y;
+}
+
+void UpdateSubtreeBounds(LayoutBox& box) {
+    box.subtreeBounds=box.rect;
+    for(const auto& child:box.children){
+        if(!child->visible)continue;
+        const auto& bounds=child->subtreeBounds;
+        const float left=std::min(box.subtreeBounds.x,bounds.x);
+        const float top=std::min(box.subtreeBounds.y,bounds.y);
+        const float right=std::max(box.subtreeBounds.x+box.subtreeBounds.width,bounds.x+bounds.width);
+        const float bottom=std::max(box.subtreeBounds.y+box.subtreeBounds.height,bounds.y+bounds.height);
+        box.subtreeBounds={left,top,right-left,bottom-top};
+    }
 }
 
 template<class BoxPointer>
@@ -3274,7 +3292,11 @@ void PaintOutline(ID2D1RenderTarget* target,const ComputedStyle& style,
 
 std::wstring EscapeJson(const std::wstring& value){std::wstring o;for(wchar_t c:value){if(c==L'\\'||c==L'"')o+=L'\\';if(c==L'\n')o+=L"\\n";else o+=c;}return o;}
 
-void TranslateBox(LayoutBox& box,float dx,float dy){box.rect.x+=dx;box.rect.y+=dy;box.content.x+=dx;box.content.y+=dy;for(auto& child:box.children)TranslateBox(*child,dx,dy);}
+void TranslateBoxGeometry(LayoutBox& box,float dx,float dy){
+    box.rect.x+=dx;box.rect.y+=dy;box.content.x+=dx;box.content.y+=dy;
+    box.subtreeBounds.x+=dx;box.subtreeBounds.y+=dy;
+}
+void TranslateBox(LayoutBox& box,float dx,float dy){TranslateBoxGeometry(box,dx,dy);for(auto& child:box.children)TranslateBox(*child,dx,dy);}
 void ApplyTransform(LayoutBox& box,float viewportWidth,float viewportHeight){
     const auto transform=ToLower(Trim(box.style.Get(L"transform")));if(transform.empty()||transform==L"none")return;
     auto argument=[&](const std::wstring& function){const auto start=transform.find(function+L"(");if(start==std::wstring::npos)return std::wstring{};const auto first=start+function.size()+1,close=transform.find(L')',first);return close==std::wstring::npos?std::wstring{}:Trim(transform.substr(first,close-first));};
@@ -3313,12 +3335,22 @@ void ApplySticky(LayoutBox& box,float clipTop,float viewportHeight){
     if(box.style.Is(L"position",L"sticky")){if(!box.stickyFlowYValid){box.stickyFlowY=box.rect.y;box.stickyFlowYValid=true;}const float top=StyleSheet::Length(box.style.Get(L"top",L"0"),viewportHeight,viewportHeight,0),desired=std::max(box.stickyFlowY,clipTop+top);if(std::abs(box.rect.y-desired)>0.001f)TranslateBox(box,0,desired-box.rect.y);}
     for(auto& child:box.children)if(child->containsSticky)ApplySticky(*child,clipTop,viewportHeight);
     if(HasTableDisplay(box,L"table-row")||IsTableRowGroup(box)){bool found=false;float left=0,top=0,right=0,bottom=0;for(const auto& child:box.children)if(child->visible&&child->rect.width>0&&child->rect.height>0){if(!found){left=child->rect.x;top=child->rect.y;right=child->rect.x+child->rect.width;bottom=child->rect.y+child->rect.height;found=true;}else{left=std::min(left,child->rect.x);top=std::min(top,child->rect.y);right=std::max(right,child->rect.x+child->rect.width);bottom=std::max(bottom,child->rect.y+child->rect.height);}}if(found){box.rect={left,top,right-left,bottom-top};box.content=box.rect;}}
+    UpdateSubtreeBounds(box);
 }
 
 void ApplyScrollOffset(LayoutBox& box,float oldScrollLeft,float oldScrollTop,float viewportHeight){
     const float dx=oldScrollLeft-box.node->scrollLeft,dy=oldScrollTop-box.node->scrollTop;
-    if(std::abs(dx)>=0.001f||std::abs(dy)>=0.001f)
-        for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,dx,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
+    if(std::abs(dx)>=0.001f||std::abs(dy)>=0.001f){
+        if(box.scrollTraversalCached){
+            for(auto* child:box.scrollTranslationBoxes)TranslateBoxGeometry(*child,dx,dy);
+            for(auto* child:box.scrollStickyChildren){
+                ShiftStickyFlow(*child,dy);ApplySticky(*child,box.content.y,viewportHeight);
+            }
+        }else{
+            for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){ShiftStickyFlow(*child,dy);TranslateBox(*child,dx,dy);if(child->containsSticky)ApplySticky(*child,box.content.y,viewportHeight);}
+        }
+        for(auto* ancestor=&box;ancestor;ancestor=ancestor->parent)UpdateSubtreeBounds(*ancestor);
+    }
     box.appliedScrollLeft=box.node->scrollLeft;
     box.appliedScrollTop=box.node->scrollTop;
 }
@@ -4431,6 +4463,21 @@ void LayoutEngine::LayoutBoxTree(LayoutBox& box,const LayoutRect& available,bool
 
 void LayoutEngine::UpdateTraversalMetadata(LayoutBox& box){
     for(auto& child:box.children)UpdateTraversalMetadata(*child);
+    UpdateSubtreeBounds(box);
+    box.deferredStackingScope=nullptr;
+    box.scrollTranslationBoxes.clear();
+    box.scrollStickyChildren.clear();
+    box.scrollTraversalCached=box.scrollWidth>box.content.width||box.scrollHeight>box.content.height;
+    if(box.scrollTraversalCached){
+        const auto collect=[&](const auto& self,LayoutBox& child)->void{
+            box.scrollTranslationBoxes.push_back(&child);
+            for(auto& descendant:child.children)self(self,*descendant);
+        };
+        for(auto& child:box.children)if(!child->style.Is(L"position",L"fixed")){
+            collect(collect,*child);
+            if(child->containsSticky)box.scrollStickyChildren.push_back(child.get());
+        }
+    }
 
     box.paintChildren.clear();
     box.paintChildren.reserve(box.children.size());
@@ -4476,7 +4523,10 @@ void LayoutEngine::UpdateStackingContexts(LayoutBox& scope){
                 // CSS paints zero/auto positioned stacking contexts after
                 // ordinary in-flow descendants. Sticky boxes always establish
                 // a stacking context, even without an explicit z-index.
-                if(ZIndex(*child)>=0)scope.nonNegativeStackingContexts.push_back(child.get());
+                if(ZIndex(*child)>=0){
+                    scope.nonNegativeStackingContexts.push_back(child.get());
+                    child->deferredStackingScope=&scope;
+                }
                 UpdateStackingContexts(*child);
             }else collect(*child);
         }
@@ -4515,18 +4565,27 @@ void LayoutEngine::FinalizeScroll(LayoutBox& box){
     }
     struct ScrollExtent { float right=0,bottom=0; };
     std::function<ScrollExtent(const LayoutBox&)> measure=[&](const LayoutBox& current){
-        if(!current.visible||current.style.Is(L"position",L"fixed"))return ScrollExtent{current.content.x,current.content.y};
+        if(!current.visible||current.style.Is(L"position",L"fixed"))
+            return ScrollExtent{-std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()};
+        const auto overflow=current.style.Get(L"overflow",L"visible");
+        const auto clips=[](const std::wstring& value){return value==L"hidden"||value==L"clip"||value==L"auto"||value==L"scroll";};
+        const bool clipsX=clips(current.style.Get(L"overflow-x",overflow));
+        const bool clipsY=clips(current.style.Get(L"overflow-y",overflow));
+        // A nested overflow box contributes its own border box, not the
+        // translated contents behind its clip. Otherwise scrolling the inner
+        // box changes the outer scroll range on the next layout rebuild.
+        if(clipsX&&clipsY)return ScrollExtent{current.rect.x+current.rect.width,current.rect.y+current.rect.height};
         ScrollExtent descendants{current.content.x,current.content.y};
         for(const auto& child:current.children){const auto extent=measure(*child);descendants.right=std::max(descendants.right,extent.right);descendants.bottom=std::max(descendants.bottom,extent.bottom);}
-        ScrollExtent extent{std::max(current.rect.x+current.rect.width,descendants.right),
-                            std::max(current.rect.y+current.rect.height,descendants.bottom)};
+        ScrollExtent extent{clipsX?current.rect.x+current.rect.width:std::max(current.rect.x+current.rect.width,descendants.right),
+                            clipsY?current.rect.y+current.rect.height:std::max(current.rect.y+current.rect.height,descendants.bottom)};
         const float contentRight=current.content.x+current.content.width;
         const float contentBottom=current.content.y+current.content.height;
-        if(descendants.right>contentRight+0.01f){
+        if(!clipsX&&descendants.right>contentRight+0.01f){
             const float endInset=std::max(0.0f,current.rect.x+current.rect.width-contentRight);
             extent.right=std::max(extent.right,descendants.right+endInset);
         }
-        if(descendants.bottom>contentBottom+0.01f){
+        if(!clipsY&&descendants.bottom>contentBottom+0.01f){
             // End padding follows overflowing content in the scrollable
             // overflow area. A forced grid/flex item may be shorter than its
             // contents, but its authored padding must not disappear.
@@ -5245,19 +5304,21 @@ void LayoutEngine::PaintDialogBackdrop(ID2D1RenderTarget* target,const LayoutBox
 void LayoutEngine::PaintStackingContext(ID2D1RenderTarget* target,IDWriteFactory* factory,
                                         LayoutBox& box,const LayoutRect& clipBounds){
     if(clipBounds.width<=0||clipBounds.height<=0)return;
+    if(!Intersects(box.subtreeBounds,clipBounds))return;
     if(box.node&&box.node->modal&& &box!=paintingTopLayer_)return;
     target->PushAxisAlignedClip(PixelAlignedRect(clipBounds,deviceScale_),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    PaintBox(target,factory,box,clipBounds,&box.nonNegativeStackingContexts);
+    PaintBox(target,factory,box,clipBounds,&box);
     for(auto* context:box.nonNegativeStackingContexts)
-        PaintStackingContext(target,factory,*context,StackingContextClip(*context,box,clipBounds));
+        if(Intersects(context->subtreeBounds,clipBounds))
+            PaintStackingContext(target,factory,*context,StackingContextClip(*context,box,clipBounds));
     target->PopAxisAlignedClip();
 }
 
 void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,LayoutBox& box,
                             const LayoutRect& clipBounds,
-                            const std::vector<LayoutBox*>* deferredContexts){
+                            const LayoutBox* deferredScope){
     if(box.node&&box.node->modal&& &box!=paintingTopLayer_)return;
-    if(IsDeferredContext(box,deferredContexts))return;
+    if(IsDeferredContext(box,deferredScope))return;
     const bool intersects=box.rect.x<clipBounds.x+clipBounds.width&&box.rect.x+box.rect.width>clipBounds.x&&box.rect.y<clipBounds.y+clipBounds.height&&box.rect.y+box.rect.height>clipBounds.y;
     if(!box.visible||box.rect.width<=0||box.rect.height<=0||!intersects)return;
     float opacity=1.0f;TryParseFloat(box.style.Get(L"opacity",L"1"),opacity);
@@ -5486,9 +5547,9 @@ void LayoutEngine::PaintBox(ID2D1RenderTarget* target,IDWriteFactory* factory,La
         }
     }
     const auto paintChild=[&](LayoutBox& child){
-        if(IsDeferredContext(child,deferredContexts))return;
+        if(IsDeferredContext(child,deferredScope))return;
         if(IsStackingContext(child))PaintStackingContext(target,factory,child,childClip);
-        else PaintBox(target,factory,child,childClip,deferredContexts);
+        else PaintBox(target,factory,child,childClip,deferredScope);
     };
     if(!box.verticallyOrderedChildren.empty()){
         const float top=childClip.y,bottom=childClip.y+childClip.height;
@@ -5961,15 +6022,16 @@ bool LayoutEngine::TextCaretRect(const std::shared_ptr<Node>& textNode,size_t te
 }
 
 std::shared_ptr<Node> LayoutEngine::HitTestStackingContext(const LayoutBox& box,float x,float y)const{
+    if(!box.subtreeBounds.Contains(x,y))return {};
     for(auto it=box.nonNegativeStackingContexts.rbegin();it!=box.nonNegativeStackingContexts.rend();++it){
         const auto* context=*it;
-        if(StackingContextAllowsPoint(*context,box,x,y))
+        if(context->subtreeBounds.Contains(x,y)&&StackingContextAllowsPoint(*context,box,x,y))
             if(auto node=HitTestStackingContext(*context,x,y))return node;
     }
     return HitTestBox(box,x,y);
 }
 std::shared_ptr<Node> LayoutEngine::HitTestBox(const LayoutBox& box,float x,float y)const{
-    if(!box.visible)return {};
+    if(!box.visible||!box.subtreeBounds.Contains(x,y))return {};
     const bool inside=box.rect.Contains(x,y);
     const auto overflow=box.style.Get(L"overflow",L"visible");
     const auto overflowX=box.style.Get(L"overflow-x",overflow),overflowY=box.style.Get(L"overflow-y",overflow);

@@ -34,6 +34,9 @@ struct LayoutBox {
     ComputedStyle style;
     LayoutRect rect;
     LayoutRect content;
+    // Conservative subtree geometry for rejecting off-screen stacking contexts
+    // before walking their ancestor clips or testing individual descendants.
+    LayoutRect subtreeBounds;
     std::vector<std::unique_ptr<LayoutBox>> children;
     // Painting and hit testing use the same CSS stacking order repeatedly.
     // Cache it after layout instead of rebuilding and sorting a temporary
@@ -42,6 +45,12 @@ struct LayoutBox {
     std::vector<LayoutBox*> nonNegativeStackingContexts;
     std::vector<LayoutBox*> verticallyOrderedChildren;
     std::vector<LayoutBox*> overlayChildren;
+    const LayoutBox* deferredStackingScope = nullptr;
+    // Scroll changes positions, not styles or tree membership. Cache the boxes
+    // to translate while constructing traversal metadata, including text runs.
+    std::vector<LayoutBox*> scrollTranslationBoxes;
+    std::vector<LayoutBox*> scrollStickyChildren;
+    bool scrollTraversalCached = false;
     bool visible = true;
     bool preserveLeadingWhitespace = false;
     bool preserveTrailingWhitespace = false;
@@ -153,7 +162,7 @@ private:
                              const LayoutRect& clipBounds);
     void PaintBox(ID2D1RenderTarget* target, IDWriteFactory* factory, LayoutBox& box,
                   const LayoutRect& clipBounds,
-                  const std::vector<LayoutBox*>* deferredContexts = nullptr);
+                  const LayoutBox* deferredScope = nullptr);
     std::shared_ptr<Node> HitTestStackingContext(const LayoutBox& box, float x, float y) const;
     std::shared_ptr<Node> HitTestBox(const LayoutBox& box, float x, float y) const;
     bool ScrollBox(LayoutBox& box, float x, float y, float wheelDelta,
