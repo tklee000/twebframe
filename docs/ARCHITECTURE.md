@@ -69,6 +69,15 @@ Painting uses Direct2D for boxes, controls, SVG primitives, and decoration, and 
 
 All script input is processed by the same lexer, recursive-descent compiler, and bytecode VM. `ExecuteScript()` does not inspect function names and does not route known calls to page-specific C++ handlers.
 
+On x64, frequently called synchronous numeric functions can be promoted from
+the bytecode VM to a small baseline JIT tier. The tier compiles constants,
+numeric locals, arithmetic, comparisons, branches, and loops directly to
+machine code. It uses guarded number arguments, interpreter-compatible results,
+and read/write-then-execute code pages; unsupported bytecode and failed guards
+continue through the VM without changing script semantics. Generated pages are
+owned by the compiled function, capped by an 8 MiB per-runtime allocation
+budget, and released when the runtime is cleared.
+
 Compiled functions retain lexical environments for closures. The VM maintains exception handlers and resumable execution frames for `async`/`await`. Promise reactions and `queueMicrotask()` use a microtask queue drained at task boundaries. Timers and animation-frame callbacks are scheduled by the owning view.
 
 DOM objects, events, browser-compatibility objects, and the C++ message bridge are VM host objects. They are a deliberately limited binding layer, not a complete Web API implementation.

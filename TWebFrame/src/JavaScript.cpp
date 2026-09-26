@@ -9,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -435,6 +436,25 @@ struct Chunk {
     std::vector<ExceptionHandler> handlers;
 };
 
+constexpr size_t kBaselineJitMaxLocals=64;
+constexpr size_t kBaselineJitMaxStack=64;
+
+struct BaselineJitFrame {
+    double locals[kBaselineJitMaxLocals];
+    double stack[kBaselineJitMaxStack];
+    double result;
+    std::uint32_t resultKind;
+};
+
+struct BaselineJitCode {
+    using Entry=void (*)(BaselineJitFrame*);
+    void* memory=nullptr;
+    size_t size=0;
+    size_t allocationSize=0;
+    Entry entry=nullptr;
+    ~BaselineJitCode(){if(memory)VirtualFree(memory,0,MEM_RELEASE);}
+};
+
 struct Prototype {
     struct Binding {
         std::wstring parameter, property, name;
@@ -449,7 +469,295 @@ struct Prototype {
     std::wstring name;
     bool lexicalThis = false;
     bool isAsync = false;
+    size_t jitCallCount = 0;
+    bool jitCompilationAttempted = false;
+    std::shared_ptr<BaselineJitCode> jitCode;
 };
+
+#if defined(_M_X64)
+// The first tier is deliberately a leaf-code compiler: numeric arguments are
+// guarded before entry, generated code never calls C++ or allocates, and any
+// unsupported bytecode rejects the whole function before executable memory is
+// created. This keeps exceptions and stack unwinding out of generated frames.
+enum class JitScalarKind : std::uint8_t { Number, Boolean, Reference };
+struct JitAbstractValue {
+    JitScalarKind kind=JitScalarKind::Number;
+    std::uint16_t slot=0;
+    bool operator==(const JitAbstractValue& other)const{
+        return kind==other.kind&&slot==other.slot;
+    }
+};
+struct JitAbstractState {
+    bool initialized=false;
+    std::uint64_t assigned=0;
+    std::vector<JitAbstractValue> stack;
+};
+
+class X64BaselineEmitter {
+public:
+    // Small x64/SSE2 encoder for the fixed instruction subset used below.
+    struct Patch { size_t displacement=0,target=0; };
+    std::vector<std::uint8_t> code;
+    std::vector<Patch> patches;
+
+    void Byte(std::uint8_t value){code.push_back(value);}
+    void Dword(std::uint32_t value){
+        for(int shift=0;shift<32;shift+=8)Byte(static_cast<std::uint8_t>(value>>shift));
+    }
+    void Qword(std::uint64_t value){
+        for(int shift=0;shift<64;shift+=8)Byte(static_cast<std::uint8_t>(value>>shift));
+    }
+    void MovRax(std::uint64_t value){Byte(0x48);Byte(0xb8);Qword(value);}
+    void MovFrameFromRax(std::uint32_t offset){Byte(0x48);Byte(0x89);Byte(0x81);Dword(offset);}
+    void MovXmm0FromFrame(std::uint32_t offset){Byte(0xf2);Byte(0x0f);Byte(0x10);Byte(0x81);Dword(offset);}
+    void MovXmm1FromFrame(std::uint32_t offset){Byte(0xf2);Byte(0x0f);Byte(0x10);Byte(0x89);Dword(offset);}
+    void MovFrameFromXmm0(std::uint32_t offset){Byte(0xf2);Byte(0x0f);Byte(0x11);Byte(0x81);Dword(offset);}
+    void MovXmm1FromRax(){Byte(0x66);Byte(0x48);Byte(0x0f);Byte(0x6e);Byte(0xc8);}
+    void XorXmm1(){Byte(0x66);Byte(0x0f);Byte(0x57);Byte(0xc9);}
+    void XorXmm0Xmm1(){Byte(0x66);Byte(0x0f);Byte(0x57);Byte(0xc1);}
+    void Add(){Byte(0xf2);Byte(0x0f);Byte(0x58);Byte(0xc1);}
+    void Multiply(){Byte(0xf2);Byte(0x0f);Byte(0x59);Byte(0xc1);}
+    void Subtract(){Byte(0xf2);Byte(0x0f);Byte(0x5c);Byte(0xc1);}
+    void Divide(){Byte(0xf2);Byte(0x0f);Byte(0x5e);Byte(0xc1);}
+    void Compare(){Byte(0x66);Byte(0x0f);Byte(0x2e);Byte(0xc1);}
+    void Set(std::uint8_t condition,std::uint8_t destination){
+        Byte(0x0f);Byte(static_cast<std::uint8_t>(0x90+condition));Byte(destination);
+    }
+    void AndAlDl(){Byte(0x20);Byte(0xd0);}
+    void OrAlDl(){Byte(0x08);Byte(0xd0);}
+    void BooleanToXmm0(){
+        Byte(0x0f);Byte(0xb6);Byte(0xc0);
+        Byte(0xf2);Byte(0x0f);Byte(0x2a);Byte(0xc0);
+    }
+    void StoreDword(std::uint32_t offset,std::uint32_t value){
+        Byte(0xc7);Byte(0x81);Dword(offset);Dword(value);
+    }
+    void Jump(size_t target){
+        Byte(0xe9);patches.push_back({code.size(),target});Dword(0);
+    }
+    void JumpCondition(std::uint8_t condition,size_t target){
+        Byte(0x0f);Byte(static_cast<std::uint8_t>(0x80+condition));
+        patches.push_back({code.size(),target});Dword(0);
+    }
+    void Ret(){Byte(0xc3);}
+};
+
+std::shared_ptr<BaselineJitCode> CompileBaselineJit(const Prototype& prototype){
+    const bool hasParameterDefaults=std::any_of(
+        prototype.parameterDefaults.begin(),prototype.parameterDefaults.end(),
+        [](const auto& value){return static_cast<bool>(value);});
+    if(prototype.isAsync||hasParameterDefaults||
+       !prototype.bindings.empty()||!prototype.restParameter.empty()||
+       !prototype.chunk.handlers.empty())return {};
+    const auto& chunk=prototype.chunk;
+    if(chunk.code.empty())return {};
+
+    std::unordered_map<std::wstring,size_t> locals;
+    for(const auto& parameter:prototype.parameters){
+        if(locals.size()>=kBaselineJitMaxLocals)return {};
+        if(!locals.emplace(parameter,locals.size()).second)return {};
+    }
+    for(const auto& instruction:chunk.code)if(instruction.op==Op::Declare&&!locals.count(instruction.text)){
+        if(locals.size()>=kBaselineJitMaxLocals)return {};
+        locals.emplace(instruction.text,locals.size());
+    }
+    for(const auto& instruction:chunk.code)if(instruction.op==Op::LoadReference&&!locals.count(instruction.text))return {};
+
+    const auto reference=[&](const std::wstring& name){
+        return JitAbstractValue{JitScalarKind::Reference,static_cast<std::uint16_t>(locals.at(name))};
+    };
+    const auto numeric=[](const JitAbstractValue& value,std::uint64_t assigned){
+        return value.kind==JitScalarKind::Number||
+            (value.kind==JitScalarKind::Reference&&(assigned&(std::uint64_t{1}<<value.slot))!=0);
+    };
+    const auto truthy=[&](const JitAbstractValue& value,std::uint64_t assigned){
+        return numeric(value,assigned)||value.kind==JitScalarKind::Boolean;
+    };
+    std::vector<JitAbstractState> states(chunk.code.size()+1);
+    std::deque<size_t> work;
+    states[0].initialized=true;
+    for(size_t index=0;index<prototype.parameters.size();++index)states[0].assigned|=std::uint64_t{1}<<index;
+    work.push_back(0);
+    bool valid=true,hasReturn=false;
+    const auto merge=[&](size_t target,const std::vector<JitAbstractValue>& stack,std::uint64_t assigned){
+        if(target>=chunk.code.size()){valid=false;return;}
+        auto& state=states[target];
+        if(!state.initialized){state.initialized=true;state.assigned=assigned;state.stack=stack;work.push_back(target);}
+        else if(state.stack!=stack||state.assigned!=assigned)valid=false;
+    };
+    while(valid&&!work.empty()){
+        const size_t ip=work.front();work.pop_front();
+        auto stack=states[ip].stack;
+        auto assigned=states[ip].assigned;
+        const auto& instruction=chunk.code[ip];
+        const auto pop=[&](){
+            if(stack.empty()){valid=false;return JitAbstractValue{};}
+            auto value=stack.back();stack.pop_back();return value;
+        };
+        bool fallthrough=true;
+        switch(instruction.op){
+        case Op::Constant:
+            if(instruction.argument<0||static_cast<size_t>(instruction.argument)>=chunk.constants.size()||
+               chunk.constants[static_cast<size_t>(instruction.argument)].type!=Value::Type::Number){valid=false;break;}
+            stack.push_back({JitScalarKind::Number,0});break;
+        case Op::TrueValue:case Op::FalseValue:stack.push_back({JitScalarKind::Boolean,0});break;
+        case Op::LoadReference:stack.push_back(reference(instruction.text));break;
+        case Op::Declare:{
+            auto value=pop();if(!numeric(value,assigned))valid=false;
+            else assigned|=std::uint64_t{1}<<locals.at(instruction.text);break;
+        }
+        case Op::Duplicate:if(stack.empty())valid=false;else stack.push_back(stack.back());break;
+        case Op::Pop:pop();break;
+        case Op::Assign:{
+            auto value=pop(),target=pop();if(target.kind!=JitScalarKind::Reference||!numeric(value,assigned))valid=false;
+            else{assigned|=std::uint64_t{1}<<target.slot;stack.push_back({JitScalarKind::Number,0});}break;
+        }
+        case Op::PostIncrement:case Op::PostDecrement:case Op::PreIncrement:case Op::PreDecrement:{
+            auto target=pop();if(target.kind!=JitScalarKind::Reference||!numeric(target,assigned))valid=false;
+            else stack.push_back({JitScalarKind::Number,0});break;
+        }
+        case Op::Add:case Op::Subtract:case Op::Multiply:case Op::Divide:{
+            auto right=pop(),left=pop();if(!numeric(left,assigned)||!numeric(right,assigned))valid=false;else stack.push_back({JitScalarKind::Number,0});break;
+        }
+        case Op::Equal:case Op::NotEqual:case Op::StrictEqual:case Op::StrictNotEqual:
+        case Op::Less:case Op::LessEqual:case Op::Greater:case Op::GreaterEqual:{
+            auto right=pop(),left=pop();if(!numeric(left,assigned)||!numeric(right,assigned))valid=false;else stack.push_back({JitScalarKind::Boolean,0});break;
+        }
+        case Op::Negate:case Op::Positive:{auto value=pop();if(!numeric(value,assigned))valid=false;else stack.push_back({JitScalarKind::Number,0});break;}
+        case Op::Not:{auto value=pop();if(!truthy(value,assigned))valid=false;else stack.push_back({JitScalarKind::Boolean,0});break;}
+        case Op::Jump:
+            if(instruction.argument<0)valid=false;else merge(static_cast<size_t>(instruction.argument),stack,assigned);
+            fallthrough=false;break;
+        case Op::JumpFalse:{
+            auto value=pop();if(!truthy(value,assigned)||instruction.argument<0)valid=false;
+            else merge(static_cast<size_t>(instruction.argument),stack,assigned);break;
+        }
+        case Op::JumpFalseKeep:case Op::JumpTrueKeep:{
+            if(stack.empty()||!truthy(stack.back(),assigned)||instruction.argument<0){valid=false;break;}
+            merge(static_cast<size_t>(instruction.argument),stack,assigned);stack.pop_back();break;
+        }
+        case Op::Return:{auto value=pop();if(!truthy(value,assigned))valid=false;hasReturn=true;fallthrough=false;break;}
+        default:valid=false;break;
+        }
+        if(stack.size()>kBaselineJitMaxStack)valid=false;
+        if(valid&&fallthrough)merge(ip+1,stack,assigned);
+    }
+    if(!valid||!hasReturn)return {};
+
+    X64BaselineEmitter out;
+    // ENDBR64 keeps indirect JIT entries compatible with control-flow enforcement.
+    out.Byte(0xf3);out.Byte(0x0f);out.Byte(0x1e);out.Byte(0xfa);
+    std::vector<size_t> labels(chunk.code.size()+1,static_cast<size_t>(-1));
+    const auto localOffset=[](size_t slot){return static_cast<std::uint32_t>(offsetof(BaselineJitFrame,locals)+slot*sizeof(double));};
+    const auto stackOffset=[](size_t slot){return static_cast<std::uint32_t>(offsetof(BaselineJitFrame,stack)+slot*sizeof(double));};
+    const auto doubleBits=[](double value){std::uint64_t bits=0;std::memcpy(&bits,&value,sizeof(bits));return bits;};
+    const auto loadValue=[&](const std::vector<JitAbstractValue>& stack,size_t position,bool second){
+        const auto& value=stack[position];const auto offset=value.kind==JitScalarKind::Reference?localOffset(value.slot):stackOffset(position);
+        if(second)out.MovXmm1FromFrame(offset);else out.MovXmm0FromFrame(offset);
+    };
+    const auto storeStack=[&](size_t position){out.MovFrameFromXmm0(stackOffset(position));};
+    const auto emitBoolean=[&](Op operation){
+        // x86 condition codes: B=2, AE=3, E=4, NE=5, BE=6, A=7, P=A, NP=B.
+        switch(operation){
+        case Op::Less:out.Set(2,0xc0);out.Set(11,0xc2);out.AndAlDl();break;
+        case Op::LessEqual:out.Set(6,0xc0);out.Set(11,0xc2);out.AndAlDl();break;
+        case Op::Greater:out.Set(7,0xc0);break;
+        case Op::GreaterEqual:out.Set(3,0xc0);break;
+        case Op::Equal:case Op::StrictEqual:out.Set(4,0xc0);out.Set(11,0xc2);out.AndAlDl();break;
+        case Op::NotEqual:case Op::StrictNotEqual:out.Set(5,0xc0);out.Set(10,0xc2);out.OrAlDl();break;
+        default:break;
+        }
+        out.BooleanToXmm0();
+    };
+    const auto emitTruthBranch=[&](const std::vector<JitAbstractValue>& stack,bool whenTrue,size_t target){
+        loadValue(stack,stack.size()-1,false);out.XorXmm1();out.Compare();out.JumpCondition(whenTrue?5:4,target);
+    };
+    for(size_t ip=0;ip<chunk.code.size();++ip){
+        labels[ip]=out.code.size();if(!states[ip].initialized)continue;
+        const auto& stack=states[ip].stack;const auto& instruction=chunk.code[ip];
+        switch(instruction.op){
+        case Op::Constant:{
+            const auto number=chunk.constants[static_cast<size_t>(instruction.argument)].number;
+            out.MovRax(doubleBits(number));out.MovFrameFromRax(stackOffset(stack.size()));break;
+        }
+        case Op::TrueValue:case Op::FalseValue:
+            out.MovRax(doubleBits(instruction.op==Op::TrueValue?1.0:0.0));out.MovFrameFromRax(stackOffset(stack.size()));break;
+        case Op::LoadReference:break;
+        case Op::Declare:{
+            loadValue(stack,stack.size()-1,false);out.MovFrameFromXmm0(localOffset(locals.at(instruction.text)));break;
+        }
+        case Op::Duplicate:
+            if(stack.back().kind!=JitScalarKind::Reference){loadValue(stack,stack.size()-1,false);storeStack(stack.size());}break;
+        case Op::Pop:break;
+        case Op::Assign:{
+            const auto resultPosition=stack.size()-2;loadValue(stack,stack.size()-1,false);
+            out.MovFrameFromXmm0(localOffset(stack[resultPosition].slot));storeStack(resultPosition);break;
+        }
+        case Op::PostIncrement:case Op::PostDecrement:case Op::PreIncrement:case Op::PreDecrement:{
+            const auto position=stack.size()-1;const auto slot=stack.back().slot;loadValue(stack,position,false);
+            if(instruction.op==Op::PostIncrement||instruction.op==Op::PostDecrement)storeStack(position);
+            out.MovRax(doubleBits(1.0));out.MovXmm1FromRax();
+            if(instruction.op==Op::PostIncrement||instruction.op==Op::PreIncrement)out.Add();else out.Subtract();
+            out.MovFrameFromXmm0(localOffset(slot));
+            if(instruction.op==Op::PreIncrement||instruction.op==Op::PreDecrement)storeStack(position);break;
+        }
+        case Op::Add:case Op::Subtract:case Op::Multiply:case Op::Divide:{
+            const auto resultPosition=stack.size()-2;loadValue(stack,resultPosition,false);loadValue(stack,stack.size()-1,true);
+            if(instruction.op==Op::Add)out.Add();else if(instruction.op==Op::Subtract)out.Subtract();
+            else if(instruction.op==Op::Multiply)out.Multiply();else out.Divide();
+            storeStack(resultPosition);break;
+        }
+        case Op::Equal:case Op::NotEqual:case Op::StrictEqual:case Op::StrictNotEqual:
+        case Op::Less:case Op::LessEqual:case Op::Greater:case Op::GreaterEqual:{
+            const auto resultPosition=stack.size()-2;loadValue(stack,resultPosition,false);loadValue(stack,stack.size()-1,true);
+            out.Compare();emitBoolean(instruction.op);storeStack(resultPosition);break;
+        }
+        case Op::Negate:{
+            const auto position=stack.size()-1;loadValue(stack,position,false);out.MovRax(0x8000000000000000ull);
+            out.MovXmm1FromRax();out.XorXmm0Xmm1();storeStack(position);break;
+        }
+        case Op::Positive:{const auto position=stack.size()-1;loadValue(stack,position,false);storeStack(position);break;}
+        case Op::Not:{
+            const auto position=stack.size()-1;loadValue(stack,position,false);out.XorXmm1();out.Compare();out.Set(4,0xc0);
+            out.BooleanToXmm0();storeStack(position);break;
+        }
+        case Op::Jump:out.Jump(static_cast<size_t>(instruction.argument));break;
+        case Op::JumpFalse:emitTruthBranch(stack,false,static_cast<size_t>(instruction.argument));break;
+        case Op::JumpFalseKeep:emitTruthBranch(stack,false,static_cast<size_t>(instruction.argument));break;
+        case Op::JumpTrueKeep:emitTruthBranch(stack,true,static_cast<size_t>(instruction.argument));break;
+        case Op::Return:{
+            const auto& value=stack.back();loadValue(stack,stack.size()-1,false);
+            out.MovFrameFromXmm0(static_cast<std::uint32_t>(offsetof(BaselineJitFrame,result)));
+            out.StoreDword(static_cast<std::uint32_t>(offsetof(BaselineJitFrame,resultKind)),
+                           value.kind==JitScalarKind::Boolean?1u:0u);
+            out.Ret();break;
+        }
+        default:return {};
+        }
+    }
+    labels[chunk.code.size()]=out.code.size();out.Ret();
+    for(const auto& patch:out.patches){
+        if(patch.target>=labels.size()||labels[patch.target]==static_cast<size_t>(-1))return {};
+        const auto relative=static_cast<std::int64_t>(labels[patch.target])-static_cast<std::int64_t>(patch.displacement+4);
+        if(relative<(std::numeric_limits<std::int32_t>::min)()||relative>(std::numeric_limits<std::int32_t>::max)())return {};
+        const auto value=static_cast<std::uint32_t>(static_cast<std::int32_t>(relative));
+        for(int shift=0;shift<32;shift+=8)out.code[patch.displacement+static_cast<size_t>(shift/8)]=static_cast<std::uint8_t>(value>>shift);
+    }
+    if(out.code.empty())return {};
+    auto compiled=std::make_shared<BaselineJitCode>();compiled->size=out.code.size();
+    static const size_t pageSize=[](){SYSTEM_INFO information{};GetSystemInfo(&information);return static_cast<size_t>(information.dwPageSize);}();
+    compiled->allocationSize=(compiled->size+pageSize-1)/pageSize*pageSize;
+    compiled->memory=VirtualAlloc(nullptr,compiled->allocationSize,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    if(!compiled->memory)return {};
+    std::memcpy(compiled->memory,out.code.data(),compiled->size);
+    DWORD previous=0;
+    if(!VirtualProtect(compiled->memory,compiled->size,PAGE_EXECUTE_READ,&previous))return {};
+    if(!FlushInstructionCache(GetCurrentProcess(),compiled->memory,compiled->size))return {};
+    compiled->entry=reinterpret_cast<BaselineJitCode::Entry>(compiled->memory);return compiled;
+}
+#else
+std::shared_ptr<BaselineJitCode> CompileBaselineJit(const Prototype&){return {};}
+#endif
 
 struct Module {
     std::vector<std::shared_ptr<Prototype>> prototypes;
@@ -1374,6 +1682,10 @@ struct RuntimeCore {
     double viewportWidth=0;
     double viewportHeight=0;
     double devicePixelRatio=1;
+    size_t jitCompilationThreshold=64;
+    size_t jitCodeBudget=8*1024*1024;
+    size_t jitAllocatedCodeBytes=0;
+    JavaScriptRuntime::JitStatistics jitStatistics;
     std::weak_ptr<Node> pointerCaptureNode;
 
     explicit RuntimeCore(Document& d)
@@ -1496,6 +1808,7 @@ struct RuntimeCore {
         nodeObjects.clear();canvasContexts.clear();frameWindows.clear();inlineHandlerCache.clear();
         frameCallbacks.clear();frameScheduled=false;timers.clear();timerScheduled=false;
         microtasks.clear();possiblyUnhandledRejections.clear();templatePrograms.clear();mutationTargets.clear();
+        jitStatistics={};jitAllocatedCodeBytes=0;
         module=std::make_shared<Module>();global=CreateEnvironment();InstallGlobals();
         for(const auto& script:document.QuerySelectorAll(L"script"))script->scriptStarted=true;
     }
@@ -3372,7 +3685,34 @@ struct RuntimeCore {
         if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::ErrorConstructor){const auto name=callee.object->props.count(L"$name")?String(callee.object->props[L"$name"]):L"Error";return ErrorValue(name,args.empty()?L"":String(args[0]));}
         if(callee.type==Value::Type::Object&&callee.object&&callee.object->kind==ObjectKind::PromiseConstructor)throw JavaScriptException{ErrorValue(L"TypeError",L"Promise constructor must be called with new")};
         if(callee.type==Value::Type::Function){
-            const auto prototype=callee.function->prototype;auto env=CreateEnvironment();env->parent=callee.function->closure;
+            const auto prototype=callee.function->prototype;
+            if(jitCompilationThreshold&&prototype&&!prototype->jitCompilationAttempted&&
+               ++prototype->jitCallCount>=jitCompilationThreshold){
+                prototype->jitCompilationAttempted=true;auto compiled=CompileBaselineJit(*prototype);
+                if(compiled&&compiled->allocationSize<=jitCodeBudget-jitAllocatedCodeBytes){
+                    prototype->jitCode=std::move(compiled);++jitStatistics.compiledFunctions;
+                    jitStatistics.generatedCodeBytes+=prototype->jitCode->size;
+                    jitAllocatedCodeBytes+=prototype->jitCode->allocationSize;
+                }else ++jitStatistics.unsupportedFunctions;
+            }
+            if(jitCompilationThreshold&&prototype&&prototype->jitCode){
+                // Generated numeric code is a leaf and cannot re-enter the VM,
+                // so one scratch frame per runtime thread avoids per-call heap
+                // allocation and does not inflate every interpreter call frame.
+                static thread_local BaselineJitFrame frame;
+                bool argumentsAreNumeric=args.size()>=prototype->parameters.size();
+                for(size_t index=0;argumentsAreNumeric&&index<prototype->parameters.size();++index){
+                    const auto value=Deref(args[index]);
+                    if(value.type!=Value::Type::Number)argumentsAreNumeric=false;
+                    else frame.locals[index]=value.number;
+                }
+                if(argumentsAreNumeric){
+                    prototype->jitCode->entry(&frame);++jitStatistics.nativeCalls;
+                    return frame.resultKind?Value::Bool(frame.result!=0):Value::Number(frame.result);
+                }
+                ++jitStatistics.guardFallbacks;
+            }
+            auto env=CreateEnvironment();env->parent=callee.function->closure;
             env->values.reserve(prototype->parameters.size()+3);
             try{
                 if(!prototype->lexicalThis)env->values[L"this"]=thisValue;
@@ -4018,6 +4358,8 @@ bool JavaScriptRuntime::Load(const std::wstring& source,std::wstring* error){
     return impl_->core.CompileRun(source,nullptr,error);
 }
 bool JavaScriptRuntime::Execute(const std::wstring& source,std::wstring* result,std::wstring* error){return impl_->core.CompileRun(source,result,error);}
+void JavaScriptRuntime::SetJitCompilationThreshold(size_t calls){impl_->core.jitCompilationThreshold=calls;}
+JavaScriptRuntime::JitStatistics JavaScriptRuntime::GetJitStatistics()const{return impl_->core.jitStatistics;}
 void JavaScriptRuntime::DispatchDocumentEvent(const std::wstring& eventName){impl_->core.Dispatch({},eventName);}
 void JavaScriptRuntime::DispatchWindowEvent(const std::wstring& eventName){impl_->core.DispatchWindow(eventName);}
 void JavaScriptRuntime::RunAnimationFrame(){impl_->core.RunAnimationFrame();}

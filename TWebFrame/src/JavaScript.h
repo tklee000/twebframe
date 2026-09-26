@@ -3,6 +3,7 @@
 #include "EditingCommand.h"
 
 #include <functional>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -10,6 +11,13 @@ namespace TWebFrame::Internal {
 
 class JavaScriptRuntime {
 public:
+    struct JitStatistics {
+        size_t compiledFunctions = 0;
+        size_t generatedCodeBytes = 0;
+        size_t nativeCalls = 0;
+        size_t guardFallbacks = 0;
+        size_t unsupportedFunctions = 0;
+    };
     enum class MutationKind { Paint, Style, Layout, Tree };
     struct Mutation {
         MutationKind kind = MutationKind::Paint;
@@ -95,6 +103,9 @@ public:
     bool Load(const std::wstring& source, std::wstring* error = nullptr);
     bool Execute(const std::wstring& source, std::wstring* result = nullptr,
                  std::wstring* error = nullptr);
+    // Zero disables JIT compilation and execution for this runtime.
+    void SetJitCompilationThreshold(size_t calls);
+    JitStatistics GetJitStatistics() const;
     void DispatchDocumentEvent(const std::wstring& eventName);
     void DispatchWindowEvent(const std::wstring& eventName);
     void RunAnimationFrame();

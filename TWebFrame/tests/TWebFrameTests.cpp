@@ -614,6 +614,54 @@ int wmain(int argc,wchar_t** argv) {
           L"DOM, CSS, layout and JavaScript numeric fallbacks do not throw first-chance C++ exceptions");
     if(numericExceptionHandler)RemoveVectoredExceptionHandler(numericExceptionHandler);
 
+    Document jitDoc;Check(jitDoc.Parse(L"<body></body>",&error),L"baseline JIT fixture parses");
+    JavaScriptRuntime jitJs(jitDoc);std::wstring jitResult;jitJs.SetJitCompilationThreshold(2);
+    Check(jitJs.Execute(LR"(
+        function jitSum(n){let total=0;for(let i=0;i<n;i++){total+=i;}return total;}
+        function jitAbs(n){if(n<0)return -n;return n;}
+        function jitGuard(n){return n+1;}
+        function jitOps(a,b){let value=a+b;value=value-b;value=value*3;return value/2;}
+        function jitInc(n){let x=n;let a=x++;let b=++x;let c=x--;let d=--x;return a+b+c+d+x;}
+        function jitLess(a,b){return a<b;}
+        function jitEqual(a,b){return a===b;}
+        function jitRelation(a,b){
+            let value=0;
+            if(a<=b)value=value+1;
+            if(a>b)value=value+2;
+            if(a>=b)value=value+4;
+            if(a!==b)value=value+8;
+            return value;
+        }
+        function jitNot(n){return !n;}
+        let answer=0;
+        for(let i=0;i<8;i++)answer+=jitSum(1000+i);
+        for(let i=0;i<8;i++)answer+=jitAbs(-i);
+        for(let i=0;i<4;i++){
+            jitGuard(i);jitOps(i+4,2);jitInc(i);jitLess(i,i+1);jitEqual(i,i);
+            jitRelation(i+1,i);jitNot(i);
+        }
+        return answer+'|'+jitOps(8,2)+'|'+jitInc(5)+'|'+jitLess(1,2)+'|'
+            +jitEqual(2,2)+'|'+jitRelation(3,2)+'|'+jitRelation(0/0,2)+'|'
+            +jitLess(0/0,2)+'|'+jitNot(0/0)+'|'+jitNot(0)+'|'+jitNot(4)+'|'+jitGuard('x');
+    )",&jitResult,&error)&&
+          jitResult==L"4024084|12|29|true|true|14|8|false|true|true|false|x1",error.c_str());
+#if defined(_M_X64)
+    const auto jitStatistics=jitJs.GetJitStatistics();
+    Check(jitStatistics.compiledFunctions>=9&&jitStatistics.generatedCodeBytes>0&&
+          jitStatistics.nativeCalls>=9,
+          L"hot numeric functions are promoted to x64 baseline JIT code");
+    Check(jitStatistics.guardFallbacks>=1,
+          L"baseline JIT type guard failures return to the interpreter");
+    jitJs.SetJitCompilationThreshold(0);const auto nativeCallsBeforeDisable=jitStatistics.nativeCalls;
+    Check(jitJs.Execute(L"return jitSum(10);",&jitResult,&error)&&jitResult==L"45"&&
+          jitJs.GetJitStatistics().nativeCalls==nativeCallsBeforeDisable,
+          L"baseline JIT can be disabled per runtime without changing execution results");
+    jitJs.Clear();
+    const auto clearedJitStatistics=jitJs.GetJitStatistics();
+    Check(clearedJitStatistics.compiledFunctions==0&&clearedJitStatistics.generatedCodeBytes==0,
+          L"runtime reset releases baseline JIT code and statistics");
+#endif
+
     Document switchDoc;Check(switchDoc.Parse(L"<body></body>",&error),L"switch JavaScript fixture parses");
     JavaScriptRuntime switchJs(switchDoc);std::wstring switchResult;
     Check(switchJs.Load(L"function choose(value){let result='';switch(value){case 'a':result+='a';break;default:result+='d';case 'b':result+='b';}return result;}",&error),error.c_str());

@@ -128,6 +128,10 @@ There is no complete keyframe animation, transform-composition, filter, composit
 
 ### Syntax and execution
 
+- Hot synchronous numeric functions can promote from bytecode interpretation
+  to the x64 baseline JIT for local variables, arithmetic, comparisons,
+  branches, and loops. Unsupported functions and non-number arguments remain
+  on the bytecode interpreter.
 - `let`, `const`, and `var` declarations.
 - Function declarations and expressions, arrow functions, closures, lexical arrow `this`, and `arguments`.
 - Rest parameters, argument spread, default parameters, and tested destructuring patterns.

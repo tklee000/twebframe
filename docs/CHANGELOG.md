@@ -6,6 +6,8 @@ This document records user-visible changes cumulatively by released version. Add
 
 ### Added
 
+- Added an x64 baseline JIT tier for hot synchronous numeric JavaScript
+  functions, with guarded interpreter fallback and W^X code pages.
 - Added common-layout `::first-letter` text runs, including responsive compact
   controls whose remaining label text is hidden.
 - Added shared pointer transition events with CSS-pixel coordinates, related targets, and 100%/150% DPI regression coverage.
