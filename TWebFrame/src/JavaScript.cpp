@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1196,6 +1197,15 @@ private:
 
 std::wstring NumberString(double number) {
     if(std::isnan(number))return L"NaN";if(std::isinf(number))return number<0?L"-Infinity":L"Infinity";
+    // Array indices, counters and template substitutions overwhelmingly use
+    // small integers. Format these without constructing a locale-aware stream.
+    // Stay below the existing general-format exponent threshold.
+    if(std::abs(number)<1e15&&std::floor(number)==number){
+        char buffer[32];
+        const auto converted=std::to_chars(std::begin(buffer),std::end(buffer),
+            static_cast<long long>(number));
+        return std::wstring(buffer,converted.ptr);
+    }
     std::wostringstream out;out<<std::setprecision(15)<<number;auto value=out.str();
     if(value.find(L'.')!=std::wstring::npos){while(!value.empty()&&value.back()==L'0')value.pop_back();if(!value.empty()&&value.back()==L'.')value.pop_back();}
     return value;
@@ -1320,6 +1330,7 @@ struct RuntimeCore {
     std::unordered_map<const NativeFunction*,std::weak_ptr<NativeFunction>> managedNativeFunctions;
     std::unordered_map<const Environment*,std::weak_ptr<Environment>> managedEnvironments;
     size_t managedAllocationsSinceSweep=0;
+    size_t managedSweepInterval=256;
     struct NodeEventListeners {
         std::weak_ptr<Node> node;
         EventListenerMap events;
@@ -1394,8 +1405,14 @@ struct RuntimeCore {
         for(const auto& entry:entries)if(entry.second.expired())expired.push_back(entry.first);
         for(const auto& key:expired)entries.erase(key);
     }
+    template<class Key,class T,class Hash,class Equal>
+    static void PruneExpiredManagedEntries(FastMap<Key,T,Hash,Equal>& entries){
+        // Compact weak wrapper registries once. Erasing each expired wrapper
+        // separately rebuilds the flat map's buckets once per removed entry.
+        entries.erase_if([](const auto& entry){return entry.second.expired();});
+    }
     void MaybePruneManagedEntries(){
-        if(++managedAllocationsSinceSweep<256)return;
+        if(++managedAllocationsSinceSweep<managedSweepInterval)return;
         managedAllocationsSinceSweep=0;
         PruneExpiredManagedEntries(managedObjects);
         PruneExpiredManagedEntries(managedFunctions);
@@ -1409,10 +1426,13 @@ struct RuntimeCore {
         // listener into an unintended runtime root and leaves a dangling key.
         // Connected nodes and detached nodes still referenced by JavaScript
         // remain alive through this weak association and keep their listeners.
-        std::vector<Node*> expiredListenerTargets;
-        for(const auto& entry:listeners)
-            if(entry.second.node.expired())expiredListenerTargets.push_back(entry.first);
-        for(auto* target:expiredListenerTargets)listeners.erase(target);
+        listeners.erase_if([](const auto& entry){return entry.second.node.expired();});
+        // Amortize a full registry scan over the live graph size. A fixed
+        // interval repeatedly scans every retained record while a large array
+        // is being mapped, making otherwise linear JavaScript work quadratic.
+        managedSweepInterval=std::max<size_t>(256,managedObjects.size()+
+            managedFunctions.size()+managedNativeFunctions.size()+managedEnvironments.size()+
+            nodeObjects.size()+canvasContexts.size()+frameWindows.size()+listeners.size());
     }
     template<class T>
     void TrackManaged(std::unordered_map<const T*,std::weak_ptr<T>>& entries,
@@ -1465,6 +1485,7 @@ struct RuntimeCore {
         managedNativeFunctions.clear();managedFunctions.clear();
         managedEnvironments.clear();managedObjects.clear();
         managedAllocationsSinceSweep=0;
+        managedSweepInterval=256;
     }
     void ResetExecutionState(bool notifyTimerScheduler){
         if(notifyTimerScheduler&&timerScheduler)timerScheduler(0);
@@ -3034,8 +3055,8 @@ struct RuntimeCore {
             if(key==L"insertCell"&&node->tag==L"tr")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){std::vector<std::shared_ptr<Node>> cells;for(const auto& child:node->children)if(child->tag==L"td"||child->tag==L"th")cells.push_back(child);long long requested=a.empty()?-1:static_cast<long long>(r.Number(a[0]));size_t index=requested<0?cells.size():std::min(cells.size(),static_cast<size_t>(requested));auto cell=r.document.CreateElement(L"td");cell->parent=node;auto position=node->children.end();if(index<cells.size())position=std::find(node->children.begin(),node->children.end(),cells[index]);node->children.insert(position,cell);const bool indexOk=r.document.IndexSubtree(cell);r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,!indexOk);return r.NodeValue(cell);});
             if(key==L"deleteCell"&&node->tag==L"tr")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){std::vector<std::shared_ptr<Node>> cells;for(const auto& child:node->children)if(child->tag==L"td"||child->tag==L"th")cells.push_back(child);if(cells.empty())return Value::Undefined();long long requested=a.empty()?-1:static_cast<long long>(r.Number(a[0]));size_t index=requested<0?cells.size()-1:static_cast<size_t>(requested);if(index>=cells.size())return Value::Undefined();auto cell=cells[index];const bool indexOk=r.document.UnindexSubtree(cell);node->children.erase(std::remove(node->children.begin(),node->children.end(),cell),node->children.end());cell->parent.reset();r.Mutated(node,JavaScriptRuntime::MutationKind::Tree,!indexOk);return Value::Undefined();});
             if(key==L"contains")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){if(a.empty())return Value::Bool(false);auto value=r.Deref(a[0]);if(value.type!=Value::Type::Object||!value.object||value.object->kind!=ObjectKind::Node)return Value::Bool(false);for(auto current=value.object->node;current;current=current->parent.lock())if(current==node)return Value::Bool(true);return Value::Bool(false);});
-            if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto& listeners=r.listeners[node.get()];listeners.node=node;r.AddEventListener(listeners.events,a);return Value::Undefined();});
-            if(key==L"removeEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto found=r.listeners.find(node.get());if(found!=r.listeners.end()){r.RemoveEventListener(found->second.events,a);if(found->second.events.empty())r.listeners.erase(node.get());}return Value::Undefined();});
+            if(key==L"addEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto& listeners=r.listeners[node.get()];if(listeners.node.lock()!=node)listeners.events.clear();listeners.node=node;r.AddEventListener(listeners.events,a);return Value::Undefined();});
+            if(key==L"removeEventListener")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){auto found=r.listeners.find(node.get());if(found!=r.listeners.end()){if(found->second.node.lock()!=node){r.listeners.erase(node.get());return Value::Undefined();}r.RemoveEventListener(found->second.events,a);if(found->second.events.empty())r.listeners.erase(node.get());}return Value::Undefined();});
             if(key==L"querySelector"||key==L"querySelectorAll")return Native([node,key](RuntimeCore& r,const Value&,const std::vector<Value>& a){r.EnsureIndex();auto selector=a.empty()?L"":r.String(a[0]);if(key==L"querySelector")return r.NodeValue(r.document.QuerySelector(selector,node));std::vector<Value> out;for(auto& n:r.document.QuerySelectorAll(selector,node))out.push_back(r.NodeValue(n));return r.ArrayValue(out);});
             if(key==L"closest")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return r.NodeValue(node->Closest(a.empty()?L"":r.String(a[0])));});
             if(key==L"matches")return Native([node](RuntimeCore& r,const Value&,const std::vector<Value>& a){return Value::Bool(!a.empty()&&Document::MatchesSelector(node,r.String(a[0])));});
@@ -3890,19 +3911,19 @@ struct RuntimeCore {
             invoke(windowListeners,windowTarget,true,1);
             if(!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,true,1);
             if(!stopped(L"$propagationStopped"))for(auto iterator=ancestors.rbegin();iterator!=ancestors.rend();++iterator){
-                auto found=listeners.find(iterator->get());if(found!=listeners.end())invoke(found->second.events,NodeValue(*iterator),true,1);
+                auto found=listeners.find(iterator->get());if(found!=listeners.end()&&found->second.node.lock()==*iterator)invoke(found->second.events,NodeValue(*iterator),true,1);
                 if(stopped(L"$propagationStopped"))break;
             }
             if(!stopped(L"$propagationStopped")){
                 const auto target=NodeValue(node);auto found=listeners.find(node.get());
-                if(found!=listeners.end())invoke(found->second.events,target,true,2);
+                if(found!=listeners.end()&&found->second.node.lock()==node)invoke(found->second.events,target,true,2);
                 if(!stopped(L"$immediateStopped")){event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(2);DispatchInlineEventHandler(node,eventName,eventValue,event);}
-                if(!stopped(L"$immediateStopped")&&found!=listeners.end())invoke(found->second.events,target,false,2);
+                if(!stopped(L"$immediateStopped")){auto bubbleListeners=listeners.find(node.get());if(bubbleListeners!=listeners.end()&&bubbleListeners->second.node.lock()==node)invoke(bubbleListeners->second.events,target,false,2);}
             }
             if(init.bubbles&&!stopped(L"$propagationStopped"))for(const auto& current:ancestors){
                 const auto target=NodeValue(current);event->props[L"currentTarget"]=target;event->props[L"eventPhase"]=Value::Number(3);
                 DispatchInlineEventHandler(current,eventName,eventValue,event);
-                if(!stopped(L"$immediateStopped")){auto found=listeners.find(current.get());if(found!=listeners.end())invoke(found->second.events,target,false,3);}
+                if(!stopped(L"$immediateStopped")){auto found=listeners.find(current.get());if(found!=listeners.end()&&found->second.node.lock()==current)invoke(found->second.events,target,false,3);}
                 if(stopped(L"$propagationStopped"))break;
             }
             if(init.bubbles&&!stopped(L"$propagationStopped"))invoke(documentListeners,documentTarget,false,3);

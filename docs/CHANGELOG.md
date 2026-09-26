@@ -6,6 +6,8 @@ This document records user-visible changes cumulatively by released version. Add
 
 ### Added
 
+- Added common-layout `::first-letter` text runs, including responsive compact
+  controls whose remaining label text is hidden.
 - Added shared pointer transition events with CSS-pixel coordinates, related targets, and 100%/150% DPI regression coverage.
 - Added DOM range and selection support plus `document.execCommand('insertHTML')` for block-aware editable HTML insertion.
 - Added native title tooltips and focused pointer, editing-command, and tooltip regression projects under `TWebFrame/tests`.

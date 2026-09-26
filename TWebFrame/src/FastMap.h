@@ -17,7 +17,7 @@ namespace TWebFrame::Internal {
 // per-element node allocation and checked STL hash iterators that are
 // particularly expensive in MSVC Debug builds.
 //
-// TWebFrame does not erase individual entries, so no tombstone state is needed.
+// Erasure compacts the entries and rebuilds buckets, without tombstone state.
 template <typename Key, typename T, typename Hash = std::hash<Key>,
           typename Equal = std::equal_to<Key>>
 class FastMap {
@@ -123,6 +123,17 @@ public:
         entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
         if (!buckets_.empty()) RebuildBuckets(buckets_.size());
         return 1;
+    }
+
+    template<typename Predicate>
+    size_type erase_if(Predicate predicate) {
+        const auto first=std::remove_if(entries_.begin(),entries_.end(),predicate);
+        const auto removed=static_cast<size_type>(entries_.end()-first);
+        if(removed){
+            entries_.erase(first,entries_.end());
+            if(!buckets_.empty())RebuildBuckets(buckets_.size());
+        }
+        return removed;
     }
 
     T& operator[](const Key& key) { return FindOrAdd(key); }

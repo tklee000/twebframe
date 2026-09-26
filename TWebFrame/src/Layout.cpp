@@ -5,17 +5,59 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cwctype>
 #include <functional>
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
+#include <list>
 #include <sstream>
+#include <string_view>
+#include <unordered_map>
 #include <wrl/client.h>
 
 namespace TWebFrame::Internal {
 namespace {
+
+// Evict the least recently measured text instead of dropping every width when
+// a document crosses an entry-count threshold. Keys include all shaping inputs;
+// neither text length nor character set changes the actual measurement path.
+class TextWidthCache {
+    using Entry=std::pair<std::wstring,float>;
+    using Entries=std::list<Entry>;
+    Entries entries_;
+    std::unordered_map<std::wstring_view,Entries::iterator> index_;
+    size_t bytes_=0;
+    static constexpr size_t budget_=4*1024*1024;
+    static size_t Cost(const std::wstring& key){
+        return sizeof(Entry)+8*sizeof(void*)+(key.capacity()+1)*sizeof(wchar_t);
+    }
+public:
+    bool Find(const std::wstring& key,float& width){
+        const auto found=index_.find(key);
+        if(found==index_.end())return false;
+        width=found->second->second;
+        entries_.splice(entries_.begin(),entries_,found->second);
+        return true;
+    }
+    void Remember(std::wstring key,float width){
+        const auto cost=Cost(key);
+        if(cost>budget_)return;
+        while(bytes_+cost>budget_&&!entries_.empty()){
+            const auto& oldest=entries_.back().first;
+            bytes_-=Cost(oldest);index_.erase(oldest);entries_.pop_back();
+        }
+        entries_.emplace_front(std::move(key),width);
+        index_.emplace(std::wstring_view(entries_.front().first),entries_.begin());
+        bytes_+=cost;
+    }
+    void Clear(){index_.clear();entries_.clear();bytes_=0;}
+};
+TextWidthCache& ThreadTextWidthCache(){
+    static thread_local TextWidthCache cache;return cache;
+}
 
 struct Edges { float top=0,right=0,bottom=0,left=0; };
 struct CachedStyleMetrics {
@@ -27,6 +69,15 @@ struct CachedStyleMetrics {
     bool bordersValid=false;
     bool fontSizeValid=false;
     bool lineHeightValid=false;
+    bool edgeDependenciesValid[2]{};
+    bool edgesUseReference[2]{};
+    bool edgesUseViewport[2]{};
+    bool monospaceValid=false;
+    bool monospace=false;
+    bool inlineFontValid=false;
+    float inlineFontScale=0;
+    float inlineFontHeight=0;
+    float inlineFontBaseline=0;
 };
 using StyleMetricsCache=FastMap<const void*,CachedStyleMetrics>;
 StyleMetricsCache& ThreadStyleMetricsCache(){
@@ -71,6 +122,7 @@ EdgeValuesCache& ThreadEdgeValuesCache(){
     static thread_local EdgeValuesCache cache;return cache;
 }
 void ClearOwnerBoundThreadCaches(){
+    ThreadTextWidthCache().Clear();
     // These caches use weak ownership to validate raw style pointers. Releasing
     // them with the last layout engine avoids retaining weak control blocks for
     // documents whose view has already been destroyed.
@@ -507,8 +559,13 @@ std::vector<NumericToken> NumericTokens(const std::wstring& value) {
 
 std::wstring NumberText(double value) {
     if(std::abs(value)<0.0000005)value=0;
-    std::wostringstream output;output<<std::fixed<<std::setprecision(6)<<value;
-    auto text=output.str();while(text.size()>1&&text.back()==L'0')text.pop_back();
+    // CSS numbers and cache keys are ASCII, independent of the process locale.
+    // Avoid constructing a locale-aware stream for every text/grid measurement.
+    char buffer[384];
+    const auto converted=std::to_chars(std::begin(buffer),std::end(buffer),value,
+        std::chars_format::fixed,6);
+    std::wstring text(buffer,converted.ptr);
+    while(text.size()>1&&text.back()==L'0')text.pop_back();
     if(!text.empty()&&text.back()==L'.')text.pop_back();return text;
 }
 
@@ -628,8 +685,21 @@ std::vector<BoxShadow> BoxShadows(const ComputedStyle& style,float viewport) {
 }
 
 Edges EdgeValues(const ComputedStyle& style,const std::wstring& base,float reference,float viewport) {
+    const size_t kind=base==L"padding"?1:0;
+    auto& metrics=StyleMetrics(style);
+    if(!metrics.edgeDependenciesValid[kind]){
+        for(const auto* suffix:{L"",L"-top",L"-right",L"-bottom",L"-left"}){
+            const auto value=style.Get(base+suffix);
+            metrics.edgesUseReference[kind]|=value.find(L'%')!=std::wstring::npos;
+            metrics.edgesUseViewport[kind]|=value.find_first_of(L"vV")!=std::wstring::npos;
+        }
+        metrics.edgeDependenciesValid[kind]=true;
+    }
     auto& cache=ThreadEdgeValuesCache();
-    const EdgeCacheKey key{style.values.get(),reference,viewport,base==L"padding"};
+    // Fixed/em edges are identical across intrinsic and final grid widths.
+    // Keep percentage and viewport dependencies in the key only when present.
+    const EdgeCacheKey key{style.values.get(),metrics.edgesUseReference[kind]?reference:0,
+        metrics.edgesUseViewport[kind]?viewport:0,kind==1};
     auto found=cache.find(key);
     if(found!=cache.end()){
         const auto owner=found->second.owner.lock();
@@ -874,9 +944,12 @@ std::wstring FontFamily(const ComputedStyle& style) {
 }
 
 bool UsesGenericMonospaceMetrics(const ComputedStyle& style) {
+    auto& cached=StyleMetrics(style);
+    if(cached.monospaceValid)return cached.monospace;
+    cached.monospaceValid=true;
     for(auto family:CssFontFamilies(style.Get(L"font-family"))){
         const auto generic=ToLower(Trim(family));
-        if(generic==L"monospace"||generic==L"ui-monospace")return true;
+        if(generic==L"monospace"||generic==L"ui-monospace")return cached.monospace=true;
         family=WindowsGenericFontFamily(family);
         if(SystemFontFamilyExists(family))return false;
     }
@@ -1051,6 +1124,15 @@ float NaturalFontLineHeight(const ComputedStyle& style) {
 }
 
 FontBoxMetrics InlineFontBoxMetrics(const ComputedStyle& style) {
+    const auto& cachedMetrics=StyleMetrics(style);
+    if(cachedMetrics.inlineFontValid&&cachedMetrics.inlineFontScale==style.deviceScale)
+        return {cachedMetrics.inlineFontHeight,cachedMetrics.inlineFontBaseline};
+    const auto remember=[&](FontBoxMetrics result){
+        auto& cached=StyleMetrics(style);
+        cached.inlineFontValid=true;cached.inlineFontScale=style.deviceScale;
+        cached.inlineFontHeight=result.height;cached.inlineFontBaseline=result.baseline;
+        return result;
+    };
     static thread_local FastMap<std::wstring,FontBoxMetrics> cache;
     const bool genericMonospace=UsesGenericMonospaceMetrics(style);
     std::wstring key=style.Get(L"font-family");key+=L'\x1f';
@@ -1058,7 +1140,7 @@ FontBoxMetrics InlineFontBoxMetrics(const ComputedStyle& style) {
     key+=std::to_wstring(FontWeight(style));key+=L'\x1f';key+=style.Get(L"font-style");
     key+=genericMonospace?L"\x1fmono":L"\x1fresolved";
     if(genericMonospace){key+=L'\x1f';key+=NumberText(style.deviceScale);}
-    if(const auto found=cache.find(key);found!=cache.end())return found->second;
+    if(const auto found=cache.find(key);found!=cache.end())return remember(found->second);
     if(cache.size()>=256)cache.clear();
     FontBoxMetrics result=NaturalFontBoxMetrics(style);
     if(!genericMonospace){
@@ -1096,7 +1178,7 @@ FontBoxMetrics InlineFontBoxMetrics(const ComputedStyle& style) {
                          std::floor(fontSize*scale+0.0001f)/scale),
                 std::round(fontSize*0.85f*scale)/scale};
     }
-    cache.emplace(std::move(key),result);return result;
+    cache.emplace(std::move(key),result);return remember(result);
 }
 
 float InlineContentBoxHeight(const ComputedStyle& style) {
@@ -1317,15 +1399,16 @@ void ApplyTextDecorations(IDWriteTextLayout* layout,const std::wstring& text,
 
 float TextWidth(const std::wstring& source,const ComputedStyle& style,bool preserveLeading=false,bool preserveTrailing=false,bool gdiCompatible=false){
     const auto text=NormalizeText(source,style.Get(L"white-space"),preserveLeading,preserveTrailing);
-    static thread_local FastMap<std::wstring,float> cache;
+    auto& cache=ThreadTextWidthCache();
     std::wstring cacheKey=text;cacheKey+=L'\x1f';cacheKey+=FontFamily(style);cacheKey+=L'\x1f';
     cacheKey+=NumberText(FontSize(style));cacheKey+=L'\x1f';cacheKey+=std::to_wstring(FontWeight(style));
     cacheKey+=L'\x1f';cacheKey+=style.Get(L"font-style");cacheKey+=L'\x1f';
     cacheKey+=style.Get(L"letter-spacing");cacheKey+=L'\x1f';cacheKey+=style.Get(L"tab-size");
+    cacheKey+=L'\x1f';cacheKey+=style.Get(L"font-family");
     cacheKey+=gdiCompatible?L"\x1fG":L"\x1fD";
-    if(const auto found=cache.find(cacheKey);found!=cache.end())return found->second;
-    if(cache.size()>8192)cache.clear();
-    auto remember=[&](float value){cache[std::move(cacheKey)]=value;return value;};
+    float cachedWidth=0;
+    if(cache.Find(cacheKey,cachedWidth))return cachedWidth;
+    auto remember=[&](float value){cache.Remember(std::move(cacheKey),value);return value;};
     if(auto* factory=SharedWriteFactory()){
         auto format=TextFormat(factory,style);Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
         HRESULT created=E_FAIL;
@@ -1383,6 +1466,12 @@ float TextHeight(const std::wstring& source,const ComputedStyle& style,float ava
     // still need measurement because authored segment breaks create lines.
     if(whiteSpace==L"nowrap")return LineHeight(style);
     const auto text=NormalizeText(source,whiteSpace,preserveLeading,preserveTrailing);
+    // Preserved lines cannot wrap in pre. Their height depends only on authored
+    // segment breaks, including the final empty line, never on the grid width.
+    // In particular, provisional intrinsic widths must not trigger shaping.
+    // Leave other Unicode line separators to DirectWrite's line breaker.
+    if(whiteSpace==L"pre"&&text.find_first_of(L"\v\f\x85\u2028\u2029")==std::wstring::npos)
+        return LineHeight(style)*(1+std::count(text.begin(),text.end(),L'\n'));
     static thread_local FastMap<std::wstring,float> cache;
     std::wstring cacheKey=text;cacheKey+=L'\x1f';cacheKey+=FontFamily(style);cacheKey+=L'\x1f';
     cacheKey+=NumberText(FontSize(style));cacheKey+=L'\x1f';cacheKey+=std::to_wstring(FontWeight(style));
@@ -1986,6 +2075,7 @@ float MinContentWidth(const LayoutBox& box){
     if(overflow!=L"visible"&&overflow!=L"clip")return remember(margin.left+margin.right);
     if(box.node->type==NodeType::Text){
         const auto whiteSpace=box.style.Get(L"white-space");
+        if(whiteSpace==L"pre")return remember(NaturalWidth(box));
         const auto text=NormalizeText(box.node->text,whiteSpace,box.preserveLeadingWhitespace,box.preserveTrailingWhitespace);
         if(PreventsTextWrapping(whiteSpace))return remember(TextWidth(text,box.style));
         float longest=1;for(const auto& word:Words(text))longest=std::max(longest,TextWidth(word,box.style));return remember(longest);
@@ -2014,6 +2104,11 @@ float NaturalGridHeight(const LayoutBox& box,float availableWidth);
 float NaturalHeight(const LayoutBox& box,float availableWidth=500){
     if(box.naturalHeightValid&&std::abs(box.naturalHeightReference-availableWidth)<0.01f)return box.naturalHeight;
     auto remember=[&](float result){box.naturalHeightReference=availableWidth;box.naturalHeight=result;box.naturalHeightValid=true;return result;};
+    // Ordinary text inherits font/line formatting, not element box edges or
+    // size constraints. Match LayoutBoxTree's text path during intrinsic sizing.
+    if(box.node->type==NodeType::Text&&!box.generatedFrom)
+        return remember(TextHeight(box.node->text,box.style,availableWidth,
+            box.preserveLeadingWhitespace,box.preserveTrailingWhitespace));
     auto height=box.style.Get(L"height");float value=0;
     if(!height.empty()&&height!=L"auto"&&height.find(L'%')==std::wstring::npos){
         value=StyleSheet::Length(height,500,500,20);
@@ -2569,65 +2664,36 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
         const auto start=columns?item.column:item.row;
         const auto span=columns?item.columnSpan:item.rowSpan;
         if(start>=tracks.size())continue;
-        bool spansFlexibleTrack=false,spansStretchTrack=false;
+        bool spansFlexibleTrack=false,spansStretchTrack=false,spansIntrinsicTrack=false;
         for(size_t index=0;index<span&&start+index<tracks.size();++index){
             spansFlexibleTrack=spansFlexibleTrack||tracks[start+index].fraction>0;
             spansStretchTrack=spansStretchTrack||tracks[start+index].stretch;
+            spansIntrinsicTrack=spansIntrinsicTrack||tracks[start+index].intrinsic;
         }
-        // Bare fr and auto tracks have automatic minimums.  In a definite grid
-        // their item contribution is the min-content size, not max-content.
-        // Using NaturalWidth here lets a newly revealed no-wrap descendant
-        // expand an outer implicit auto track past the grid container; a later
-        // viewport relayout then appears to be what made the nested grid responsive.
-        float contribution=columns&&definiteAvailable&&
-            (spansFlexibleTrack||spansStretchTrack)?
-            MinContentWidth(*item.box):
+        // Content cannot grow fixed tracks. It still receives normal layout
+        // and contributes overflow after track sizing, without this extra pass.
+        if(!spansIntrinsicTrack)continue;
+        const auto itemSize=Trim(item.box->style.Get(columns?L"width":L"height"));
+        const bool percentageSize=itemSize.find(L'%')!=std::wstring::npos;
+        const bool automaticSize=itemSize.empty()||itemSize==L"auto"||percentageSize;
+        const auto minimum=Trim(item.box->style.Get(columns?L"min-width":L"min-height"));
+        const auto overflow=item.box->style.Get(columns?L"overflow-x":L"overflow-y",
+            item.box->style.Get(L"overflow",L"visible"));
+        const bool zeroAutomaticMinimum=automaticSize&&
+            ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
+             (overflow!=L"visible"&&overflow!=L"clip"));
+        if(zeroAutomaticMinimum&&!spansFlexibleTrack&&definiteAvailable&&stretchAutoTracks)
+            for(size_t index=0;index<span&&start+index<tracks.size();++index)
+                shrinkableAutoTracks[start+index]=tracks[start+index].stretch;
+        // Determine zero contributions before descending into content. Scroll
+        // containers in flexible tracks can contain arbitrarily large trees;
+        // measuring those trees only to discard the result stalls first layout.
+        if(percentageSize||(zeroAutomaticMinimum&&spansFlexibleTrack))continue;
+        // Bare fr and stretched auto tracks use min-content contributions in a
+        // definite grid; other intrinsic tracks retain their natural size.
+        const float contribution=columns&&definiteAvailable&&
+            (spansFlexibleTrack||spansStretchTrack)?MinContentWidth(*item.box):
             (columns?NaturalWidth(*item.box):NaturalHeight(*item.box,spanSize(item)));
-        // A percentage inline size is resolved from the finished grid area. It
-        // is indefinite while intrinsic track contributions are collected, so
-        // it must not inject the control's fallback intrinsic width into an fr
-        // track (for example, a width:100% select inside a 140px grid cell).
-        if(columns){
-            const auto itemWidth=Trim(item.box->style.Get(L"width"));
-            if(itemWidth.find(L'%')!=std::wstring::npos)contribution=0;
-            const bool automaticSize=itemWidth.empty()||itemWidth==L"auto"||
-                itemWidth.find(L'%')!=std::wstring::npos;
-            const auto minimum=Trim(item.box->style.Get(L"min-width"));
-            const auto overflow=item.box->style.Get(L"overflow-x",item.box->style.Get(L"overflow",L"visible"));
-            // A zero automatic minimum applies only while the item size is
-            // automatic. A definite width/height remains its track sizing
-            // contribution even when the item clips overflowing descendants.
-            // A definite grid container also does not by itself make an
-            // intrinsic track flexible: non-stretched auto tracks retain the
-            // content contribution, fr tracks use the zero minimum immediately,
-            // and stretched auto tracks shrink only if their combined natural
-            // size actually exceeds the definite grid area.
-            const bool zeroAutomaticMinimum=automaticSize&&
-                ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
-                 (overflow!=L"visible"&&overflow!=L"clip"));
-            if(zeroAutomaticMinimum){
-                if(spansFlexibleTrack)contribution=0;
-                else if(definiteAvailable&&stretchAutoTracks)
-                    for(size_t index=0;index<span&&start+index<tracks.size();++index)
-                        shrinkableAutoTracks[start+index]=tracks[start+index].stretch;
-            }
-        }else{
-            const auto itemHeight=Trim(item.box->style.Get(L"height"));
-            if(itemHeight.find(L'%')!=std::wstring::npos)contribution=0;
-            const bool automaticSize=itemHeight.empty()||itemHeight==L"auto"||
-                itemHeight.find(L'%')!=std::wstring::npos;
-            const auto minimum=Trim(item.box->style.Get(L"min-height"));
-            const auto overflow=item.box->style.Get(L"overflow-y",item.box->style.Get(L"overflow",L"visible"));
-            const bool zeroAutomaticMinimum=automaticSize&&
-                ((!minimum.empty()&&StyleSheet::Length(minimum,available,viewport,1)==0)||
-                 (overflow!=L"visible"&&overflow!=L"clip"));
-            if(zeroAutomaticMinimum){
-                if(spansFlexibleTrack)contribution=0;
-                else if(definiteAvailable&&stretchAutoTracks)
-                    for(size_t index=0;index<span&&start+index<tracks.size();++index)
-                        shrinkableAutoTracks[start+index]=tracks[start+index].stretch;
-            }
-        }
         float occupied=gap*std::max(0,static_cast<int>(span)-1);
         for(size_t index=0;index<span&&start+index<tracks.size();++index)occupied+=tracks[start+index].base;
         float deficit=std::max(0.0f,contribution-occupied);
@@ -2668,8 +2734,9 @@ std::vector<float> ResolveGridTracks(const std::vector<std::wstring>& definition
             occupied+=preferredAutoSizes[index];
             if(tracks[index].stretch&&tracks[index].fraction<=0)eligible.push_back(index);
         }
+        if(eligible.empty())continue;
         float deficit=std::max(0.0f,NaturalWidth(*item.box)-occupied);
-        if(eligible.empty()||deficit<=0.01f)continue;
+        if(deficit<=0.01f)continue;
         const float share=deficit/static_cast<float>(eligible.size());
         for(const auto index:eligible)preferredAutoSizes[index]+=share;
     }

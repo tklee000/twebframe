@@ -72,7 +72,8 @@ Shadow DOM, Custom Elements, browser observer APIs, the full Event constructor f
 - Attribute presence and `=`, `^=`, `$=`, `*=`, `~=`, and `|=` matching, including the tested ASCII-insensitive flag.
 - `:root`, `:scope`, `:checked`, `:indeterminate`, `:disabled`, `:hover`, `:focus`, `:focus-visible`, and `:focus-within`.
 - `:first-child`, `:last-child`, `:not(...)`, `:has(...)`, `:nth-child(...)`, and `:nth-of-type(...)` for tested patterns.
-- `::before` and `::after` generated boxes.
+- `::before` and `::after` generated boxes, plus reusable `::first-letter`
+  text-run styling across direct and nested inline content.
 
 ### Cascade
 
